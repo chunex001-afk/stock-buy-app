@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, Response, request, jsonify
@@ -10,6 +11,8 @@ API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
 DATA_CACHE_TTL = 12 * 60 * 60
 NEWS_CACHE_TTL = 6 * 60 * 60
 cache = {}
+api_lock = threading.Lock()
+last_api_request = 0.0
 DEFAULT_TICKERS = ["AXT", "NBIS", "AEHR", "MU", "SNDK", "BE", "IONQ", "CRDO"]
 
 
@@ -18,14 +21,23 @@ def av(params):
         raise RuntimeError("Alpha Vantage APIキーがRenderに設定されていません")
     p = dict(params)
     p["apikey"] = API_KEY
-    try:
-        r = requests.get("https://www.alphavantage.co/query", params=p, timeout=25)
-        r.raise_for_status()
-        d = r.json()
-    except requests.RequestException as e:
-        raise RuntimeError(f"Alpha Vantage通信エラー: {e}") from e
-    except ValueError as e:
-        raise RuntimeError("Alpha VantageからJSONデータを受け取れませんでした") from e
+    # Free Alpha Vantage keys require requests to be spaced out.
+    # Serialize requests so 8 tickers do not hit the 1-request/second burst limit.
+    global last_api_request
+    with api_lock:
+        wait = 1.15 - (time.time() - last_api_request)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            r = requests.get("https://www.alphavantage.co/query", params=p, timeout=25)
+            r.raise_for_status()
+            d = r.json()
+        except requests.RequestException as e:
+            raise RuntimeError(f"Alpha Vantage通信エラー: {e}") from e
+        except ValueError as e:
+            raise RuntimeError("Alpha VantageからJSONデータを受け取れませんでした") from e
+        finally:
+            last_api_request = time.time()
 
     # Alpha Vantage can return quota / service messages without HTTP errors.
     if "Error Message" in d:
@@ -242,7 +254,7 @@ th,td{padding:9px 7px;border-bottom:1px solid #eee;text-align:left;vertical-alig
 <script>
 let ts=JSON.parse(localStorage.getItem("buyTickers")||'["AXT","NBIS","AEHR","MU","SNDK","BE","IONQ","CRDO"]');
 function save(){localStorage.setItem("buyTickers",JSON.stringify(ts))}
-function add(){let t=document.getElementById("t").value.trim().toUpperCase();if(!t)return;if(ts.includes(t))return alert("すでに登録されています");if(ts.length>=20)return alert("最大20銘柄です");ts.push(t);save();document.getElementById("t").value="";load(true)}
+function add(){let t=document.getElementById("t").value.trim().toUpperCase();if(!t)return;if(ts.includes(t))return alert("すでに登録されています");if(ts.length>=15)return alert("最大15銘柄です");ts.push(t);save();document.getElementById("t").value="";load(true)}
 function del(t){if(confirm(t+"を削除しますか？")){ts=ts.filter(x=>x!==t);save();load(true)}}
 function esc(s){return String(s??"").replace(/[&<>\"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\\':'&#92;','"':'&quot;'}[m]))}
 async function load(force=false){document.getElementById("st").textContent=force?"最新データを確認中…":"データを読み込み中…";try{
