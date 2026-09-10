@@ -19,7 +19,7 @@ def _redact(text):
     return _APIKEY_RE.sub("apikey=***", str(text))
 
 API_URL = "https://www.alphavantage.co/query"
-DEFAULT_TICKERS = ["AXT", "NBIS", "AEHR", "MU", "SNDK", "BE", "IONQ", "CRDO"]
+DEFAULT_TICKERS = ["AXTI", "NBIS", "AEHR", "MU", "SNDK", "BE", "IONQ", "CRDO"]
 MAX_TICKERS = 15
 
 # Alpha Vantage無料枠は25 requests/dayだが、リトライ・手動更新の余裕を
