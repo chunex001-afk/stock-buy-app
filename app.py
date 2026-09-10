@@ -16,11 +16,32 @@ API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
 # 対して余裕が小さいため、自動更新より長めの間隔を空ける。
 MANUAL_REFRESH_COOLDOWN = 3 * 60 * 60  # 3時間
 
+# Redisのキャッシュがこの時間を超えて古い場合のみ、手動更新の対象に含める
+# （日次のGitHub Actionsジョブが何らかの理由で動かなかった場合の保険）。
+CACHE_FRESH_SECONDS = 20 * 60 * 60  # 20時間
+
 TICKER_RE = re.compile(r"[^A-Z0-9.\-]")
 
 
 def _sanitize_ticker(raw):
     return TICKER_RE.sub("", (raw or "").strip().upper())
+
+
+def _needs_refresh(record):
+    """Redis上のレコードが「取得済みキャッシュとして十分新しいか」を判定する。"""
+    if not record or not record.get("last_trade_date"):
+        return True
+    if record.get("is_stale"):
+        return True
+    fetched_at = record.get("fetched_at")
+    if not fetched_at:
+        return True
+    try:
+        fetched_dt = datetime.fromisoformat(fetched_at)
+    except ValueError:
+        return True
+    age = (datetime.now(timezone.utc).astimezone() - fetched_dt).total_seconds()
+    return age > CACHE_FRESH_SECONDS
 
 
 def _freshness(record):
@@ -388,14 +409,10 @@ def manual_refresh():
             }), 200
 
         tickers = _get_watchlist()
-        targets = []
-        for t in tickers:
-            rec = store.get_ticker_record(t)
-            if not rec or not rec.get("last_trade_date") or rec.get("is_stale"):
-                targets.append(t)
+        targets = [t for t in tickers if _needs_refresh(store.get_ticker_record(t))]
 
         if not targets:
-            return jsonify({"ok": True, "message": "更新の必要はありません（全銘柄が最新です）"})
+            return jsonify({"ok": True, "message": "更新の必要はありません（全銘柄が20時間以内に取得済みです）"})
 
         result = refresh.run_refresh(targets, API_KEY)
         store.set_last_manual_refresh(datetime.now(timezone.utc).astimezone().isoformat())

@@ -3,11 +3,20 @@
 app.py（Webサービス）と refresh.py（日次自動更新ジョブ）の両方から import される。
 """
 
+import re
 import time
 import threading
 from datetime import datetime, timezone, timedelta
 
 import requests
+
+_APIKEY_RE = re.compile(r"apikey=[^&\s'\")]+", re.IGNORECASE)
+
+
+def _redact(text):
+    """requestsの通信エラーはURL（apikey付き）をそのまま文字列化することがあるため、
+    ログ・エラーメッセージに出す前に必ずAPIキーを伏字にする。"""
+    return _APIKEY_RE.sub("apikey=***", str(text))
 
 API_URL = "https://www.alphavantage.co/query"
 DEFAULT_TICKERS = ["AXT", "NBIS", "AEHR", "MU", "SNDK", "BE", "IONQ", "CRDO"]
@@ -81,9 +90,9 @@ def api_get(params, api_key, retry_network=True):
             if attempt < attempts - 1:
                 time.sleep(2)
                 continue
-            raise ApiError("NETWORK", f"通信エラー: {e}")
+            raise ApiError("NETWORK", f"通信エラー: {_redact(e)}")
         except requests.RequestException as e:
-            raise ApiError("NETWORK", f"通信エラー: {e}")
+            raise ApiError("NETWORK", f"通信エラー: {_redact(e)}")
 
         try:
             data = r.json()
@@ -92,11 +101,11 @@ def api_get(params, api_key, retry_network=True):
 
         err_type, err_msg = classify_error(data)
         if err_type:
-            raise ApiError(err_type, err_msg)
+            raise ApiError(err_type, _redact(err_msg))
         return data
 
     # ここには到達しない想定だが、念のため
-    raise ApiError("NETWORK", f"通信エラー: {last_exc}")
+    raise ApiError("NETWORK", f"通信エラー: {_redact(last_exc)}")
 
 
 def fetch_daily_series(ticker, api_key):
