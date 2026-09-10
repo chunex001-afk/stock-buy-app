@@ -138,7 +138,11 @@ def fetch_daily_series(ticker, api_key):
 
 
 def fetch_news(tickers, api_key):
-    """対象銘柄群についてのニュースをまとめて1コールで取得する。失敗時は空リスト。"""
+    """対象銘柄群についてのニュース（センチメント付き）をまとめて1コールで取得する。
+
+    失敗時は空リスト。各アイテムには一致した銘柄ごとの
+    {"score": float, "relevance": float, "label": str} を持つ "sentiment" 辞書を含める。
+    """
     if not tickers:
         return []
     try:
@@ -165,8 +169,25 @@ def fetch_news(tickers, api_key):
         except Exception:
             pass
 
-        matched = [ts.get("ticker") for ts in x.get("ticker_sentiment", []) if ts.get("ticker") in tickers]
-        if not matched:
+        sentiment = {}
+        for ts in x.get("ticker_sentiment", []):
+            tk = ts.get("ticker")
+            if tk not in tickers:
+                continue
+            try:
+                score = float(ts.get("ticker_sentiment_score", 0))
+            except (TypeError, ValueError):
+                score = 0.0
+            try:
+                relevance = float(ts.get("relevance_score", 0))
+            except (TypeError, ValueError):
+                relevance = 0.0
+            sentiment[tk] = {
+                "score": score,
+                "relevance": relevance,
+                "label": ts.get("ticker_sentiment_label", ""),
+            }
+        if not sentiment:
             continue
 
         items.append(
@@ -175,10 +196,53 @@ def fetch_news(tickers, api_key):
                 "url": x.get("url", ""),
                 "source": x.get("source", ""),
                 "published": published,
-                "tickers": matched,
+                "tickers": list(sentiment.keys()),
+                "sentiment": sentiment,
             }
         )
     return items[:30]
+
+
+def aggregate_sentiment(ticker, news_items):
+    """関連度で重み付けした平均センチメントスコア（おおむね-1〜1）を返す。データが無ければNone。"""
+    total_w = 0.0
+    total = 0.0
+    for n in news_items or []:
+        s = (n.get("sentiment") or {}).get(ticker)
+        if not s:
+            continue
+        w = max(s.get("relevance", 0) or 0, 0.05)
+        total += (s.get("score", 0) or 0) * w
+        total_w += w
+    if total_w == 0:
+        return None
+    return round(total / total_w, 3)
+
+
+def _clean_overview_field(v):
+    """Alpha VantageのOVERVIEWは値がない項目を文字列"None"で返すことがあるため空文字に正規化する。"""
+    v = (v or "").strip()
+    return "" if v in ("", "None", "-", "N/A") else v
+
+
+def fetch_overview(ticker, api_key):
+    """OVERVIEWエンドポイントから時価総額・セクター・業種を取得する（日次では最大1銘柄のみ呼ぶ）。"""
+    data = api_get({"function": "OVERVIEW", "symbol": ticker}, api_key, retry_network=False)
+    if not isinstance(data, dict) or not data.get("Symbol"):
+        raise ApiError("NO_DATA", "企業情報を取得できませんでした")
+
+    cap_raw = data.get("MarketCapitalization")
+    try:
+        market_cap = int(cap_raw) if cap_raw not in (None, "", "None") else None
+    except (TypeError, ValueError):
+        market_cap = None
+
+    return {
+        "market_cap": market_cap,
+        "name": _clean_overview_field(data.get("Name")),
+        "sector": _clean_overview_field(data.get("Sector")),
+        "industry": _clean_overview_field(data.get("Industry")),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +320,7 @@ def compute_indicators(dates, closes, volumes):
 
 
 # ---------------------------------------------------------------------------
-# 底打ち状態 / 局面 / スコア / 最終判定
+# 底打ち状態 / 局面 / スコア（内部判定材料。最終判定そのものではない）
 # ---------------------------------------------------------------------------
 
 def compute_bottom_status(ind):
@@ -356,26 +420,103 @@ def compute_overheat_score(ind, phase):
     return max(0, min(100, round(score)))
 
 
+# ---------------------------------------------------------------------------
+# 時価総額
+# ---------------------------------------------------------------------------
+
+_MARKET_CAP_TIERS = (
+    (200_000_000_000, "超大型株"),
+    (10_000_000_000, "大型株"),
+    (2_000_000_000, "中型株"),
+    (300_000_000, "小型株"),
+)
+
+
+def classify_market_cap(market_cap):
+    if not market_cap or market_cap <= 0:
+        return None
+    for threshold, label in _MARKET_CAP_TIERS:
+        if market_cap >= threshold:
+            return label
+    return "超小型株"
+
+
+def format_market_cap(market_cap):
+    if not market_cap or market_cap <= 0:
+        return None
+    if market_cap >= 1_000_000_000:
+        return f"${market_cap / 1_000_000_000:.1f}B"
+    return f"${market_cap / 1_000_000:.0f}M"
+
+
+_SECTOR_THEME_JA = {
+    "TECHNOLOGY": "テクノロジー",
+    "LIFE SCIENCES": "ライフサイエンス",
+    "MANUFACTURING": "製造業",
+    "ENERGY & TRANSPORTATION": "エネルギー・輸送",
+    "FINANCE": "金融",
+    "TRADE & SERVICES": "商業・サービス",
+    "REAL ESTATE & CONSTRUCTION": "不動産・建設",
+}
+
+
+def theme_label(sector, industry):
+    industry = (industry or "").strip()
+    sector = (sector or "").strip()
+    ja_sector = _SECTOR_THEME_JA.get(sector.upper()) if sector else None
+    if industry:
+        return f"{ja_sector}／{industry}" if ja_sector else industry
+    if sector:
+        return ja_sector or sector
+    return None
+
+
+def adjust_scores_for_context(upside, overheat, sentiment_score, cap_label):
+    """ニュースセンチメントと時価総額規模で、テクニカル由来のスコアを小幅に補正する。
+    いずれか単体で判定が決まらないよう、影響量は控えめに留める。"""
+    if sentiment_score is not None:
+        if sentiment_score >= 0.35:
+            upside += 6
+        elif sentiment_score >= 0.15:
+            upside += 3
+        elif sentiment_score <= -0.35:
+            upside -= 8
+            overheat += 5
+        elif sentiment_score <= -0.15:
+            upside -= 4
+
+    if cap_label in ("超小型株", "小型株"):
+        overheat += 5
+        upside -= 2
+    elif cap_label in ("超大型株", "大型株"):
+        overheat -= 3
+        upside += 2
+
+    return max(0, min(100, round(upside))), max(0, min(100, round(overheat)))
+
+
+# ---------------------------------------------------------------------------
+# 最終判定（4種類）
+# ---------------------------------------------------------------------------
+
 JUDGMENTS = (
-    "強い買い候補",
+    "強く買いたい",
     "買い候補",
-    "先回り候補",
-    "底打ち待ち",
-    "過熱のため待つ",
-    "天井圏のため見送り",
+    "まだ買わない",
+    "過熱のため買わない",
     "判定不可",
 )
 
 # ランキング表示順（数字が小さいほど上位）
 JUDGMENT_ORDER = {
-    "強い買い候補": 0,
+    "強く買いたい": 0,
     "買い候補": 1,
-    "先回り候補": 2,
-    "底打ち待ち": 3,
-    "過熱のため待つ": 4,
-    "天井圏のため見送り": 5,
-    "判定不可": 6,
+    "まだ買わない": 2,
+    "過熱のため買わない": 3,
+    "判定不可": 4,
 }
+
+OVERHEAT_JUDGMENT_THRESHOLD = 55
 
 ERROR_LABELS = {
     "RATE_LIMIT": "APIレート制限",
@@ -386,63 +527,197 @@ ERROR_LABELS = {
 }
 
 
-def compute_judgment(bottom_status, phase, upside, overheat):
+def compute_final_judgment(bottom_status, phase, upside, overheat):
+    """最終判定は「強く買いたい／買い候補／まだ買わない／過熱のため買わない」の4種類のみ。
+    上昇しすぎている（過熱）場合は、底打ち状態に関わらず必ず「過熱のため買わない」を優先する。"""
     if bottom_status is None:
         return "判定不可"
 
-    if phase == "天井局面" or overheat >= 70:
-        return "天井圏のため見送り"
+    if phase == "天井局面" or overheat >= OVERHEAT_JUDGMENT_THRESHOLD:
+        return "過熱のため買わない"
 
-    if overheat >= 50:
-        return "過熱のため待つ"
+    if bottom_status == "底打ち確認" and upside >= 72:
+        return "強く買いたい"
 
-    if bottom_status == "底打ち未確認":
-        return "底打ち待ち"
+    if bottom_status in ("底打ち確認", "底打ち途中") and upside >= 52:
+        return "買い候補"
 
-    if bottom_status == "底打ち途中":
-        return "先回り候補" if upside >= 65 else "底打ち待ち"
+    return "まだ買わない"
 
+
+def sort_rows(rows):
+    """最終判定順→上昇余地スコア降順でソートする。app.py（当日順位）とrefresh.py
+    （前日順位スナップショット）の両方から同一基準で使われる。"""
+    return sorted(
+        rows,
+        key=lambda x: (
+            JUDGMENT_ORDER.get(x.get("judgment"), 99),
+            -(x.get("upside_score") if x.get("upside_score") is not None else -1),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 一言コメント生成（銘柄ごとに材料の異なる文章を組み立てる）
+# ---------------------------------------------------------------------------
+
+_CONCLUSION_TEXT = {
+    "強く買いたい": "強く買いたい",
+    "買い候補": "買い候補",
+    "まだ買わない": "まだ買わない",
+    "過熱のため買わない": "過熱のため買わない",
+}
+
+
+def _shorten(text, n):
+    text = (text or "").strip()
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _news_clause(related_news, sentiment_score):
+    if not related_news:
+        return None
+    title = _shorten(related_news[0].get("title", ""), 34)
+    if not title:
+        return None
+    if sentiment_score is not None and sentiment_score <= -0.15:
+        return f"「{title}」など懸念材料"
+    if sentiment_score is not None and sentiment_score >= 0.15:
+        return f"「{title}」など好材料"
+    return f"「{title}」が話題"
+
+
+def _theme_clause(sector, industry):
+    label = theme_label(sector, industry)
+    if not label:
+        return None
+    return f"{_shorten(label, 20)}が事業テーマ"
+
+
+def _bottom_clause(bottom_status, phase, change_pct):
+    if phase == "天井局面":
+        return "高値圏で上昇一服の兆し"
     if bottom_status == "底打ち確認":
-        if upside >= 75:
-            return "強い買い候補"
-        if upside >= 55:
-            return "買い候補"
-        return "底打ち待ち"
+        return "底打ち後の反発局面" if (change_pct or 0) > 0 else "底打ちを確認済み"
+    if bottom_status == "底打ち途中":
+        return "底打ちの途中段階"
+    if bottom_status == "底打ち未確認":
+        return "下落トレンドが続き底打ち未確認"
+    return None
 
-    return "判定不可"
+
+def _rsi_clause(rsi):
+    if rsi is None:
+        return None
+    if rsi >= 75:
+        return f"RSIは{rsi:.0f}と過熱圏"
+    if rsi >= 65:
+        return f"RSIは{rsi:.0f}とやや過熱気味"
+    if rsi <= 30:
+        return f"RSIは{rsi:.0f}と売られ過ぎ圏"
+    return f"RSI{rsi:.0f}で過熱していない"
 
 
-def build_comment(judgment, ind, related_news=None):
+def _trend_clause(ma20, ma50):
+    if ma20 is None or ma50 is None:
+        return None
+    return "MA20がMA50を上回り上昇基調" if ma20 > ma50 else "MA20がMA50を下回り軟調"
+
+
+def _highgap_clause(high_gap):
+    if high_gap is None:
+        return None
+    if high_gap >= -2:
+        return "直近高値圏まで値を戻している"
+    if high_gap <= -25:
+        return f"直近高値から{abs(high_gap):.0f}%下押し"
+    return None
+
+
+def _volume_clause(volume_ratio):
+    if volume_ratio is None:
+        return None
+    if volume_ratio >= 1.8:
+        return "出来高も急増"
+    if volume_ratio <= 0.6:
+        return "出来高は細め"
+    return None
+
+
+def _month_clause(month_return):
+    if month_return is None:
+        return None
+    if month_return >= 30:
+        return f"1か月で{month_return:.0f}%超の急騰"
+    if month_return <= -15:
+        return f"1か月で{abs(month_return):.0f}%下落"
+    return None
+
+
+def _capsize_clause(cap_label):
+    if cap_label in ("超小型株", "小型株"):
+        return f"{cap_label}で値動きが荒くなりやすい"
+    if cap_label in ("超大型株", "大型株"):
+        return f"{cap_label}で値動きは比較的安定"
+    return None
+
+
+def build_comment(judgment, ind, bottom_status, phase, cap_label, sector, industry, related_news, sentiment_score):
     rsi = ind.get("rsi")
+    ma20, ma50 = ind.get("ma20"), ind.get("ma50")
     high_gap = ind.get("high_gap")
-    rsi_s = f"{rsi:.1f}" if rsi is not None else "-"
-    hg_s = f"{high_gap:.1f}" if high_gap is not None else "-"
+    volume_ratio = ind.get("volume_ratio")
+    month_return = ind.get("month_return")
+    change_pct = ind.get("change_pct")
 
-    if related_news:
-        return f"ニュース: {related_news[0].get('title', '')}"
+    news_c = _news_clause(related_news, sentiment_score)
+    theme_c = _theme_clause(sector, industry)
+    bottom_c = _bottom_clause(bottom_status, phase, change_pct)
+    rsi_c = _rsi_clause(rsi)
+    trend_c = _trend_clause(ma20, ma50)
+    hg_c = _highgap_clause(high_gap)
+    vol_c = _volume_clause(volume_ratio)
+    month_c = _month_clause(month_return)
+    cap_c = _capsize_clause(cap_label)
 
-    if judgment in ("強い買い候補", "買い候補"):
-        return f"底打ち確認。RSIは健全圏（{rsi_s}）で、過熱感が低く上昇余地が大きい。"
-    if judgment == "先回り候補":
-        return "底打ちの途中段階だが、反発の兆しがあり上昇余地も大きい。確認前のため一部先回りで検討。"
-    if judgment == "底打ち待ち":
-        return "底打ちはまだ確認できない。下落トレンドが止まるまで待ち。"
-    if judgment in ("過熱のため待つ", "天井圏のため見送り"):
-        return f"上昇トレンドは強いが、RSI（{rsi_s}）と高値乖離（{hg_s}%）から過熱感が強く、今は追わない方がよい。"
-    return "データが不足しているため判定できません。"
+    lead = news_c or theme_c
+
+    if judgment == "強く買いたい":
+        candidates = [lead, bottom_c, rsi_c, vol_c]
+    elif judgment == "買い候補":
+        candidates = [lead, bottom_c, rsi_c, hg_c]
+    elif judgment == "過熱のため買わない":
+        candidates = [month_c, hg_c, rsi_c, news_c, cap_c]
+    else:  # まだ買わない
+        candidates = [bottom_c, trend_c, lead, cap_c]
+
+    parts = [c for c in candidates if c][:3]
+    if not parts:
+        parts = [c for c in [rsi_c, trend_c] if c] or ["データが限定的"]
+
+    body = "、".join(parts)
+    return f"{body}ため{_CONCLUSION_TEXT.get(judgment, judgment)}。"
 
 
-def build_result(ticker, dates, closes, volumes, news_items=None):
+def build_result(ticker, dates, closes, volumes, news_items=None,
+                  market_cap=None, sector="", industry="", company_name=""):
     """指標計算〜最終判定までをまとめて実行し、Redisに保存する形のレコードを返す。"""
     ind = compute_indicators(dates, closes, volumes)
     bottom_status = compute_bottom_status(ind)
     phase = compute_phase(ind, bottom_status)
     upside = compute_upside_score(ind, bottom_status, phase)
     overheat = compute_overheat_score(ind, phase)
-    judgment = compute_judgment(bottom_status, phase, upside, overheat)
 
     related_news = [n for n in (news_items or []) if ticker in n.get("tickers", [])]
-    comment = build_comment(judgment, ind, related_news)
+    related_news.sort(key=lambda n: n.get("published", ""), reverse=True)
+    sentiment_score = aggregate_sentiment(ticker, related_news)
+
+    cap_label = classify_market_cap(market_cap)
+    upside, overheat = adjust_scores_for_context(upside, overheat, sentiment_score, cap_label)
+
+    judgment = compute_final_judgment(bottom_status, phase, upside, overheat)
+    comment = build_comment(judgment, ind, bottom_status, phase, cap_label, sector, industry,
+                             related_news, sentiment_score)
 
     return {
         "ticker": ticker,
@@ -459,6 +734,12 @@ def build_result(ticker, dates, closes, volumes, news_items=None):
         "overheat_score": overheat,
         "bottom_status": bottom_status,
         "phase": phase,
+        "market_cap": market_cap,
+        "market_cap_label": cap_label,
+        "company_name": company_name,
+        "sector": sector,
+        "industry": industry,
+        "news_sentiment_score": sentiment_score,
         "judgment": judgment,
         "comment": comment,
         "news": related_news[:3],
