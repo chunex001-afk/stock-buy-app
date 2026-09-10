@@ -137,3 +137,11 @@ def get_last_refresh():
 
 def set_last_refresh(summary):
     return set_json("last_refresh", summary)
+
+
+def get_last_manual_refresh():
+    return get("last_manual_refresh")
+
+
+def set_last_manual_refresh(iso_timestamp):
+    return set_("last_manual_refresh", iso_timestamp)

@@ -357,6 +357,25 @@ JUDGMENTS = (
     "判定不可",
 )
 
+# ランキング表示順（数字が小さいほど上位）
+JUDGMENT_ORDER = {
+    "強い買い候補": 0,
+    "買い候補": 1,
+    "先回り候補": 2,
+    "底打ち待ち": 3,
+    "過熱のため待つ": 4,
+    "天井圏のため見送り": 5,
+    "判定不可": 6,
+}
+
+ERROR_LABELS = {
+    "RATE_LIMIT": "APIレート制限",
+    "NETWORK": "通信エラー",
+    "INVALID_SYMBOL": "無効な銘柄コード",
+    "NO_DATA": "データ取得不可",
+    "UNKNOWN": "不明なエラー",
+}
+
 
 def compute_judgment(bottom_status, phase, upside, overheat):
     if bottom_status is None:
