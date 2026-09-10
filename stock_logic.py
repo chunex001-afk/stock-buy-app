@@ -459,6 +459,29 @@ _SECTOR_THEME_JA = {
     "REAL ESTATE & CONSTRUCTION": "不動産・建設",
 }
 
+# 主要銘柄については、OVERVIEWのSector/Industryより具体的で自然な事業テーマ文言を優先する。
+# 未収録の銘柄はOVERVIEW由来のsector/industryにフォールバックする（theme_label参照）。
+_TICKER_THEMES = {
+    "MU": "メモリ・DRAM・HBM（AI向け高帯域メモリ）需要",
+    "SNDK": "NAND型フラッシュ・ストレージ需要",
+    "NBIS": "AIデータセンター・GPUインフラ",
+    "BE": "燃料電池・水素発電・データセンター向け電力",
+    "IONQ": "量子コンピューティング",
+    "CRDO": "AIデータセンター向け光接続・高速インターコネクト",
+    "AXTI": "化合物半導体基板（GaAs/InP）",
+    "AEHR": "半導体バーンイン・テスト装置（SiC/AI関連）",
+    "NVDA": "AI向けGPU・データセンター半導体",
+    "AMD": "AI/サーバー向けCPU・GPU",
+    "TSM": "先端半導体ファウンドリ（AI/HPC向け）",
+    "SMCI": "AIサーバー・データセンター向けサーバー機器",
+    "PLTR": "AI・データ分析ソフトウェア基盤",
+    "ARM": "半導体設計IP（モバイル・AI向け）",
+    "SOUN": "音声認識・会話型AI",
+    "VRT": "データセンター向け電力・冷却インフラ",
+    "OKLO": "小型モジュール原子炉（データセンター電力向け）",
+    "CCJ": "ウラン採掘・原子力燃料",
+}
+
 
 def theme_label(sector, industry):
     industry = (industry or "").strip()
@@ -575,34 +598,38 @@ def _shorten(text, n):
 
 
 def _news_clause(related_news, sentiment_score):
+    """ニュースが取得できている場合の最優先クローズ。件名をそのまま埋め込むため、
+    銘柄ごとに内容が必ず変わる（定型文の使い回しにならない）。"""
     if not related_news:
         return None
     title = _shorten(related_news[0].get("title", ""), 34)
     if not title:
         return None
     if sentiment_score is not None and sentiment_score <= -0.15:
-        return f"「{title}」など懸念材料"
+        return f"「{title}」など懸念材料が重石"
     if sentiment_score is not None and sentiment_score >= 0.15:
-        return f"「{title}」など好材料"
-    return f"「{title}」が話題"
+        return f"「{title}」など好材料が追い風"
+    return f"「{title}」が材料視されている"
 
 
-def _theme_clause(sector, industry):
-    label = theme_label(sector, industry)
+def _theme_clause(ticker, sector, industry):
+    """ニュースが無い場合に使う、銘柄固有の事業テーマ。主要銘柄は具体的な文言（MU/SNDK/NBIS等）を、
+    それ以外はOVERVIEW由来のsector/industryを使う。"""
+    label = _TICKER_THEMES.get(ticker) or theme_label(sector, industry)
     if not label:
         return None
-    return f"{_shorten(label, 20)}が事業テーマ"
+    return f"{_shorten(label, 26)}が事業テーマ"
 
 
 def _bottom_clause(bottom_status, phase, change_pct):
     if phase == "天井局面":
         return "高値圏で上昇一服の兆し"
     if bottom_status == "底打ち確認":
-        return "底打ち後の反発局面" if (change_pct or 0) > 0 else "底打ちを確認済み"
+        return "底打ち後の反発局面に入っている" if (change_pct or 0) > 0 else "底打ちを確認済み"
     if bottom_status == "底打ち途中":
-        return "底打ちの途中段階"
+        return "底打ちの途中段階でまだ確証はない"
     if bottom_status == "底打ち未確認":
-        return "下落トレンドが続き底打ち未確認"
+        return "下落トレンドが続き底打ちは未確認"
     return None
 
 
@@ -610,18 +637,18 @@ def _rsi_clause(rsi):
     if rsi is None:
         return None
     if rsi >= 75:
-        return f"RSIは{rsi:.0f}と過熱圏"
+        return f"RSI{rsi:.0f}は明確な過熱圏"
     if rsi >= 65:
-        return f"RSIは{rsi:.0f}とやや過熱気味"
+        return f"RSI{rsi:.0f}はやや過熱気味"
     if rsi <= 30:
-        return f"RSIは{rsi:.0f}と売られ過ぎ圏"
-    return f"RSI{rsi:.0f}で過熱していない"
+        return f"RSI{rsi:.0f}は売られ過ぎ圏"
+    return f"RSI{rsi:.0f}は過熱していない水準"
 
 
 def _trend_clause(ma20, ma50):
     if ma20 is None or ma50 is None:
         return None
-    return "MA20がMA50を上回り上昇基調" if ma20 > ma50 else "MA20がMA50を下回り軟調"
+    return "MA20がMA50を上回り上昇基調を維持" if ma20 > ma50 else "MA20がMA50を下回り軟調な基調"
 
 
 def _highgap_clause(high_gap):
@@ -630,7 +657,7 @@ def _highgap_clause(high_gap):
     if high_gap >= -2:
         return "直近高値圏まで値を戻している"
     if high_gap <= -25:
-        return f"直近高値から{abs(high_gap):.0f}%下押し"
+        return f"直近高値から{abs(high_gap):.0f}%下押しした水準"
     return None
 
 
@@ -638,9 +665,9 @@ def _volume_clause(volume_ratio):
     if volume_ratio is None:
         return None
     if volume_ratio >= 1.8:
-        return "出来高も急増"
+        return "出来高も急増しており関心が高い"
     if volume_ratio <= 0.6:
-        return "出来高は細め"
+        return "出来高は細く商いは閑散"
     return None
 
 
@@ -648,21 +675,31 @@ def _month_clause(month_return):
     if month_return is None:
         return None
     if month_return >= 30:
-        return f"1か月で{month_return:.0f}%超の急騰"
+        return f"1か月で{month_return:.0f}%超急騰しており値動きが速い"
+    if month_return >= 15:
+        return f"1か月で{month_return:.0f}%上昇と勢いが強い"
     if month_return <= -15:
-        return f"1か月で{abs(month_return):.0f}%下落"
+        return f"1か月で{abs(month_return):.0f}%下落している"
     return None
 
 
 def _capsize_clause(cap_label):
     if cap_label in ("超小型株", "小型株"):
-        return f"{cap_label}で値動きが荒くなりやすい"
+        return f"{cap_label}のため値動きが荒くなりやすい"
     if cap_label in ("超大型株", "大型株"):
-        return f"{cap_label}で値動きは比較的安定"
+        return f"{cap_label}で値動きは比較的安定的"
     return None
 
 
-def build_comment(judgment, ind, bottom_status, phase, cap_label, sector, industry, related_news, sentiment_score):
+def build_comment(ticker, judgment, ind, bottom_status, phase, cap_label, sector, industry,
+                   related_news, sentiment_score):
+    """銘柄ごとに材料の異なる一言コメントを組み立てる。
+
+    ニュースが取得できていれば必ずそれを先頭材料として最優先で使い、無ければ
+    銘柄固有の事業テーマ（MU=メモリ/HBM、SNDK=NAND、NBIS=AIデータセンター等）を
+    先頭材料にする。どちらの場合も、その最終判定に至った「なぜ」が伝わるよう、
+    判定カテゴリごとに異なるテクニカル材料を後ろに続ける。
+    """
     rsi = ind.get("rsi")
     ma20, ma50 = ind.get("ma20"), ind.get("ma50")
     high_gap = ind.get("high_gap")
@@ -671,7 +708,7 @@ def build_comment(judgment, ind, bottom_status, phase, cap_label, sector, indust
     change_pct = ind.get("change_pct")
 
     news_c = _news_clause(related_news, sentiment_score)
-    theme_c = _theme_clause(sector, industry)
+    theme_c = _theme_clause(ticker, sector, industry)
     bottom_c = _bottom_clause(bottom_status, phase, change_pct)
     rsi_c = _rsi_clause(rsi)
     trend_c = _trend_clause(ma20, ma50)
@@ -680,18 +717,27 @@ def build_comment(judgment, ind, bottom_status, phase, cap_label, sector, indust
     month_c = _month_clause(month_return)
     cap_c = _capsize_clause(cap_label)
 
-    lead = news_c or theme_c
-
+    # 判定カテゴリごとに「なぜその判定か」を最も説明するテクニカル材料の優先順を変える。
     if judgment == "強く買いたい":
-        candidates = [lead, bottom_c, rsi_c, vol_c]
+        support = [bottom_c, rsi_c, vol_c, month_c, cap_c]
     elif judgment == "買い候補":
-        candidates = [lead, bottom_c, rsi_c, hg_c]
+        support = [bottom_c, rsi_c, hg_c, trend_c, cap_c]
     elif judgment == "過熱のため買わない":
-        candidates = [month_c, hg_c, rsi_c, news_c, cap_c]
+        support = [month_c, hg_c, rsi_c, vol_c, cap_c]
     else:  # まだ買わない
-        candidates = [bottom_c, trend_c, lead, cap_c]
+        support = [bottom_c, trend_c, hg_c, cap_c]
+    support = [c for c in support if c]
 
-    parts = [c for c in candidates if c][:3]
+    if news_c:
+        # ニュースがある場合は必ず先頭材料として最優先し、判定理由のテクニカル材料を後ろに続ける。
+        parts = [news_c] + support[:2]
+    elif theme_c:
+        # ニュースが無い場合は銘柄固有の事業テーマを先頭材料にする。
+        parts = [theme_c] + support[:2]
+    else:
+        parts = support[:3]
+
+    parts = [p for p in dict.fromkeys(parts) if p][:3]  # 順序を保ったまま重複除去
     if not parts:
         parts = [c for c in [rsi_c, trend_c] if c] or ["データが限定的"]
 
@@ -716,7 +762,7 @@ def build_result(ticker, dates, closes, volumes, news_items=None,
     upside, overheat = adjust_scores_for_context(upside, overheat, sentiment_score, cap_label)
 
     judgment = compute_final_judgment(bottom_status, phase, upside, overheat)
-    comment = build_comment(judgment, ind, bottom_status, phase, cap_label, sector, industry,
+    comment = build_comment(ticker, judgment, ind, bottom_status, phase, cap_label, sector, industry,
                              related_news, sentiment_score)
 
     return {

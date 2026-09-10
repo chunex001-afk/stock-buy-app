@@ -136,25 +136,58 @@ HTML = r"""
 <title>今買うべき銘柄ランキング</title>
 <style>
 *{box-sizing:border-box} body{margin:0;background:#f4f6f8;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif}
-.wrap{max-width:1300px;margin:auto;padding:18px}.title{font-size:28px;font-weight:800;margin-bottom:5px}.sub{color:#68748a;margin-bottom:18px}
+.wrap{max-width:880px;margin:auto;padding:18px}
+.title{font-size:24px;font-weight:800;margin-bottom:5px}
+.sub{color:#68748a;margin-bottom:18px;font-size:13px;line-height:1.6}
 .card{background:white;border-radius:22px;padding:18px;margin-bottom:16px;box-shadow:0 2px 14px #0000000c}
-.controls{display:flex;gap:8px;flex-wrap:wrap}.controls input{flex:1;min-width:150px;padding:13px;border:1px solid #ccd2db;border-radius:13px;font-size:16px}
+.controls{display:flex;gap:8px;flex-wrap:wrap}
+.controls input{flex:1;min-width:150px;padding:13px;border:1px solid #ccd2db;border-radius:13px;font-size:16px}
 button{border:0;border-radius:13px;padding:12px 16px;font-weight:800;font-size:15px;cursor:pointer;background:#172033;color:white}
 button:disabled{opacity:.5;cursor:not-allowed}
-button.secondary{background:#eef1f5;color:#172033}.small{font-size:12px;color:#758096;margin-top:10px;line-height:1.6}
-table{width:100%;border-collapse:collapse} th,td{padding:11px 7px;border-bottom:1px solid #e7eaf0;text-align:left;vertical-align:top} th{font-size:12px;color:#667085} td{font-size:13px}
-.rank{font-weight:900;font-size:18px}.score{font-size:18px;font-weight:900}
-.pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#edf3ff;font-weight:800;font-size:12px;white-space:nowrap}
+button.secondary{background:#eef1f5;color:#172033;padding:8px 14px;font-size:13px}
+.small{font-size:12px;color:#758096;margin-top:10px;line-height:1.6}
+
+.list{display:flex;flex-direction:column;gap:14px}
+.tcard{background:white;border-radius:20px;padding:18px 20px;box-shadow:0 2px 14px #0000000c}
+.rankline{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;margin-bottom:2px}
+.rankbig{font-size:14px;font-weight:900;color:#98a2b3;white-space:nowrap}
+.tickerbig{font-size:23px;font-weight:900;letter-spacing:.01em}
+.rankarrow{font-size:15px;font-weight:900}
+.judgebadge{margin-left:auto}
+.rc-up{color:#087443}.rc-down{color:#b42318}.rc-same{color:#98a2b3}.rc-new{color:#98a2b3}
+.rankdetail{font-size:12px;color:#758096;margin-bottom:12px}
+
+.statrow{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid #eef1f5}
+.stat{min-width:60px}
+.statlabel{font-size:11px;color:#98a2b3;font-weight:700;margin-bottom:2px}
+.statval{font-size:16px;font-weight:800;white-space:nowrap}
+.statval.up{color:#087443}.statval.down{color:#b42318}
+.captag{display:block;font-size:10px;color:#98a2b3;font-weight:600;margin-top:1px}
+
+.commentbox{background:#f7f9fc;border-radius:13px;padding:12px 14px;font-size:14px;line-height:1.65;margin-bottom:10px}
+.newsblock{font-size:13px;line-height:1.7;margin-bottom:10px}
+.newsblock a{color:#175cd3;text-decoration:none}
+.newsblock a:hover{text-decoration:underline}
+.newsblock .nonews{color:#98a2b3}
+
+details.moredetail{margin-top:2px}
+details.moredetail summary{cursor:pointer;font-size:12px;color:#475467;font-weight:700;list-style:none;padding:4px 0}
+details.moredetail summary::-webkit-details-marker{display:none}
+details.moredetail summary::before{content:"▸ "}
+details.moredetail[open] summary::before{content:"▾ "}
+.detailgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(108px,1fr));gap:10px 16px;margin:10px 0 6px;font-size:12px}
+.detailgrid .dl{color:#98a2b3;margin-bottom:2px}
+.detailgrid .dv{font-weight:700}
+
+.cardfoot{display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px;flex-wrap:wrap}
+.fresh{color:#087443;font-weight:700}.stalebadge{color:#8a6500;font-weight:700}.nonebadge{color:#98a2b3;font-weight:700}
+.freshtag{font-size:11px}
+
+.pill{display:inline-block;padding:6px 12px;border-radius:999px;font-weight:800;font-size:12px;white-space:nowrap}
 .j-strong_buy{background:#087443;color:#fff}.j-buy{background:#e7f6ed;color:#087443}
 .j-wait{background:#eef1f5;color:#475467}.j-overheat{background:#fff5cc;color:#8a6500}.j-unknown{background:#f2f2f2;color:#98a2b3;font-style:italic}
-.up{color:#087443;font-weight:800}.down{color:#b42318;font-weight:800}.reason{max-width:320px;line-height:1.5}
-.fresh{color:#087443;font-weight:700}.stalebadge{color:#8a6500;font-weight:700}.nonebadge{color:#98a2b3;font-weight:700}
-.freshbox{font-size:11px;line-height:1.6;white-space:nowrap}
-.rankchg{font-size:11px;line-height:1.5;white-space:nowrap}.rc-up{color:#087443;font-weight:800}.rc-down{color:#b42318;font-weight:800}.rc-same{color:#667085}.rc-new{color:#98a2b3}
-.newsbox{max-width:230px;line-height:1.5;font-size:12px}.newsbox a{color:#175cd3;text-decoration:none}.newsbox a:hover{text-decoration:underline}
-.capbox{font-size:12px;line-height:1.5;white-space:nowrap}.captag{color:#667085;font-size:11px}
-.tablebox{overflow-x:auto}
-@media(max-width:760px){.wrap{padding:12px}.title{font-size:23px}table{min-width:1500px}.card{border-radius:18px;padding:14px}}
+
+@media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:20px}.statrow{gap:14px}}
 </style>
 </head>
 <body>
@@ -171,26 +204,15 @@ table{width:100%;border-collapse:collapse} th,td{padding:11px 7px;border-bottom:
   <div id="status" class="small">読み込み中…</div>
 </div>
 
-<div class="card">
-<div class="tablebox">
-<table>
-<thead><tr>
-<th>順位</th><th>順位変化</th><th>銘柄</th><th>株価</th><th>前日比</th><th>1ヶ月</th><th>RSI14</th><th>MA20</th><th>MA50</th>
-<th>高値乖離</th><th>出来高比</th><th>上昇余地</th><th>過熱リスク</th><th>底打ち状態</th><th>局面</th><th>時価総額</th>
-<th>最終判定</th><th>一言コメント</th><th>ニュース</th><th>データ鮮度</th><th></th>
-</tr></thead>
-<tbody id="tbody"></tbody>
-</table>
-</div>
-</div>
+<div class="list" id="list"></div>
 
 <div class="card">
 <b>🧠 判定ロジック（概要）</b>
 <div class="small">
 最終判定は「強く買いたい／買い候補／まだ買わない／過熱のため買わない」の4種類のみです。底打ち状態・局面・上昇余地スコア・過熱リスクスコアに加え、ニュースの内容（センチメント）と時価総額規模を補正材料として統合して決めます。<br>
 RSIや高値からの乖離、1か月の上昇率が過大な場合は、底打ち後の反発局面であっても「過熱のため買わない」を優先します。単純に値上がり中の銘柄を高評価する設計ではありません。<br>
-一言コメントは銘柄ごとのニュース・事業テーマ・テクニカル指標から動的に生成しており、全銘柄で同じ文面にはなりません。<br>
-順位変化は前日（直近の自動更新時点）のランキングとの比較です。<br>
+一言コメントはニュースがあれば最優先で反映し、無ければ銘柄固有の事業テーマとテクニカル指標から生成します。全銘柄で同じ文面にはなりません。<br>
+順位変化は前日（直近の自動更新時点）のランキングとの比較です。カードの「詳細指標を見る」から、MA20/MA50・高値乖離・出来高比・上昇余地／過熱リスクスコア・底打ち状態などの内訳を確認できます。<br>
 株価・ニュースは1日1回、GitHub Actionsによる自動ジョブがAlpha Vantageから取得しUpstash Redisに保存します。時価総額は変動が小さいため1回の自動更新につき最大1銘柄のみ取得し、API無料枠を圧迫しないようにしています。銘柄を「＋追加」した際はその銘柄のみ即時に取得します（右上のボタンは未取得・失敗銘柄限定の再取得です）。
 </div>
 </div>
@@ -270,15 +292,17 @@ async function delTicker(t){
   }catch(e){alert("削除エラー: "+e.message)}
 }
 
-function rankChangeHtml(rc){
-  if(!rc) return "—";
-  const cls = rc.direction==="up"?"rc-up":rc.direction==="down"?"rc-down":rc.direction==="same"?"rc-same":"rc-new";
-  return `<div class="rankchg ${cls}">${esc(rc.label)}</div>`;
+function rankArrowHtml(rc){
+  if(!rc) return "";
+  if(rc.direction==="up") return `<span class="rankarrow rc-up">↑${rc.diff}</span>`;
+  if(rc.direction==="down") return `<span class="rankarrow rc-down">↓${Math.abs(rc.diff)}</span>`;
+  if(rc.direction==="same") return `<span class="rankarrow rc-same">→</span>`;
+  return `<span class="rankarrow rc-new">NEW</span>`;
 }
 
 function newsHtml(news){
-  if(!news || !news.length) return `<div class="newsbox small">前日の重要ニュースなし</div>`;
-  return `<div class="newsbox">` + news.slice(0,2).map(n=>{
+  if(!news || !news.length) return `<div class="newsblock"><span class="nonews">📰 直近の重要ニュースなし</span></div>`;
+  return `<div class="newsblock">` + news.slice(0,2).map(n=>{
     const title = esc(n.title||"");
     return n.url
       ? `📰 <a href="${esc(n.url)}" target="_blank" rel="noopener">${title}</a>`
@@ -286,47 +310,57 @@ function newsHtml(news){
   }).join("<br>") + `</div>`;
 }
 
-function capHtml(x){
-  if(!x.market_cap_text && !x.market_cap_label) return "—";
-  return `<div class="capbox">${esc(x.market_cap_text||"—")}<br><span class="captag">${esc(x.market_cap_label||"")}</span></div>`;
+function freshTagHtml(f){
+  f = f||{};
+  if(f.status==="fresh") return `<span class="freshtag fresh">🟢 最新（${fmtDate(f.last_trade_date)}取引分・${fmtDt(f.fetched_at)}取得）</span>`;
+  if(f.status==="stale") return `<span class="freshtag stalebadge">🟡 前回データ（${esc(f.last_error_label||"エラー")}）</span>`;
+  return `<span class="freshtag nonebadge">⚪ データなし</span>`;
 }
 
 function render(rows){
-  const tb=document.getElementById("tbody");
-  tb.innerHTML=rows.map((x,i)=>{
-    const f=x.freshness||{};
-    let freshHtml;
-    if(f.status==="fresh"){
-      freshHtml=`<div class="freshbox"><span class="fresh">${esc(f.label)}</span><br>最終取引日：${fmtDate(f.last_trade_date)}<br>取得日時：${fmtDt(f.fetched_at)}</div>`;
-    }else if(f.status==="stale"){
-      freshHtml=`<div class="freshbox"><span class="stalebadge">${esc(f.label)}</span><br>最終取引日：${fmtDate(f.last_trade_date)}<br>前回取得：${fmtDt(f.fetched_at)}<br>今回更新：${esc(f.last_error_label||"エラー")}</div>`;
-    }else{
-      freshHtml=`<div class="freshbox"><span class="nonebadge">${esc(f.label)}</span></div>`;
-    }
-    const cls=JBADGE[x.judgment]||"j-unknown";
-    return `<tr>
-      <td class="rank">${i+1}</td>
-      <td>${rankChangeHtml(x.rank_change)}</td>
-      <td><b>${esc(x.ticker)}</b></td>
-      <td class="score">${fmt(x.price)}</td>
-      <td class="${x.change_pct>0?'up':x.change_pct<0?'down':''}">${fmt(x.change_pct,"%")}</td>
-      <td>${fmt(x.month_return,"%")}</td>
-      <td>${fmt(x.rsi14)}</td>
-      <td>${fmt(x.ma20)}</td>
-      <td>${fmt(x.ma50)}</td>
-      <td>${fmt(x.high_gap,"%")}</td>
-      <td>${fmt(x.volume_ratio)}</td>
-      <td>${fmt(x.upside_score)}</td>
-      <td>${fmt(x.overheat_score)}</td>
-      <td>${esc(x.bottom_status||"—")}</td>
-      <td>${esc(x.phase||"—")}</td>
-      <td>${capHtml(x)}</td>
-      <td><span class="pill ${cls}">${esc(x.judgment)}</span></td>
-      <td class="reason">${esc(x.comment||"")}</td>
-      <td>${newsHtml(x.news)}</td>
-      <td>${freshHtml}</td>
-      <td><button class="secondary" onclick="delTicker('${esc(x.ticker)}')">削除</button></td>
-    </tr>`
+  const list=document.getElementById("list");
+  list.innerHTML = rows.map((x,i)=>{
+    const cls = JBADGE[x.judgment]||"j-unknown";
+    const rc = x.rank_change;
+    return `<div class="tcard">
+      <div class="rankline">
+        <span class="rankbig">${i+1}位</span>
+        <span class="tickerbig">${esc(x.ticker)}</span>
+        ${rankArrowHtml(rc)}
+        <span class="judgebadge pill ${cls}">${esc(x.judgment)}</span>
+      </div>
+      <div class="rankdetail">${rc?esc(rc.label):""}</div>
+
+      <div class="statrow">
+        <div class="stat"><div class="statlabel">株価</div><div class="statval">${fmt(x.price)}</div></div>
+        <div class="stat"><div class="statlabel">前日比</div><div class="statval ${x.change_pct>0?'up':x.change_pct<0?'down':''}">${fmt(x.change_pct,"%")}</div></div>
+        <div class="stat"><div class="statlabel">1ヶ月</div><div class="statval ${x.month_return>0?'up':x.month_return<0?'down':''}">${fmt(x.month_return,"%")}</div></div>
+        <div class="stat"><div class="statlabel">RSI14</div><div class="statval">${fmt(x.rsi14)}</div></div>
+        <div class="stat"><div class="statlabel">時価総額</div><div class="statval">${esc(x.market_cap_text||"—")}${x.market_cap_label?`<span class="captag">${esc(x.market_cap_label)}</span>`:""}</div></div>
+      </div>
+
+      <div class="commentbox">💬 ${esc(x.comment||"")}</div>
+      ${newsHtml(x.news)}
+
+      <details class="moredetail">
+        <summary>詳細指標を見る</summary>
+        <div class="detailgrid">
+          <div><div class="dl">MA20</div><div class="dv">${fmt(x.ma20)}</div></div>
+          <div><div class="dl">MA50</div><div class="dv">${fmt(x.ma50)}</div></div>
+          <div><div class="dl">高値乖離</div><div class="dv">${fmt(x.high_gap,"%")}</div></div>
+          <div><div class="dl">出来高比</div><div class="dv">${fmt(x.volume_ratio)}</div></div>
+          <div><div class="dl">上昇余地</div><div class="dv">${fmt(x.upside_score)}</div></div>
+          <div><div class="dl">過熱リスク</div><div class="dv">${fmt(x.overheat_score)}</div></div>
+          <div><div class="dl">底打ち状態</div><div class="dv">${esc(x.bottom_status||"—")}</div></div>
+          <div><div class="dl">局面</div><div class="dv">${esc(x.phase||"—")}</div></div>
+        </div>
+      </details>
+
+      <div class="cardfoot">
+        ${freshTagHtml(x.freshness)}
+        <button class="secondary" onclick="delTicker('${esc(x.ticker)}')">削除</button>
+      </div>
+    </div>`;
   }).join("");
 }
 
