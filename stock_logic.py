@@ -480,6 +480,12 @@ _TICKER_THEMES = {
     "VRT": "データセンター向け電力・冷却インフラ",
     "OKLO": "小型モジュール原子炉（データセンター電力向け）",
     "CCJ": "ウラン採掘・原子力燃料",
+    "AAPL": "iPhone・サービス収益中心の総合テック",
+    "MSFT": "クラウド(Azure)・AI・エンタープライズソフトウェア",
+    "GOOGL": "検索広告・クラウド・AI(Gemini)",
+    "AMZN": "EC・クラウド(AWS)",
+    "META": "SNS広告・AI基盤投資",
+    "TSLA": "EV・自動運転・エネルギー貯蔵",
 }
 
 
@@ -585,10 +591,10 @@ def sort_rows(rows):
 # ---------------------------------------------------------------------------
 
 _CONCLUSION_TEXT = {
-    "強く買いたい": "強く買いたい",
-    "買い候補": "買い候補",
-    "まだ買わない": "まだ買わない",
-    "過熱のため買わない": "過熱のため買わない",
+    "強く買いたい": "総合的に強く買いたい局面",
+    "買い候補": "総合的に買い候補と判断",
+    "まだ買わない": "総合的にまだ買い時ではない",
+    "過熱のため買わない": "過熱感が強く今は買わないほうが無難",
 }
 
 
@@ -599,16 +605,22 @@ def _shorten(text, n):
 
 def _news_clause(related_news, sentiment_score):
     """ニュースが取得できている場合の最優先クローズ。件名をそのまま埋め込むため、
-    銘柄ごとに内容が必ず変わる（定型文の使い回しにならない）。"""
+    銘柄ごとに内容が必ず変わる（定型文の使い回しにならない）。センチメントの強弱で
+    表現の温度感も変える。"""
     if not related_news:
         return None
-    title = _shorten(related_news[0].get("title", ""), 34)
+    title = _shorten(related_news[0].get("title", ""), 40)
     if not title:
         return None
-    if sentiment_score is not None and sentiment_score <= -0.15:
-        return f"「{title}」など懸念材料が重石"
-    if sentiment_score is not None and sentiment_score >= 0.15:
-        return f"「{title}」など好材料が追い風"
+    if sentiment_score is not None:
+        if sentiment_score >= 0.35:
+            return f"「{title}」など強い好材料が支え"
+        if sentiment_score >= 0.15:
+            return f"「{title}」など好材料が追い風"
+        if sentiment_score <= -0.35:
+            return f"「{title}」など強い悪材料が重石"
+        if sentiment_score <= -0.15:
+            return f"「{title}」など懸念材料が重石"
     return f"「{title}」が材料視されている"
 
 
@@ -636,13 +648,19 @@ def _bottom_clause(bottom_status, phase, change_pct):
 def _rsi_clause(rsi):
     if rsi is None:
         return None
+    if rsi >= 80:
+        return f"RSI{rsi:.0f}は極端な過熱圏"
     if rsi >= 75:
         return f"RSI{rsi:.0f}は明確な過熱圏"
     if rsi >= 65:
         return f"RSI{rsi:.0f}はやや過熱気味"
-    if rsi <= 30:
-        return f"RSI{rsi:.0f}は売られ過ぎ圏"
-    return f"RSI{rsi:.0f}は過熱していない水準"
+    if rsi >= 55:
+        return f"RSI{rsi:.0f}は底堅く推移"
+    if rsi >= 45:
+        return f"RSI{rsi:.0f}は中立圏で方向感に乏しい"
+    if rsi >= 30:
+        return f"RSI{rsi:.0f}はやや弱含み"
+    return f"RSI{rsi:.0f}は売られ過ぎ圏"
 
 
 def _trend_clause(ma20, ma50):
@@ -658,12 +676,16 @@ def _highgap_clause(high_gap):
         return "直近高値圏まで値を戻している"
     if high_gap <= -25:
         return f"直近高値から{abs(high_gap):.0f}%下押しした水準"
+    if high_gap <= -12:
+        return f"直近高値から{abs(high_gap):.0f}%ほど調整した水準"
     return None
 
 
 def _volume_clause(volume_ratio):
     if volume_ratio is None:
         return None
+    if volume_ratio >= 2.5:
+        return "出来高が急増し関心が急激に高まっている"
     if volume_ratio >= 1.8:
         return "出来高も急増しており関心が高い"
     if volume_ratio <= 0.6:
@@ -674,12 +696,31 @@ def _volume_clause(volume_ratio):
 def _month_clause(month_return):
     if month_return is None:
         return None
+    if month_return >= 40:
+        return f"1か月で{month_return:.0f}%超と急騰し値動きが極めて速い"
     if month_return >= 30:
         return f"1か月で{month_return:.0f}%超急騰しており値動きが速い"
     if month_return >= 15:
         return f"1か月で{month_return:.0f}%上昇と勢いが強い"
+    if month_return <= -30:
+        return f"1か月で{abs(month_return):.0f}%超下落し下げが加速"
     if month_return <= -15:
         return f"1か月で{abs(month_return):.0f}%下落している"
+    return None
+
+
+def _daychange_clause(change_pct):
+    """当日の値動きが大きい場合のみ言及する（前日比が地味な日は省略して情報過多を避ける）。"""
+    if change_pct is None:
+        return None
+    if change_pct >= 8:
+        return f"本日は+{change_pct:.1f}%と急伸"
+    if change_pct >= 5:
+        return f"本日は+{change_pct:.1f}%高"
+    if change_pct <= -8:
+        return f"本日は{change_pct:.1f}%と急落"
+    if change_pct <= -5:
+        return f"本日は{change_pct:.1f}%安"
     return None
 
 
@@ -691,14 +732,57 @@ def _capsize_clause(cap_label):
     return None
 
 
+def _ranked_support_clauses(judgment, ind, bottom_c, rsi_c, trend_c, hg_c, vol_c, month_c, day_c, cap_c):
+    """テクニカル材料候補を「その銘柄にとってどれだけ特徴的か」でスコア付けし、
+    重要度順に並べ替える。固定の文面パターンを繰り返すのではなく、実際の数値が
+    突出している指標ほど採用されやすくすることで、似た判定同士でも銘柄ごとに
+    異なる材料が前面に出るようにする。"""
+    rsi = ind.get("rsi")
+    month_return = ind.get("month_return")
+    change_pct = ind.get("change_pct")
+
+    candidates = []
+
+    def add(text, weight):
+        if text:
+            candidates.append((weight, text))
+
+    # 底打ち状態・局面は「なぜこの判定か」の中核情報。過熱判定では相対的に重要度を下げる。
+    add(bottom_c, 25 if judgment in ("強く買いたい", "買い候補", "まだ買わない") else 8)
+
+    rsi_weight = abs((rsi if rsi is not None else 50) - 50) * 0.5
+    if judgment == "過熱のため買わない":
+        rsi_weight *= 1.6
+    add(rsi_c, rsi_weight)
+
+    month_weight = abs(month_return or 0) * 0.6
+    if judgment == "過熱のため買わない":
+        month_weight *= 1.3
+    add(month_c, month_weight)
+
+    add(day_c, abs(change_pct or 0) * 1.2)
+    add(hg_c, 16)
+    add(vol_c, 11)
+    add(trend_c, 7)
+    add(cap_c, 4)
+
+    candidates.sort(key=lambda c: -c[0])
+    ranked = []
+    for _, text in candidates:
+        if text not in ranked:
+            ranked.append(text)
+    return ranked
+
+
 def build_comment(ticker, judgment, ind, bottom_status, phase, cap_label, sector, industry,
                    related_news, sentiment_score):
     """銘柄ごとに材料の異なる一言コメントを組み立てる。
 
-    ニュースが取得できていれば必ずそれを先頭材料として最優先で使い、無ければ
-    銘柄固有の事業テーマ（MU=メモリ/HBM、SNDK=NAND、NBIS=AIデータセンター等）を
-    先頭材料にする。どちらの場合も、その最終判定に至った「なぜ」が伝わるよう、
-    判定カテゴリごとに異なるテクニカル材料を後ろに続ける。
+    ニュースが取得できていれば見出しとセンチメントを先頭材料として最優先で使い、
+    無ければ銘柄固有の事業テーマ（MU=メモリ/HBM、SNDK=NAND、NBIS=AIデータセンター等）を
+    先頭材料にする。後ろに続くテクニカル材料は固定パターンではなく、その銘柄の数値が
+    実際にどれだけ突出しているかで動的に選ぶため、「RSIが○○なので買い候補」のような
+    使い回しの定型文になりにくい。
     """
     rsi = ind.get("rsi")
     ma20, ma50 = ind.get("ma20"), ind.get("ma50")
@@ -715,34 +799,26 @@ def build_comment(ticker, judgment, ind, bottom_status, phase, cap_label, sector
     hg_c = _highgap_clause(high_gap)
     vol_c = _volume_clause(volume_ratio)
     month_c = _month_clause(month_return)
+    day_c = _daychange_clause(change_pct)
     cap_c = _capsize_clause(cap_label)
 
-    # 判定カテゴリごとに「なぜその判定か」を最も説明するテクニカル材料の優先順を変える。
-    if judgment == "強く買いたい":
-        support = [bottom_c, rsi_c, vol_c, month_c, cap_c]
-    elif judgment == "買い候補":
-        support = [bottom_c, rsi_c, hg_c, trend_c, cap_c]
-    elif judgment == "過熱のため買わない":
-        support = [month_c, hg_c, rsi_c, vol_c, cap_c]
-    else:  # まだ買わない
-        support = [bottom_c, trend_c, hg_c, cap_c]
-    support = [c for c in support if c]
+    ranked = _ranked_support_clauses(judgment, ind, bottom_c, rsi_c, trend_c, hg_c, vol_c, month_c, day_c, cap_c)
 
     if news_c:
-        # ニュースがある場合は必ず先頭材料として最優先し、判定理由のテクニカル材料を後ろに続ける。
-        parts = [news_c] + support[:2]
+        # ニュースがある場合は必ず先頭材料（コメントの中心）とし、判定理由のテクニカル材料を後ろに続ける。
+        parts = [news_c] + ranked[:2]
     elif theme_c:
         # ニュースが無い場合は銘柄固有の事業テーマを先頭材料にする。
-        parts = [theme_c] + support[:2]
+        parts = [theme_c] + ranked[:2]
     else:
-        parts = support[:3]
+        parts = ranked[:3]
 
     parts = [p for p in dict.fromkeys(parts) if p][:3]  # 順序を保ったまま重複除去
     if not parts:
         parts = [c for c in [rsi_c, trend_c] if c] or ["データが限定的"]
 
     body = "、".join(parts)
-    return f"{body}ため{_CONCLUSION_TEXT.get(judgment, judgment)}。"
+    return f"{body}。{_CONCLUSION_TEXT.get(judgment, judgment)}。"
 
 
 def build_result(ticker, dates, closes, volumes, news_items=None,

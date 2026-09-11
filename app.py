@@ -137,6 +137,7 @@ HTML = r"""
 <style>
 *{box-sizing:border-box} body{margin:0;background:#f4f6f8;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif}
 .wrap{max-width:880px;margin:auto;padding:18px}
+@media(min-width:760px){.wrap{max-width:1120px}}
 .title{font-size:24px;font-weight:800;margin-bottom:5px}
 .sub{color:#68748a;margin-bottom:18px;font-size:13px;line-height:1.6}
 .card{background:white;border-radius:22px;padding:18px;margin-bottom:16px;box-shadow:0 2px 14px #0000000c}
@@ -145,14 +146,55 @@ HTML = r"""
 button{border:0;border-radius:13px;padding:12px 16px;font-weight:800;font-size:15px;cursor:pointer;background:#172033;color:white}
 button:disabled{opacity:.5;cursor:not-allowed}
 button.secondary{background:#eef1f5;color:#172033;padding:8px 14px;font-size:13px}
-.small{font-size:12px;color:#758096;margin-top:10px;line-height:1.6}
+.small{font-size:12px;color:#758096;margin-top:10px;line-height:1.6;min-height:14px}
 
-.list{display:flex;flex-direction:column;gap:14px}
-.tcard{background:white;border-radius:20px;padding:18px 20px;box-shadow:0 2px 14px #0000000c}
+details.opinfo{margin-top:6px}
+details.opinfo summary{cursor:pointer;font-size:11px;color:#98a2b3;font-weight:700;list-style:none}
+details.opinfo summary::-webkit-details-marker{display:none}
+details.opinfo summary::before{content:"▸ "}
+details.opinfo[open] summary::before{content:"▾ "}
+details.opinfo .opbody{font-size:11px;color:#98a2b3;margin-top:6px;line-height:1.7}
+
+details.logicinfo summary{cursor:pointer;font-size:15px;list-style:none;padding:2px 0}
+details.logicinfo summary::-webkit-details-marker{display:none}
+details.logicinfo summary::before{content:"▸ ";color:#758096}
+details.logicinfo[open] summary::before{content:"▾ ";color:#758096}
+details.logicinfo .small{margin-top:10px}
+
+.zerobanner{background:#eef1f5;color:#475467;font-weight:800;padding:14px 18px;border-radius:16px;margin-bottom:14px;font-size:15px;line-height:1.5}
+.zerobanner .sub2{display:block;font-weight:600;font-size:12px;color:#758096;margin-top:3px}
+
+.hero{border-radius:22px;padding:20px 22px;margin-bottom:18px;box-shadow:0 4px 20px #0000001a}
+.hero-buy{background:linear-gradient(135deg,#0c7a49,#0a5c38);color:#fff}
+.hero-caution{background:#fff;border:2px solid #e3b400}
+.herolabel{font-size:12px;font-weight:800;opacity:.9;margin-bottom:10px;letter-spacing:.02em}
+.hero-caution .herolabel{color:#8a6500}
+.heroline{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px}
+.herorank{font-size:15px;font-weight:900;opacity:.85}
+.heroticker{font-size:32px;font-weight:900;letter-spacing:.01em}
+.herorc{font-size:12px;opacity:.85;margin-bottom:14px}
+.hero-caution .herorc{color:#758096}
+.herostats{display:flex;gap:24px;flex-wrap:wrap;font-size:14px;margin-bottom:14px}
+.herostats b{font-size:19px}
+.herostats .up{color:#baf3d7}.herostats .down{color:#ffd0c7}
+.hero-caution .herostats .up{color:#087443}.hero-caution .herostats .down{color:#b42318}
+.herocomment{font-size:15px;line-height:1.75;background:rgba(255,255,255,.16);border-radius:14px;padding:14px 16px}
+.hero-caution .herocomment{background:#f7f9fc;color:#172033}
+.herowarn{margin-top:14px;background:#fff5cc;color:#8a6500;font-weight:800;padding:12px 14px;border-radius:12px;font-size:13px;line-height:1.6}
+.hero-buy .herowarn{background:rgba(255,255,255,.92)}
+
+.list{display:grid;grid-template-columns:1fr;gap:14px}
+@media(min-width:760px){.list{grid-template-columns:repeat(2,1fr)}}
+
+.tcard{background:white;border-radius:20px;padding:18px 20px;box-shadow:0 2px 14px #0000000c;border-left:5px solid #e5e7eb}
+.tcard.cj-strong_buy{border-left-color:#087443}
+.tcard.cj-buy{border-left-color:#4fb488}
+.tcard.cj-wait{border-left-color:#c9cfd8}
+.tcard.cj-overheat{border-left-color:#e3b400}
 .rankline{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;margin-bottom:2px}
-.rankbig{font-size:14px;font-weight:900;color:#98a2b3;white-space:nowrap}
-.tickerbig{font-size:23px;font-weight:900;letter-spacing:.01em}
-.rankarrow{font-size:15px;font-weight:900}
+.rankbig{font-size:17px;font-weight:900;color:#344054;white-space:nowrap}
+.tickerbig{font-size:20px;font-weight:900;letter-spacing:.01em}
+.rankarrow{font-size:14px;font-weight:900}
 .judgebadge{margin-left:auto}
 .rc-up{color:#087443}.rc-down{color:#b42318}.rc-same{color:#98a2b3}.rc-new{color:#98a2b3}
 .rankdetail{font-size:12px;color:#758096;margin-bottom:12px}
@@ -186,14 +228,16 @@ details.moredetail[open] summary::before{content:"▾ "}
 .pill{display:inline-block;padding:6px 12px;border-radius:999px;font-weight:800;font-size:12px;white-space:nowrap}
 .j-strong_buy{background:#087443;color:#fff}.j-buy{background:#e7f6ed;color:#087443}
 .j-wait{background:#eef1f5;color:#475467}.j-overheat{background:#fff5cc;color:#8a6500}.j-unknown{background:#f2f2f2;color:#98a2b3;font-style:italic}
+.hero-buy .herobadge.j-strong_buy{background:#fff;color:#087443}
+.hero-buy .herobadge.j-buy{background:#fff;color:#087443}
 
-@media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:20px}.statrow{gap:14px}}
+@media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}}
 </style>
 </head>
 <body>
 <div class="wrap">
 <div class="title">🏆 今買うべき銘柄ランキング</div>
-<div class="sub">実データ版｜最大15銘柄｜1日1回サーバー側で自動更新（GitHub Actions）｜銘柄追加時はその場で即時取得</div>
+<div class="sub">実データ版｜最大15銘柄｜毎朝サーバー側で自動更新｜「今日どれを優先すべきか」が一目で分かることを目指しています</div>
 
 <div class="card">
   <div class="controls">
@@ -202,19 +246,23 @@ details.moredetail[open] summary::before{content:"▾ "}
     <button onclick="addTicker()" id="addBtn">＋追加（即時取得）</button>
   </div>
   <div id="status" class="small">読み込み中…</div>
+  <details class="opinfo"><summary>運用情報</summary><div id="opinfo" class="opbody"></div></details>
 </div>
 
+<div id="hero"></div>
 <div class="list" id="list"></div>
 
 <div class="card">
-<b>🧠 判定ロジック（概要）</b>
+<details class="logicinfo">
+<summary><b>🧠 判定ロジック（概要）</b></summary>
 <div class="small">
 最終判定は「強く買いたい／買い候補／まだ買わない／過熱のため買わない」の4種類のみです。底打ち状態・局面・上昇余地スコア・過熱リスクスコアに加え、ニュースの内容（センチメント）と時価総額規模を補正材料として統合して決めます。<br>
 RSIや高値からの乖離、1か月の上昇率が過大な場合は、底打ち後の反発局面であっても「過熱のため買わない」を優先します。単純に値上がり中の銘柄を高評価する設計ではありません。<br>
-一言コメントはニュースがあれば最優先で反映し、無ければ銘柄固有の事業テーマとテクニカル指標から生成します。全銘柄で同じ文面にはなりません。<br>
+一言コメントはニュースがあれば最優先で反映し、無ければ銘柄固有の事業テーマとテクニカル指標から生成します。テクニカル材料はその銘柄で実際に値が突出している指標を優先して選ぶため、全銘柄で同じ文面にはなりません。<br>
 順位変化は前日（直近の自動更新時点）のランキングとの比較です。カードの「詳細指標を見る」から、MA20/MA50・高値乖離・出来高比・上昇余地／過熱リスクスコア・底打ち状態などの内訳を確認できます。<br>
 株価・ニュースは1日1回、GitHub Actionsによる自動ジョブがAlpha Vantageから取得しUpstash Redisに保存します。時価総額は変動が小さいため1回の自動更新につき最大1銘柄のみ取得し、API無料枠を圧迫しないようにしています。銘柄を「＋追加」した際はその銘柄のみ即時に取得します（右上のボタンは未取得・失敗銘柄限定の再取得です）。
 </div>
+</details>
 </div>
 </div>
 
@@ -222,6 +270,12 @@ RSIや高値からの乖離、1か月の上昇率が過大な場合は、底打�
 const JBADGE = {
   "強く買いたい":"j-strong_buy","買い候補":"j-buy","まだ買わない":"j-wait","過熱のため買わない":"j-overheat","判定不可":"j-unknown"
 };
+// カード全体の縁取り色分け用。JBADGEと同名にするとバッジ用の塗りつぶし背景色まで
+// カード全体に適用されてしまうため、別名にしている。
+const CARDCLASS = {
+  "強く買いたい":"cj-strong_buy","買い候補":"cj-buy","まだ買わない":"cj-wait","過熱のため買わない":"cj-overheat","判定不可":"cj-unknown"
+};
+const BUY_JUDGMENTS = new Set(["強く買いたい","買い候補"]);
 
 function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));}
 function fmt(v,suf){return (v===null||v===undefined)?"—":((v>0&&suf==="%")?"+":"")+v+(suf||"");}
@@ -235,22 +289,26 @@ function fmtDate(s){
 }
 
 async function updateRanking(extraMsg){
-  document.getElementById("status").textContent="読み込み中…";
+  document.getElementById("status").textContent = extraMsg || "読み込み中…";
   try{
     const r=await fetch("/api/ranking");
     const j=await r.json();
     if(!j.ok) throw new Error(j.error||"取得失敗");
     render(j.rows);
-    const lr=j.last_refresh;
-    const budget=j.budget||{};
-    let statusMsg = lr
-      ? `自動更新: ${lr.success_count}件成功／${lr.failed_count}件失敗（${fmtDt(lr.run_at)}実行）`
-      : "自動更新はまだ実行されていません";
-    statusMsg += ` ｜ 本日のAPI使用: ${budget.used??"—"}/${budget.limit??"—"}`;
-    if(j.rank_reference_date) statusMsg += ` ｜ 前日順位の基準日: ${fmtDate(j.rank_reference_date)}`;
-    if(extraMsg) statusMsg = extraMsg + " ｜ " + statusMsg;
-    document.getElementById("status").textContent = statusMsg;
+    renderOpInfo(j);
+    document.getElementById("status").textContent = extraMsg || "";
   }catch(e){document.getElementById("status").textContent="エラー："+e.message}
+}
+
+function renderOpInfo(j){
+  const lr=j.last_refresh;
+  const budget=j.budget||{};
+  let msg = lr
+    ? `自動更新: ${lr.success_count}件成功／${lr.failed_count}件失敗（${fmtDt(lr.run_at)}実行）`
+    : "自動更新はまだ実行されていません";
+  msg += ` ｜ 本日のAPI使用: ${budget.used??"—"}/${budget.limit??"—"}`;
+  if(j.rank_reference_date) msg += ` ｜ 前日順位の基準日: ${fmtDate(j.rank_reference_date)}`;
+  document.getElementById("opinfo").textContent = msg;
 }
 
 async function manualRefresh(){
@@ -317,12 +375,56 @@ function freshTagHtml(f){
   return `<span class="freshtag nonebadge">⚪ データなし</span>`;
 }
 
+function renderHero(rows){
+  const heroEl = document.getElementById("hero");
+  if(!rows || !rows.length){ heroEl.innerHTML=""; return; }
+
+  const strongCount = rows.filter(x=>x.judgment==="強く買いたい").length;
+  const top = rows[0];
+  const isBuy = BUY_JUDGMENTS.has(top.judgment);
+  const cls = JBADGE[top.judgment]||"j-unknown";
+
+  let banner = "";
+  if(strongCount===0){
+    banner = `<div class="zerobanner">📋 今日は積極的に買いたい銘柄なし<span class="sub2">「強く買いたい」判定は現在0件です</span></div>`;
+  }
+
+  let warn = "";
+  if(top.judgment==="判定不可"){
+    warn = `<div class="herowarn">⏳ まだデータを取得できていません。自動更新をお待ちください。</div>`;
+  }else if(!isBuy){
+    warn = `<div class="herowarn">⚠️ ランキング1位ですが、現在は買いを推奨しません（判定：${esc(top.judgment)}）。</div>`;
+  }
+
+  heroEl.innerHTML = `
+    ${banner}
+    <div class="hero ${isBuy?'hero-buy':'hero-caution'}">
+      <div class="herolabel">📌 今日の注目銘柄（ランキング1位）</div>
+      <div class="heroline">
+        <span class="herorank">1位</span>
+        <span class="heroticker">${esc(top.ticker)}</span>
+        ${rankArrowHtml(top.rank_change)}
+        <span class="pill herobadge ${cls}">${esc(top.judgment)}</span>
+      </div>
+      <div class="herorc">${top.rank_change?esc(top.rank_change.label):""}</div>
+      <div class="herostats">
+        <span>株価 <b>${fmt(top.price)}</b></span>
+        <span class="${top.change_pct>0?'up':top.change_pct<0?'down':''}">前日比 <b>${fmt(top.change_pct,"%")}</b></span>
+      </div>
+      <div class="herocomment">💬 ${esc(top.comment||"")}</div>
+      ${warn}
+    </div>
+  `;
+}
+
 function render(rows){
+  renderHero(rows);
   const list=document.getElementById("list");
   list.innerHTML = rows.map((x,i)=>{
     const cls = JBADGE[x.judgment]||"j-unknown";
     const rc = x.rank_change;
-    return `<div class="tcard">
+    const cardCls = CARDCLASS[x.judgment]||"cj-unknown";
+    return `<div class="tcard ${cardCls}">
       <div class="rankline">
         <span class="rankbig">${i+1}位</span>
         <span class="tickerbig">${esc(x.ticker)}</span>
