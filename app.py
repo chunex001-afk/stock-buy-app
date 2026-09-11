@@ -1,129 +1,332 @@
 import os
-import re
-from datetime import datetime, timezone
+import time
+import threading
+from datetime import datetime, timezone, timedelta
 
+import requests
 from flask import Flask, jsonify, request, render_template_string
-
-import redis_store as store
-import stock_logic as logic
-import refresh
 
 app = Flask(__name__)
 
 API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+MAX_TICKERS = 15
+DATA_TTL = 20 * 60 * 60  # 20 hours
+NEWS_TTL = 12 * 60 * 60
+API_URL = "https://www.alphavantage.co/query"
 
-# 手動更新のクールダウン。1日の自己申告予算(stock_logic.DAILY_API_BUDGET)に
-# 対して余裕が小さいため、自動更新より長めの間隔を空ける。
-MANUAL_REFRESH_COOLDOWN = 3 * 60 * 60  # 3時間
+DEFAULT_TICKERS = ["AXT", "NBIS", "AEHR", "MU", "SNDK", "BE", "IONQ", "CRDO"]
 
-# Redisのキャッシュがこの時間を超えて古い場合のみ、手動更新の対象に含める
-# （日次のGitHub Actionsジョブが何らかの理由で動かなかった場合の保険）。
-CACHE_FRESH_SECONDS = 20 * 60 * 60  # 20時間
-
-TICKER_RE = re.compile(r"[^A-Z0-9.\-]")
-
-
-def _sanitize_ticker(raw):
-    return TICKER_RE.sub("", (raw or "").strip().upper())
+cache = {}
+news_cache = {"ts": 0, "items": []}
+lock = threading.Lock()
+last_api_call = 0.0
 
 
-def _needs_refresh(record):
-    """Redis上のレコードが「取得済みキャッシュとして十分新しいか」を判定する。"""
-    if not record or not record.get("last_trade_date"):
-        return True
-    if record.get("is_stale"):
-        return True
-    fetched_at = record.get("fetched_at")
-    if not fetched_at:
-        return True
+def api_get(params):
+    """Alpha Vantage free-plan friendly request: never burst requests."""
+    global last_api_call
+    with lock:
+        wait = 1.05 - (time.time() - last_api_call)
+        if wait > 0:
+            time.sleep(wait)
+        params = dict(params)
+        params["apikey"] = API_KEY
+        r = requests.get(API_URL, params=params, timeout=20)
+        last_api_call = time.time()
+    r.raise_for_status()
+    return r.json()
+
+
+def clean_error(data):
+    if not isinstance(data, dict):
+        return "取得エラー"
+    for key in ("Error Message", "Note", "Information"):
+        if data.get(key):
+            return str(data[key])
+    return None
+
+
+def rsi14(closes):
+    if len(closes) < 15:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    n = 14
+    avg_gain = sum(gains[:n]) / n
+    avg_loss = sum(losses[:n]) / n
+    for i in range(n, len(gains)):
+        avg_gain = (avg_gain * (n - 1) + gains[i]) / n
+        avg_loss = (avg_loss * (n - 1) + losses[i]) / n
+    if avg_loss == 0:
+        return 100.0
+    return 100 - (100 / (1 + avg_gain / avg_loss))
+
+
+def sma(values, n):
+    if len(values) < n:
+        return None
+    return sum(values[-n:]) / n
+
+
+def fetch_price(ticker, force=False):
+    now = time.time()
+    old = cache.get(ticker)
+    if old and not force and now - old["ts"] < DATA_TTL:
+        return old["data"]
+
+    if not API_KEY:
+        return {"ticker": ticker, "error": "ALPHAVANTAGE_API_KEYが未設定です"}
+
     try:
-        fetched_dt = datetime.fromisoformat(fetched_at)
-    except ValueError:
-        return True
-    age = (datetime.now(timezone.utc).astimezone() - fetched_dt).total_seconds()
-    return age > CACHE_FRESH_SECONDS
+        data = api_get({
+            "function": "TIME_SERIES_DAILY",
+            "symbol": ticker,
+            "outputsize": "compact",
+        })
+        err = clean_error(data)
+        if err:
+            return {"ticker": ticker, "error": err}
 
+        series = data.get("Time Series (Daily)")
+        if not series:
+            return {"ticker": ticker, "error": "株価データを取得できませんでした"}
 
-def _freshness(record):
-    """画面表示用の鮮度情報を組み立てる。"""
-    if not record or not record.get("last_trade_date"):
-        return {
-            "status": "none",
-            "label": "⚪ データなし",
-            "last_trade_date": None,
-            "fetched_at": None,
-            "last_error_label": None,
-        }
+        rows = sorted(
+            [(d, float(v["4. close"]), int(float(v.get("5. volume", 0))))
+             for d, v in series.items()],
+            key=lambda x: x[0]
+        )
+        dates = [x[0] for x in rows]
+        closes = [x[1] for x in rows]
+        volumes = [x[2] for x in rows]
 
-    is_stale = bool(record.get("is_stale"))
-    if not is_stale:
-        return {
-            "status": "fresh",
-            "label": "🟢 最新",
-            "last_trade_date": record.get("last_trade_date"),
-            "fetched_at": record.get("fetched_at"),
-            "last_error_label": None,
-        }
+        if len(closes) < 20:
+            return {"ticker": ticker, "error": "データ不足"}
 
-    err_type = record.get("last_error")
-    return {
-        "status": "stale",
-        "label": "🟡 前回データ",
-        "last_trade_date": record.get("last_trade_date"),
-        "fetched_at": record.get("fetched_at"),
-        "last_error_label": logic.ERROR_LABELS.get(err_type, err_type or "不明なエラー"),
-    }
+        latest = closes[-1]
+        prev = closes[-2]
+        one_month = closes[-22] if len(closes) >= 22 else closes[0]
+        one_month_return = (latest / one_month - 1) * 100
 
+        ma20 = sma(closes, 20)
+        ma50 = sma(closes, 50)
+        rsi = rsi14(closes)
+        # Price position: recent high is only a secondary context signal.
+        # The primary recovery signal is how far price has risen from the
+        # recent bottom, not how far it remains below an old high.
+        recent_high = max(closes[-63:]) if len(closes) >= 63 else max(closes)
+        high_gap = (latest / recent_high - 1) * 100
+        recent_low_20 = min(closes[-20:])
+        rebound_from_low = (latest / recent_low_20 - 1) * 100 if recent_low_20 else 0
 
-def _build_row(ticker):
-    record = store.get_ticker_record(ticker)
-    freshness = _freshness(record)
+        # Check whether the recent pullback low is starting to rise.
+        higher_low = False
+        if len(closes) >= 15:
+            prior_low = min(closes[-15:-5])
+            latest_low = min(closes[-5:])
+            higher_low = latest_low > prior_low
 
-    if not record or not record.get("last_trade_date"):
-        return {
+        avg_vol20 = sma(volumes, 20)
+        vol_ratio = (volumes[-1] / avg_vol20) if avg_vol20 else 1
+
+        # Neutral "buy now" score based only on observable market data.
+        # No user preferences or hard-coded stock ranking are included.
+        score = 50.0
+
+        # Momentum / trend
+        score += max(-12, min(12, one_month_return * 0.35))
+        if ma20:
+            score += 5 if latest > ma20 else -5
+        if ma50:
+            score += 5 if latest > ma50 else -5
+        if ma20 and ma50:
+            score += 5 if ma20 > ma50 else -4
+
+        # RSI / overheating: strength and overheating are evaluated separately.
+        # A strong uptrend should NOT be pushed down simply because RSI is high.
+        # If trend + volume confirm strength, high RSI is treated as "strong but
+        # slightly overheated; buyable on a pullback" rather than a sell signal.
+        strong_trend = bool(
+            ma20 and ma50 and latest > ma20 > ma50
+            and one_month_return >= 8
+        )
+        volume_confirmed = vol_ratio >= 1.25
+        pullback_zone = high_gap <= -3
+
+        if rsi is not None:
+            if 45 <= rsi <= 65:
+                score += 6
+            elif 65 < rsi <= 72:
+                score += 3 if strong_trend else 2
+            elif rsi > 72:
+                # Do not over-penalize a confirmed strong trend.
+                score -= 1 if strong_trend else 5
+            elif 30 <= rsi < 45:
+                score += 2
+            elif rsi < 30:
+                score += 5
+
+        # PRIMARY recovery / rebound signal.
+        # Do NOT award points merely because the stock is far below its old high.
+        # Reward actual recovery from the recent low and improving lows.
+        if rebound_from_low >= 15:
+            score += 6
+        elif rebound_from_low >= 8:
+            score += 4
+        elif rebound_from_low >= 3:
+            score += 2
+        elif rebound_from_low < 0:
+            score -= 3
+
+        if higher_low:
+            score += 3
+
+        # Old-high distance is only a secondary price-position / overheating signal.
+        # Being far below the old high is NOT itself a buy signal.
+        if high_gap > -3:
+            score -= 1 if strong_trend else 3
+        elif high_gap <= -3 and high_gap >= -12 and strong_trend:
+            score += 2  # healthy pullback inside an established uptrend
+
+        # Volume confirmation
+        if vol_ratio >= 1.5:
+            score += 3
+        elif volume_confirmed and strong_trend:
+            score += 1
+
+        # "Strong but overheated" is a valid high-ranking state. The app should
+        # favor a strong trend with a manageable pullback over a weak stock just
+        # because the latter has a lower RSI.
+        if strong_trend and (rsi is not None and rsi > 65):
+            score += 2
+
+        score = max(0, min(100, round(score)))
+        if score >= 88:
+            judgment = "今買う候補"
+        elif score >= 80:
+            judgment = "買い場候補"
+        elif score >= 70:
+            judgment = "監視"
+        elif score >= 60:
+            judgment = "良い会社でも今は待つ"
+        else:
+            judgment = "今は見送り"
+
+        result = {
             "ticker": ticker,
-            "price": None, "change_pct": None, "month_return": None,
-            "rsi14": None, "ma20": None, "ma50": None,
-            "high_gap": None, "volume_ratio": None,
-            "upside_score": None, "overheat_score": None,
-            "bottom_status": None, "phase": None,
-            "market_cap": None, "market_cap_label": None, "market_cap_text": None,
-            "news": [],
-            "judgment": "判定不可",
-            "comment": "まだデータを取得できていません。追加直後は自動で取得を試みます。",
-            "freshness": freshness,
+            "date": dates[-1],
+            "price": round(latest, 2),
+            "change_pct": round((latest / prev - 1) * 100, 2),
+            "month_return": round(one_month_return, 2),
+            "rsi14": round(rsi, 1) if rsi is not None else None,
+            "ma20": round(ma20, 2) if ma20 else None,
+            "ma50": round(ma50, 2) if ma50 else None,
+            "high_gap": round(high_gap, 2),
+            "recent_low_20": round(recent_low_20, 2),
+            "rebound_from_low": round(rebound_from_low, 2),
+            "higher_low": higher_low,
+            "volume_ratio": round(vol_ratio, 2),
+            "score": score,
+            "judgment": judgment,
+            "error": None,
+            "source_note": "日足の実データから算出。企業業績・時価総額はこのAPI呼び出し回数制限のため自動取得対象外。",
         }
+        cache[ticker] = {"ts": now, "data": result}
+        return result
 
-    market_cap = record.get("market_cap")
-    return {
-        "ticker": ticker,
-        "price": record.get("price"),
-        "change_pct": record.get("change_pct"),
-        "month_return": record.get("month_return"),
-        "rsi14": record.get("rsi14"),
-        "ma20": record.get("ma20"),
-        "ma50": record.get("ma50"),
-        "high_gap": record.get("high_gap"),
-        "volume_ratio": record.get("volume_ratio"),
-        "upside_score": record.get("upside_score"),
-        "overheat_score": record.get("overheat_score"),
-        "bottom_status": record.get("bottom_status"),
-        "phase": record.get("phase"),
-        "market_cap": market_cap,
-        "market_cap_label": record.get("market_cap_label") or logic.classify_market_cap(market_cap),
-        "market_cap_text": logic.format_market_cap(market_cap),
-        "news": record.get("news", []),
-        "judgment": record.get("judgment", "判定不可"),
-        "comment": record.get("comment", ""),
-        "freshness": freshness,
-    }
+    except Exception as e:
+        return {"ticker": ticker, "error": str(e)}
 
 
-def _get_watchlist():
-    tickers = store.get_watchlist()
-    if not tickers:
-        return list(logic.DEFAULT_TICKERS)
-    return [t for t in tickers if t][: logic.MAX_TICKERS]
+def fetch_news(tickers, force=False):
+    global news_cache
+    now = time.time()
+    if news_cache["items"] and not force and now - news_cache["ts"] < NEWS_TTL:
+        return news_cache["items"]
+
+    if not API_KEY:
+        return []
+
+    try:
+        # One news request for the whole candidate set.
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": ",".join(tickers),
+            "sort": "LATEST",
+            "limit": 50,
+        }
+        data = api_get(params)
+        err = clean_error(data)
+        if err:
+            return []
+
+        items = []
+        for x in data.get("feed", []):
+            published = x.get("time_published", "")
+            # Only surface very recent news (roughly previous market day / last 36h).
+            try:
+                dt = datetime.strptime(published[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+                age = datetime.now(timezone.utc) - dt
+                if age > timedelta(hours=36):
+                    continue
+            except Exception:
+                pass
+
+            matched = []
+            for ts in x.get("ticker_sentiment", []):
+                t = ts.get("ticker")
+                if t in tickers:
+                    matched.append(t)
+            if not matched:
+                continue
+
+            items.append({
+                "title": x.get("title", ""),
+                "url": x.get("url", ""),
+                "source": x.get("source", ""),
+                "published": published,
+                "tickers": matched,
+            })
+
+        news_cache = {"ts": now, "items": items[:30]}
+        return news_cache["items"]
+    except Exception:
+        return []
+
+
+def reason_for(ticker, data, news):
+    if data.get("error"):
+        return data["error"]
+    related = [n for n in news if ticker in n.get("tickers", [])]
+    if related:
+        return f"ニュース: {related[0]['title']}"
+    rsi = data.get("rsi14")
+    month = data.get("month_return", 0) or 0
+    high_gap = data.get("high_gap", 0) or 0
+    rebound = data.get("rebound_from_low", 0) or 0
+    higher_low = data.get("higher_low", False)
+    ma20 = data.get("ma20")
+    ma50 = data.get("ma50")
+    price = data.get("price")
+    strong_trend = bool(ma20 and ma50 and price and price > ma20 > ma50 and month >= 8)
+    if strong_trend and rsi is not None and rsi > 65:
+        if rebound >= 8 or higher_low:
+            return "強い上昇トレンドを維持。直近安値からの反発も確認でき、やや過熱でも押し目では買いやすい"
+        return "強い上昇トレンドを維持。短期的な過熱には注意"
+    if rebound >= 12 and higher_low:
+        return "直近安値からの反発が強く、安値も切り上がり始めている。上昇継続を評価"
+    if rebound >= 5:
+        return "直近安値から反発中。最高値からの下落率より、現在の上昇モメンタムを重視"
+    if month >= 15:
+        return "1か月上昇率が高く、上昇モメンタムが強い"
+    if rsi is not None and rsi > 72:
+        return "RSIが高く短期的な過熱感あり。ただしトレンドの強さも確認"
+    if rsi is not None and rsi < 35:
+        return "RSIが低く、反発余地を確認したい局面"
+    return "株価トレンド・RSI・移動平均から判定"
 
 
 HTML = r"""
@@ -136,537 +339,151 @@ HTML = r"""
 <title>今買うべき銘柄ランキング</title>
 <style>
 *{box-sizing:border-box} body{margin:0;background:#f4f6f8;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif}
-.wrap{max-width:880px;margin:auto;padding:18px}
-@media(min-width:760px){.wrap{max-width:1120px}}
-.title{font-size:24px;font-weight:800;margin-bottom:5px}
-.sub{color:#68748a;margin-bottom:18px;font-size:13px;line-height:1.6}
+.wrap{max-width:1200px;margin:auto;padding:18px}.title{font-size:28px;font-weight:800;margin-bottom:5px}.sub{color:#68748a;margin-bottom:18px}
 .card{background:white;border-radius:22px;padding:18px;margin-bottom:16px;box-shadow:0 2px 14px #0000000c}
-.controls{display:flex;gap:8px;flex-wrap:wrap}
-.controls input{flex:1;min-width:150px;padding:13px;border:1px solid #ccd2db;border-radius:13px;font-size:16px}
+.controls{display:flex;gap:8px;flex-wrap:wrap}.controls input{flex:1;min-width:150px;padding:13px;border:1px solid #ccd2db;border-radius:13px;font-size:16px}
 button{border:0;border-radius:13px;padding:12px 16px;font-weight:800;font-size:15px;cursor:pointer;background:#172033;color:white}
-button:disabled{opacity:.5;cursor:not-allowed}
-button.secondary{background:#eef1f5;color:#172033;padding:8px 14px;font-size:13px}
-.small{font-size:12px;color:#758096;margin-top:10px;line-height:1.6;min-height:14px}
-
-details.opinfo{margin-top:6px}
-details.opinfo summary{cursor:pointer;font-size:11px;color:#98a2b3;font-weight:700;list-style:none}
-details.opinfo summary::-webkit-details-marker{display:none}
-details.opinfo summary::before{content:"▸ "}
-details.opinfo[open] summary::before{content:"▾ "}
-details.opinfo .opbody{font-size:11px;color:#98a2b3;margin-top:6px;line-height:1.7}
-
-details.logicinfo summary{cursor:pointer;font-size:15px;list-style:none;padding:2px 0}
-details.logicinfo summary::-webkit-details-marker{display:none}
-details.logicinfo summary::before{content:"▸ ";color:#758096}
-details.logicinfo[open] summary::before{content:"▾ ";color:#758096}
-details.logicinfo .small{margin-top:10px}
-
-.zerobanner{background:#eef1f5;color:#475467;font-weight:800;padding:14px 18px;border-radius:16px;margin-bottom:14px;font-size:15px;line-height:1.5}
-.zerobanner .sub2{display:block;font-weight:600;font-size:12px;color:#758096;margin-top:3px}
-
-.hero{border-radius:22px;padding:20px 22px;margin-bottom:18px;box-shadow:0 4px 20px #0000001a}
-.hero-buy{background:linear-gradient(135deg,#0c7a49,#0a5c38);color:#fff}
-.hero-caution{background:#fff;border:2px solid #e3b400}
-.herolabel{font-size:12px;font-weight:800;opacity:.9;margin-bottom:10px;letter-spacing:.02em}
-.hero-caution .herolabel{color:#8a6500}
-.heroline{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px}
-.herorank{font-size:15px;font-weight:900;opacity:.85}
-.heroticker{font-size:32px;font-weight:900;letter-spacing:.01em}
-.herorc{font-size:12px;opacity:.85;margin-bottom:14px}
-.hero-caution .herorc{color:#758096}
-.herostats{display:flex;gap:24px;flex-wrap:wrap;font-size:14px;margin-bottom:14px}
-.herostats b{font-size:19px}
-.herostats .up{color:#baf3d7}.herostats .down{color:#ffd0c7}
-.hero-caution .herostats .up{color:#087443}.hero-caution .herostats .down{color:#b42318}
-.herocomment{font-size:15px;line-height:1.75;background:rgba(255,255,255,.16);border-radius:14px;padding:14px 16px}
-.hero-caution .herocomment{background:#f7f9fc;color:#172033}
-.herowarn{margin-top:14px;background:#fff5cc;color:#8a6500;font-weight:800;padding:12px 14px;border-radius:12px;font-size:13px;line-height:1.6}
-.hero-buy .herowarn{background:rgba(255,255,255,.92)}
-
-.list{display:grid;grid-template-columns:1fr;gap:14px}
-@media(min-width:760px){.list{grid-template-columns:repeat(2,1fr)}}
-
-.tcard{background:white;border-radius:20px;padding:18px 20px;box-shadow:0 2px 14px #0000000c;border-left:5px solid #e5e7eb}
-.tcard.cj-strong_buy{border-left-color:#087443}
-.tcard.cj-buy{border-left-color:#4fb488}
-.tcard.cj-wait{border-left-color:#c9cfd8}
-.tcard.cj-overheat{border-left-color:#e3b400}
-.rankline{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;margin-bottom:2px}
-.rankbig{font-size:17px;font-weight:900;color:#344054;white-space:nowrap}
-.tickerbig{font-size:20px;font-weight:900;letter-spacing:.01em}
-.rankarrow{font-size:14px;font-weight:900}
-.judgebadge{margin-left:auto}
-.rc-up{color:#087443}.rc-down{color:#b42318}.rc-same{color:#98a2b3}.rc-new{color:#98a2b3}
-.rankdetail{font-size:12px;color:#758096;margin-bottom:12px}
-
-.statrow{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid #eef1f5}
-.stat{min-width:60px}
-.statlabel{font-size:11px;color:#98a2b3;font-weight:700;margin-bottom:2px}
-.statval{font-size:16px;font-weight:800;white-space:nowrap}
-.statval.up{color:#087443}.statval.down{color:#b42318}
-.captag{display:block;font-size:10px;color:#98a2b3;font-weight:600;margin-top:1px}
-
-.commentbox{background:#f7f9fc;border-radius:13px;padding:12px 14px;font-size:14px;line-height:1.65;margin-bottom:10px}
-.newsblock{font-size:13px;line-height:1.7;margin-bottom:10px}
-.newsblock a{color:#175cd3;text-decoration:none}
-.newsblock a:hover{text-decoration:underline}
-.newsblock .nonews{color:#98a2b3}
-
-details.moredetail{margin-top:2px}
-details.moredetail summary{cursor:pointer;font-size:12px;color:#475467;font-weight:700;list-style:none;padding:4px 0}
-details.moredetail summary::-webkit-details-marker{display:none}
-details.moredetail summary::before{content:"▸ "}
-details.moredetail[open] summary::before{content:"▾ "}
-.detailgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(108px,1fr));gap:10px 16px;margin:10px 0 6px;font-size:12px}
-.detailgrid .dl{color:#98a2b3;margin-bottom:2px}
-.detailgrid .dv{font-weight:700}
-
-.cardfoot{display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px;flex-wrap:wrap}
-.fresh{color:#087443;font-weight:700}.stalebadge{color:#8a6500;font-weight:700}.nonebadge{color:#98a2b3;font-weight:700}
-.freshtag{font-size:11px}
-
-.pill{display:inline-block;padding:6px 12px;border-radius:999px;font-weight:800;font-size:12px;white-space:nowrap}
-.j-strong_buy{background:#087443;color:#fff}.j-buy{background:#e7f6ed;color:#087443}
-.j-wait{background:#eef1f5;color:#475467}.j-overheat{background:#fff5cc;color:#8a6500}.j-unknown{background:#f2f2f2;color:#98a2b3;font-style:italic}
-.hero-buy .herobadge.j-strong_buy{background:#fff;color:#087443}
-.hero-buy .herobadge.j-buy{background:#fff;color:#087443}
-
-@media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}}
+button.secondary{background:#eef1f5;color:#172033}.small{font-size:12px;color:#758096;margin-top:10px}
+table{width:100%;border-collapse:collapse} th,td{padding:13px 8px;border-bottom:1px solid #e7eaf0;text-align:left;vertical-align:top} th{font-size:13px;color:#667085} td{font-size:14px}
+.rank{font-weight:900;font-size:18px}.score{font-size:21px;font-weight:900}.pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#edf3ff;font-weight:800}.err{background:#fff0e8;color:#a84b18}.up{color:#087443;font-weight:800}.down{color:#b42318;font-weight:800}.reason{max-width:430px;line-height:1.45}
+@media(max-width:760px){.wrap{padding:12px}.title{font-size:23px}table{min-width:760px}.tablebox{overflow-x:auto}.card{border-radius:18px;padding:14px}.controls button{width:auto}.hide-mobile{display:none}}
 </style>
 </head>
 <body>
 <div class="wrap">
 <div class="title">🏆 今買うべき銘柄ランキング</div>
-<div class="sub">実データ版｜最大15銘柄｜毎朝サーバー側で自動更新｜「今日どれを優先すべきか」が一目で分かることを目指しています</div>
+<div class="sub">実データ版｜最大15銘柄｜開くと更新｜前日の重要ニュースがある場合だけ表示</div>
 
 <div class="card">
   <div class="controls">
-    <button onclick="manualRefresh()" id="refreshBtn">🔄 未取得/失敗分だけ今すぐ再取得</button>
+    <button onclick="updateRanking(true)">🔄 最新データに更新</button>
     <input id="ticker" placeholder="例 NVDA" maxlength="10" onkeydown="if(event.key==='Enter')addTicker()">
-    <button onclick="addTicker()" id="addBtn">＋追加（即時取得）</button>
+    <button onclick="addTicker()">＋追加</button>
   </div>
   <div id="status" class="small">読み込み中…</div>
-  <details class="opinfo"><summary>運用情報</summary><div id="opinfo" class="opbody"></div></details>
 </div>
-
-<div id="hero"></div>
-<div class="list" id="list"></div>
 
 <div class="card">
-<details class="logicinfo">
-<summary><b>🧠 判定ロジック（概要）</b></summary>
-<div class="small">
-最終判定は「強く買いたい／買い候補／まだ買わない／過熱のため買わない」の4種類のみです。底打ち状態・局面・上昇余地スコア・過熱リスクスコアに加え、ニュースの内容（センチメント）と時価総額規模を補正材料として統合して決めます。<br>
-RSIや高値からの乖離、1か月の上昇率が過大な場合は、底打ち後の反発局面であっても「過熱のため買わない」を優先します。単純に値上がり中の銘柄を高評価する設計ではありません。<br>
-一言コメントはニュースがあれば最優先で反映し、無ければ銘柄固有の事業テーマとテクニカル指標から生成します。テクニカル材料はその銘柄で実際に値が突出している指標を優先して選ぶため、全銘柄で同じ文面にはなりません。<br>
-順位変化は前日（直近の自動更新時点）のランキングとの比較です。カードの「詳細指標を見る」から、MA20/MA50・高値乖離・出来高比・上昇余地／過熱リスクスコア・底打ち状態などの内訳を確認できます。<br>
-株価・ニュースは1日1回、GitHub Actionsによる自動ジョブがAlpha Vantageから取得しUpstash Redisに保存します。時価総額は変動が小さいため1回の自動更新につき最大1銘柄のみ取得し、API無料枠を圧迫しないようにしています。銘柄を「＋追加」した際はその銘柄のみ即時に取得します（右上のボタンは未取得・失敗銘柄限定の再取得です）。
+<div class="tablebox">
+<table>
+<thead><tr><th>順位</th><th>銘柄</th><th>スコア</th><th>判定</th><th>前日比</th><th>1か月</th><th>RSI14</th><th>主な理由</th><th></th></tr></thead>
+<tbody id="tbody"></tbody>
+</table>
 </div>
-</details>
+</div>
+
+<div class="card">
+<b>🎯 1か月で最も起こりやすい上昇幅</b>
+<div id="range" style="font-size:22px;font-weight:900;margin-top:8px">—</div>
+<div class="small">直近の日足データから候補銘柄の1か月リターンを参考に表示。将来の確率を保証するものではありません。</div>
+</div>
+
+<div class="card">
+<b>🧠 判定ロジック</b>
+<div class="small" style="line-height:1.7">
+株価モメンタム、MA20/MA50、RSI14、直近安値からの反発率、安値の切り上がり、出来高を中心に0〜100で算出。<b>最高値から何％下落しているかは主判定にしません。</b>直近安値からの上昇と上昇継続性を優先し、強い上昇トレンド中の高RSIは過度に減点せず、「強いがやや過熱・押し目で買いやすい」と評価します。<br>
+企業業績・時価総額を小さいだけで加点するような処理はしていません。ユーザー個人の保有銘柄や考え方もスコアには入れていません。
+</div>
 </div>
 </div>
 
 <script>
-const JBADGE = {
-  "強く買いたい":"j-strong_buy","買い候補":"j-buy","まだ買わない":"j-wait","過熱のため買わない":"j-overheat","判定不可":"j-unknown"
-};
-// カード全体の縁取り色分け用。JBADGEと同名にするとバッジ用の塗りつぶし背景色まで
-// カード全体に適用されてしまうため、別名にしている。
-const CARDCLASS = {
-  "強く買いたい":"cj-strong_buy","買い候補":"cj-buy","まだ買わない":"cj-wait","過熱のため買わない":"cj-overheat","判定不可":"cj-unknown"
-};
-const BUY_JUDGMENTS = new Set(["強く買いたい","買い候補"]);
+const DEFAULTS={{ defaults|tojson }};
+let tickers=JSON.parse(localStorage.getItem("buy_app_tickers")||"null")||DEFAULTS;
+let previous=JSON.parse(localStorage.getItem("buy_app_prev_rank")||"{}");
 
+function save(){localStorage.setItem("buy_app_tickers",JSON.stringify(tickers));}
 function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));}
-function fmt(v,suf){return (v===null||v===undefined)?"—":((v>0&&suf==="%")?"+":"")+v+(suf||"");}
-function fmtDt(iso){
-  if(!iso) return "—";
-  try{const d=new Date(iso);return d.toLocaleString("ja-JP",{year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"});}catch(e){return iso;}
-}
-function fmtDate(s){
-  if(!s) return "—";
-  return s.replaceAll("-","/");
-}
 
-async function updateRanking(extraMsg){
-  document.getElementById("status").textContent = extraMsg || "読み込み中…";
+async function updateRanking(force=false){
+  if(tickers.length===0){document.getElementById("status").textContent="銘柄を追加してください";return}
+  document.getElementById("status").textContent="データ取得中…（初回は15銘柄で少し時間がかかります）";
   try{
-    const r=await fetch("/api/ranking");
+    const r=await fetch("/api/ranking?tickers="+encodeURIComponent(tickers.join(","))+(force?"&force=1":""));
     const j=await r.json();
     if(!j.ok) throw new Error(j.error||"取得失敗");
-    render(j.rows);
-    renderOpInfo(j);
-    document.getElementById("status").textContent = extraMsg || "";
+    render(j.rows,j.news);
+    document.getElementById("status").textContent="最終更新："+j.updated_at+"｜無料API対策：取得データを20時間キャッシュ";
   }catch(e){document.getElementById("status").textContent="エラー："+e.message}
 }
-
-function renderOpInfo(j){
-  const lr=j.last_refresh;
-  const budget=j.budget||{};
-  let msg = lr
-    ? `自動更新: ${lr.success_count}件成功／${lr.failed_count}件失敗（${fmtDt(lr.run_at)}実行）`
-    : "自動更新はまだ実行されていません";
-  msg += ` ｜ 本日のAPI使用: ${budget.used??"—"}/${budget.limit??"—"}`;
-  if(j.rank_reference_date) msg += ` ｜ 前日順位の基準日: ${fmtDate(j.rank_reference_date)}`;
-  document.getElementById("opinfo").textContent = msg;
-}
-
-async function manualRefresh(){
-  const btn=document.getElementById("refreshBtn");
-  btn.disabled=true;
-  document.getElementById("status").textContent="未取得・失敗銘柄を再取得中…";
-  try{
-    const r=await fetch("/api/refresh",{method:"POST"});
-    const j=await r.json();
-    if(!j.ok){document.getElementById("status").textContent="更新できません："+j.error;}
-    else{document.getElementById("status").textContent=j.message||"更新しました";}
-    await updateRanking();
-  }catch(e){document.getElementById("status").textContent="エラー："+e.message}
-  finally{btn.disabled=false;}
-}
-
-async function addTicker(){
+function addTicker(){
   const el=document.getElementById("ticker"), t=el.value.trim().toUpperCase().replace(/[^A-Z0-9.\-]/g,"");
   if(!t)return;
-  const btn=document.getElementById("addBtn");
-  btn.disabled=true;
-  document.getElementById("status").textContent=`${t}を追加して即時取得中…`;
-  try{
-    const r=await fetch("/api/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:t})});
-    const j=await r.json();
-    if(!j.ok){alert(j.error||"追加できませんでした");return;}
-    el.value="";
-    await updateRanking(j.fetch_note?`${t}: ${j.fetch_note}`:null);
-  }catch(e){alert("追加エラー: "+e.message)}
-  finally{btn.disabled=false;}
+  if(tickers.includes(t)){el.value="";return}
+  if(tickers.length>=15){alert("登録できる銘柄は最大15銘柄です");return}
+  tickers.push(t);save();el.value="";updateRanking(false);
 }
-
-async function delTicker(t){
-  try{
-    const r=await fetch("/api/watchlist/"+encodeURIComponent(t),{method:"DELETE"});
-    const j=await r.json();
-    if(!j.ok){alert(j.error||"削除できませんでした");return;}
-    await updateRanking();
-  }catch(e){alert("削除エラー: "+e.message)}
+function delTicker(t){
+  tickers=tickers.filter(x=>x!==t);save();updateRanking(false);
 }
-
-function rankArrowHtml(rc){
-  if(!rc) return "";
-  if(rc.direction==="up") return `<span class="rankarrow rc-up">↑${rc.diff}</span>`;
-  if(rc.direction==="down") return `<span class="rankarrow rc-down">↓${Math.abs(rc.diff)}</span>`;
-  if(rc.direction==="same") return `<span class="rankarrow rc-same">→</span>`;
-  return `<span class="rankarrow rc-new">NEW</span>`;
-}
-
-function newsHtml(news){
-  if(!news || !news.length) return `<div class="newsblock"><span class="nonews">📰 直近の重要ニュースなし</span></div>`;
-  return `<div class="newsblock">` + news.slice(0,2).map(n=>{
-    const title = esc(n.title||"");
-    return n.url
-      ? `📰 <a href="${esc(n.url)}" target="_blank" rel="noopener">${title}</a>`
-      : `📰 ${title}`;
-  }).join("<br>") + `</div>`;
-}
-
-function freshTagHtml(f){
-  f = f||{};
-  if(f.status==="fresh") return `<span class="freshtag fresh">🟢 最新（${fmtDate(f.last_trade_date)}取引分・${fmtDt(f.fetched_at)}取得）</span>`;
-  if(f.status==="stale") return `<span class="freshtag stalebadge">🟡 前回データ（${esc(f.last_error_label||"エラー")}）</span>`;
-  return `<span class="freshtag nonebadge">⚪ データなし</span>`;
-}
-
-function renderHero(rows){
-  const heroEl = document.getElementById("hero");
-  if(!rows || !rows.length){ heroEl.innerHTML=""; return; }
-
-  const strongCount = rows.filter(x=>x.judgment==="強く買いたい").length;
-  const top = rows[0];
-  const isBuy = BUY_JUDGMENTS.has(top.judgment);
-  const cls = JBADGE[top.judgment]||"j-unknown";
-
-  let banner = "";
-  if(strongCount===0){
-    banner = `<div class="zerobanner">📋 今日は積極的に買いたい銘柄なし<span class="sub2">「強く買いたい」判定は現在0件です</span></div>`;
-  }
-
-  let warn = "";
-  if(top.judgment==="判定不可"){
-    warn = `<div class="herowarn">⏳ まだデータを取得できていません。自動更新をお待ちください。</div>`;
-  }else if(!isBuy){
-    warn = `<div class="herowarn">⚠️ ランキング1位ですが、現在は買いを推奨しません（判定：${esc(top.judgment)}）。</div>`;
-  }
-
-  heroEl.innerHTML = `
-    ${banner}
-    <div class="hero ${isBuy?'hero-buy':'hero-caution'}">
-      <div class="herolabel">📌 今日の注目銘柄（ランキング1位）</div>
-      <div class="heroline">
-        <span class="herorank">1位</span>
-        <span class="heroticker">${esc(top.ticker)}</span>
-        ${rankArrowHtml(top.rank_change)}
-        <span class="pill herobadge ${cls}">${esc(top.judgment)}</span>
-      </div>
-      <div class="herorc">${top.rank_change?esc(top.rank_change.label):""}</div>
-      <div class="herostats">
-        <span>株価 <b>${fmt(top.price)}</b></span>
-        <span class="${top.change_pct>0?'up':top.change_pct<0?'down':''}">前日比 <b>${fmt(top.change_pct,"%")}</b></span>
-      </div>
-      <div class="herocomment">💬 ${esc(top.comment||"")}</div>
-      ${warn}
-    </div>
-  `;
-}
-
-function render(rows){
-  renderHero(rows);
-  const list=document.getElementById("list");
-  list.innerHTML = rows.map((x,i)=>{
-    const cls = JBADGE[x.judgment]||"j-unknown";
-    const rc = x.rank_change;
-    const cardCls = CARDCLASS[x.judgment]||"cj-unknown";
-    return `<div class="tcard ${cardCls}">
-      <div class="rankline">
-        <span class="rankbig">${i+1}位</span>
-        <span class="tickerbig">${esc(x.ticker)}</span>
-        ${rankArrowHtml(rc)}
-        <span class="judgebadge pill ${cls}">${esc(x.judgment)}</span>
-      </div>
-      <div class="rankdetail">${rc?esc(rc.label):""}</div>
-
-      <div class="statrow">
-        <div class="stat"><div class="statlabel">株価</div><div class="statval">${fmt(x.price)}</div></div>
-        <div class="stat"><div class="statlabel">前日比</div><div class="statval ${x.change_pct>0?'up':x.change_pct<0?'down':''}">${fmt(x.change_pct,"%")}</div></div>
-        <div class="stat"><div class="statlabel">1ヶ月</div><div class="statval ${x.month_return>0?'up':x.month_return<0?'down':''}">${fmt(x.month_return,"%")}</div></div>
-        <div class="stat"><div class="statlabel">RSI14</div><div class="statval">${fmt(x.rsi14)}</div></div>
-        <div class="stat"><div class="statlabel">時価総額</div><div class="statval">${esc(x.market_cap_text||"—")}${x.market_cap_label?`<span class="captag">${esc(x.market_cap_label)}</span>`:""}</div></div>
-      </div>
-
-      <div class="commentbox">💬 ${esc(x.comment||"")}</div>
-      ${newsHtml(x.news)}
-
-      <details class="moredetail">
-        <summary>詳細指標を見る</summary>
-        <div class="detailgrid">
-          <div><div class="dl">MA20</div><div class="dv">${fmt(x.ma20)}</div></div>
-          <div><div class="dl">MA50</div><div class="dv">${fmt(x.ma50)}</div></div>
-          <div><div class="dl">高値乖離</div><div class="dv">${fmt(x.high_gap,"%")}</div></div>
-          <div><div class="dl">出来高比</div><div class="dv">${fmt(x.volume_ratio)}</div></div>
-          <div><div class="dl">上昇余地</div><div class="dv">${fmt(x.upside_score)}</div></div>
-          <div><div class="dl">過熱リスク</div><div class="dv">${fmt(x.overheat_score)}</div></div>
-          <div><div class="dl">底打ち状態</div><div class="dv">${esc(x.bottom_status||"—")}</div></div>
-          <div><div class="dl">局面</div><div class="dv">${esc(x.phase||"—")}</div></div>
-        </div>
-      </details>
-
-      <div class="cardfoot">
-        ${freshTagHtml(x.freshness)}
-        <button class="secondary" onclick="delTicker('${esc(x.ticker)}')">削除</button>
-      </div>
-    </div>`;
+function render(rows,news){
+  const rank={}; rows.forEach((x,i)=>rank[x.ticker]=i+1);
+  const tb=document.getElementById("tbody");
+  tb.innerHTML=rows.map((x,i)=>{
+    const old=previous[x.ticker];
+    let move="NEW", cls="";
+    if(old){const d=old-(i+1); if(d>0){move="↑"+d;cls="up"} else if(d<0){move="↓"+Math.abs(d);cls="down"} else move="→"}
+    const err=x.error;
+    const reason=esc(x.reason||"");
+    return `<tr>
+      <td class="rank">${i+1}</td>
+      <td><b>${esc(x.ticker)}</b><div class="small">${esc(x.date||"")}</div></td>
+      <td class="score">${err?"—":x.score}</td>
+      <td><span class="pill ${err?"err":""}">${esc(err?"取得エラー":x.judgment)}</span></td>
+      <td class="${x.change_pct>0?'up':x.change_pct<0?'down':''}">${err?"—":(x.change_pct>0?"+":"")+x.change_pct+"%"}</td>
+      <td>${err?"—":(x.month_return>0?"+":"")+x.month_return+"%"}</td>
+      <td>${err?"—":(x.rsi14??"—")}</td>
+      <td class="reason">${reason}</td>
+      <td><button class="secondary" onclick="delTicker('${esc(x.ticker)}')">削除</button></td>
+    </tr>`
   }).join("");
+  previous=rank;localStorage.setItem("buy_app_prev_rank",JSON.stringify(previous));
+  const good=rows.filter(x=>!x.error).map(x=>x.month_return).sort((a,b)=>b-a);
+  document.getElementById("range").textContent=good.length?((good[Math.min(2,good.length-1)]>=0?"+":"")+good[Math.min(2,good.length-1)]+"%前後"):"—";
 }
-
-updateRanking();
+updateRanking(false);
 </script>
 </body>
 </html>
 """
 
-
 @app.get("/")
 def index():
-    return render_template_string(HTML)
-
-
-@app.get("/api/watchlist")
-def get_watchlist():
-    try:
-        return jsonify({"ok": True, "tickers": _get_watchlist()})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.post("/api/watchlist")
-def add_watchlist():
-    try:
-        body = request.get_json(silent=True) or {}
-        ticker = _sanitize_ticker(body.get("ticker", ""))
-        if not ticker:
-            return jsonify({"ok": False, "error": "銘柄コードを入力してください"}), 400
-
-        tickers = _get_watchlist()
-        if ticker in tickers:
-            return jsonify({"ok": False, "error": "すでに登録されています"}), 400
-        if len(tickers) >= logic.MAX_TICKERS:
-            return jsonify({"ok": False, "error": f"登録できる銘柄は最大{logic.MAX_TICKERS}銘柄です"}), 400
-
-        tickers.append(ticker)
-        if not store.set_watchlist(tickers):
-            return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
-
-        # 追加直後にその銘柄だけ即時取得する。GitHub Actionsの日次更新は待たない。
-        # 無駄なAPI呼び出しを避けるため、対象は今追加した1銘柄のみで、
-        # 本日のAPI予算が残っていない場合は取得をスキップする（次回自動更新で反映）。
-        fetch_note = None
-        if not API_KEY:
-            fetch_note = "APIキー未設定のため、次回の自動更新までデータは表示されません。"
-        elif not store.is_configured():
-            fetch_note = "Redis未設定のため即時取得はできません。"
-        else:
-            budget_left, _ = refresh.remaining_budget()
-            if budget_left <= 0:
-                fetch_note = "本日のAPI利用予算に達しているため、次回の自動更新でデータが反映されます。"
-            else:
-                try:
-                    result = refresh.run_refresh([ticker], API_KEY)
-                    if ticker in result["success"]:
-                        fetch_note = "最新データを取得しました。"
-                    elif result["failed"]:
-                        err_type = result["failed"][0].get("type")
-                        fetch_note = (
-                            f"データ取得に失敗しました（{logic.ERROR_LABELS.get(err_type, err_type)}）。"
-                            "次回の自動更新をお待ちください。"
-                        )
-                    else:
-                        fetch_note = "データを取得できませんでした。次回の自動更新をお待ちください。"
-                except Exception as e:
-                    fetch_note = f"即時取得中にエラーが発生しました: {e}"
-
-        return jsonify({"ok": True, "tickers": tickers, "fetch_note": fetch_note})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.delete("/api/watchlist/<ticker>")
-def delete_watchlist(ticker):
-    try:
-        ticker = _sanitize_ticker(ticker)
-        tickers = [t for t in _get_watchlist() if t != ticker]
-        if not store.set_watchlist(tickers):
-            return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
-        return jsonify({"ok": True, "tickers": tickers})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-def _attach_rank_changes(rows):
-    """RedisのRank_snapshot_prev（前日順位）と当日の順位を比較して各行に付与する。"""
-    prev_snapshot = store.get_json("rank_snapshot_prev") or {}
-    prev_ranks = prev_snapshot.get("ranks", {}) if isinstance(prev_snapshot, dict) else {}
-    prev_date = prev_snapshot.get("date") if isinstance(prev_snapshot, dict) else None
-
-    for i, row in enumerate(rows):
-        today_rank = i + 1
-        yesterday_rank = prev_ranks.get(row["ticker"])
-        if yesterday_rank is None:
-            row["rank_change"] = {
-                "yesterday": None, "today": today_rank, "diff": None,
-                "direction": "new", "label": f"今日{today_rank}位（前日データなし）",
-            }
-            continue
-        diff = yesterday_rank - today_rank
-        if diff > 0:
-            direction, label = "up", f"昨日{yesterday_rank}位 → 今日{today_rank}位 ↑{diff}"
-        elif diff < 0:
-            direction, label = "down", f"昨日{yesterday_rank}位 → 今日{today_rank}位 ↓{abs(diff)}"
-        else:
-            direction, label = "same", f"昨日{yesterday_rank}位 → 今日{today_rank}位 →"
-        row["rank_change"] = {
-            "yesterday": yesterday_rank, "today": today_rank, "diff": diff,
-            "direction": direction, "label": label,
-        }
-    return prev_date
-
+    return render_template_string(HTML, defaults=DEFAULT_TICKERS)
 
 @app.get("/api/ranking")
 def ranking():
-    try:
-        tickers = _get_watchlist()
-        rows = [_build_row(t) for t in tickers]
-        rows = logic.sort_rows(rows)
-        rank_reference_date = _attach_rank_changes(rows)
+    raw = request.args.get("tickers", "")
+    tickers = [x.strip().upper() for x in raw.split(",") if x.strip()]
+    # Remove duplicates while preserving order and enforce max 15.
+    tickers = list(dict.fromkeys(tickers))[:MAX_TICKERS]
+    if not tickers:
+        tickers = DEFAULT_TICKERS
+    force = request.args.get("force") == "1"
 
-        last_refresh = store.get_last_refresh()
-        last_refresh_view = None
-        if last_refresh:
-            last_refresh_view = {
-                "run_at": last_refresh.get("run_at"),
-                "success_count": len(last_refresh.get("success", [])),
-                "failed_count": len(last_refresh.get("failed", [])),
-                "skipped_count": len(last_refresh.get("skipped", [])),
-            }
+    rows = []
+    for t in tickers:
+        rows.append(fetch_price(t, force=force))
 
-        budget_left, used = refresh.remaining_budget()
+    # One combined news request, cached separately.
+    news = fetch_news(tickers, force=force)
 
-        return jsonify({
-            "ok": True,
-            "rows": rows,
-            "last_refresh": last_refresh_view,
-            "rank_reference_date": rank_reference_date,
-            "budget": {"used": used, "limit": logic.DAILY_API_BUDGET, "remaining": budget_left},
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"予期しないエラーが発生しました: {e}"}), 200
+    for row in rows:
+        row["reason"] = reason_for(row["ticker"], row, news)
 
+    rows.sort(key=lambda x: (x.get("score", -1) if not x.get("error") else -1), reverse=True)
 
-@app.post("/api/refresh")
-def manual_refresh():
-    try:
-        if not API_KEY:
-            return jsonify({"ok": False, "error": "ALPHAVANTAGE_API_KEYが未設定です"}), 200
-        if not store.is_configured():
-            return jsonify({"ok": False, "error": "Redis接続が未設定のため更新できません"}), 200
-
-        last_manual = store.get_last_manual_refresh()
-        if last_manual:
-            try:
-                last_dt = datetime.fromisoformat(last_manual)
-                elapsed = (datetime.now(timezone.utc).astimezone() - last_dt).total_seconds()
-                if elapsed < MANUAL_REFRESH_COOLDOWN:
-                    wait_min = int((MANUAL_REFRESH_COOLDOWN - elapsed) / 60) + 1
-                    return jsonify({
-                        "ok": False,
-                        "error": f"手動更新は前回から一定時間空ける必要があります（あと約{wait_min}分）",
-                    }), 200
-            except ValueError:
-                pass
-
-        budget_left, used = refresh.remaining_budget()
-        if budget_left <= 0:
-            return jsonify({
-                "ok": False,
-                "error": f"本日のAPI利用予算（{logic.DAILY_API_BUDGET}回）に達しています。翌日の自動更新をお待ちください。",
-            }), 200
-
-        tickers = _get_watchlist()
-        targets = [t for t in tickers if _needs_refresh(store.get_ticker_record(t))]
-
-        if not targets:
-            return jsonify({"ok": True, "message": "更新の必要はありません（全銘柄が20時間以内に取得済みです）"})
-
-        result = refresh.run_refresh(targets, API_KEY)
-        store.set_last_manual_refresh(datetime.now(timezone.utc).astimezone().isoformat())
-
-        msg = f"{len(result['success'])}件更新しました"
-        if result["failed"]:
-            msg += f"（{len(result['failed'])}件は取得失敗のため前回データのままです）"
-        if result["skipped"]:
-            msg += f"（{len(result['skipped'])}件はAPI予算切れのため未処理）"
-        return jsonify({"ok": True, "message": msg, "result": result})
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"予期しないエラーが発生しました: {e}"}), 200
-
+    return jsonify({
+        "ok": True,
+        "updated_at": datetime.now().astimezone().strftime("%Y/%-m/%-d %H:%M:%S"),
+        "rows": rows,
+        "news": news,
+        "max_tickers": MAX_TICKERS,
+    })
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "ok": True,
-        "service": "stock-buy-app",
-        "max_tickers": logic.MAX_TICKERS,
-        "api_key_configured": bool(API_KEY),
-        "redis_configured": store.is_configured(),
-    })
-
+    return jsonify({"ok": True, "service": "stock-buy-app", "max_tickers": MAX_TICKERS})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
