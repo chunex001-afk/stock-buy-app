@@ -297,6 +297,75 @@ def fetch_news(tickers, force=False):
         return []
 
 
+def top_rank_reason(rows):
+    """Explain why the #1 stock ranks above the next few names.
+    This is deliberately comparative and uses only data the app actually has.
+    """
+    valid = [r for r in rows if not r.get("error")]
+    if not valid:
+        return ""
+    top = valid[0]
+    others = valid[1:4]
+
+    ticker = top.get("ticker", "")
+    score = top.get("score", 0)
+    rebound = top.get("rebound_from_low", 0) or 0
+    month = top.get("month_return", 0) or 0
+    rsi = top.get("rsi14")
+    higher_low = top.get("higher_low", False)
+    ma20 = top.get("ma20")
+    ma50 = top.get("ma50")
+    price = top.get("price")
+    vol = top.get("volume_ratio", 1) or 1
+
+    trend = bool(price and ma20 and ma50 and price > ma20 > ma50)
+    strong = trend and month >= 8
+    pullback = (top.get("high_gap", 0) or 0) <= -3
+
+    # Compare the top score and the three nearest competitors.
+    if others:
+        best_other = others[0]
+        gap = score - (best_other.get("score", 0) or 0)
+        competitor_text = f"{best_other.get('ticker','')}より" if gap > 0 else "上位銘柄の中でも"
+    else:
+        competitor_text = "登録銘柄の中で"
+
+    if strong and rebound >= 8 and higher_low:
+        line1 = f"業績などを推測せず、株価データだけで見ると、{ticker}は直近安値から+{rebound:.1f}%戻し、安値も切り上がる強い上昇基調。"
+    elif strong and rebound >= 8:
+        line1 = f"{ticker}は1か月+{month:.1f}%と上昇モメンタムが強く、直近安値からも+{rebound:.1f}%回復。現在の上昇力を高く評価。"
+    elif rebound >= 12 and higher_low:
+        line1 = f"{ticker}は直近安値から+{rebound:.1f}%上昇し、安値も切り上がっているため、調整後の回復力を高く評価。"
+    elif pullback and trend:
+        line1 = f"{ticker}は上昇トレンドを維持しながら直近高値から一服しており、強さを保った押し目として評価。"
+    else:
+        line1 = f"{ticker}は現在の株価モメンタム、移動平均、直近安値からの回復を総合してスコア{score}点で首位。"
+
+    if rsi is not None and rsi > 65 and strong:
+        line2 = f"RSIは{rsi:.1f}でやや過熱感はあるものの、強いトレンドを確認できるため過度に減点せず、「強いが押し目で買いやすい」と判断。"
+    elif rsi is not None and 45 <= rsi <= 65 and rebound >= 8:
+        line2 = f"RSIは{rsi:.1f}で極端な過熱ではなく、直近の反発と合わせて今から入る際のバランスを評価。"
+    elif vol >= 1.25:
+        line2 = f"直近出来高は20日平均の{vol:.2f}倍で、上昇に参加する売買の強さも確認できる。"
+    else:
+        line2 = "最高値から何％下かではなく、直近安値からの回復と現在の上昇継続性を優先して評価。"
+
+    names = [o.get("ticker") for o in others if o.get("ticker")]
+    if names:
+        compare = "・".join(names)
+        if gap > 0:
+            line3 = f"{competitor_text}スコアで{gap}点上回り、{compare}と比べても「現在の上昇力＋株価位置」の組み合わせが最も優位と判断。"
+        else:
+            line3 = f"{compare}との差は小さいため、1位の決め手は直近の反発・トレンド・過熱感のバランス。数値が変われば順位も入れ替わり得る。"
+    else:
+        line3 = "登録銘柄の中で現在の株価データの組み合わせが最も強く、1位と判断。"
+
+    return {
+        "title": f"🥇 {ticker}が1位の理由（{score}点）",
+        "lines": [line1, line2, line3],
+    }
+
+
 def reason_for(ticker, data, news):
     if data.get("error"):
         return data["error"]
@@ -372,6 +441,11 @@ table{width:100%;border-collapse:collapse} th,td{padding:13px 8px;border-bottom:
 </div>
 </div>
 
+<div class="card" id="topReasonCard" style="display:none">
+  <b id="topReasonTitle"></b>
+  <div id="topReasonBody" style="line-height:1.7;margin-top:8px"></div>
+</div>
+
 <div class="card">
 <b>🎯 1か月で最も起こりやすい上昇幅</b>
 <div id="range" style="font-size:22px;font-weight:900;margin-top:8px">—</div>
@@ -402,7 +476,7 @@ async function updateRanking(force=false){
     const r=await fetch("/api/ranking?tickers="+encodeURIComponent(tickers.join(","))+(force?"&force=1":""));
     const j=await r.json();
     if(!j.ok) throw new Error(j.error||"取得失敗");
-    render(j.rows,j.news);
+    render(j.rows,j.news,j.top_reason);
     document.getElementById("status").textContent="最終更新："+j.updated_at+"｜無料API対策：取得データを20時間キャッシュ";
   }catch(e){document.getElementById("status").textContent="エラー："+e.message}
 }
@@ -416,7 +490,7 @@ function addTicker(){
 function delTicker(t){
   tickers=tickers.filter(x=>x!==t);save();updateRanking(false);
 }
-function render(rows,news){
+function render(rows,news,topReason){
   const rank={}; rows.forEach((x,i)=>rank[x.ticker]=i+1);
   const tb=document.getElementById("tbody");
   tb.innerHTML=rows.map((x,i)=>{
@@ -438,6 +512,14 @@ function render(rows,news){
     </tr>`
   }).join("");
   previous=rank;localStorage.setItem("buy_app_prev_rank",JSON.stringify(previous));
+  const topCard=document.getElementById("topReasonCard");
+  if(topReason && topReason.lines){
+    document.getElementById("topReasonTitle").textContent=topReason.title;
+    document.getElementById("topReasonBody").innerHTML=topReason.lines.map(x=>`<div>${esc(x)}</div>`).join("");
+    topCard.style.display="block";
+  } else {
+    topCard.style.display="none";
+  }
   const good=rows.filter(x=>!x.error).map(x=>x.month_return).sort((a,b)=>b-a);
   document.getElementById("range").textContent=good.length?((good[Math.min(2,good.length-1)]>=0?"+":"")+good[Math.min(2,good.length-1)]+"%前後"):"—";
 }
@@ -472,12 +554,14 @@ def ranking():
         row["reason"] = reason_for(row["ticker"], row, news)
 
     rows.sort(key=lambda x: (x.get("score", -1) if not x.get("error") else -1), reverse=True)
+    top_reason = top_rank_reason(rows)
 
     return jsonify({
         "ok": True,
         "updated_at": datetime.now().astimezone().strftime("%Y/%-m/%-d %H:%M:%S"),
         "rows": rows,
         "news": news,
+        "top_reason": top_reason,
         "max_tickers": MAX_TICKERS,
     })
 
