@@ -110,8 +110,16 @@ def run_refresh(tickers, api_key):
 
     success, failed, skipped = [], [], []
     fetched_price = {}
+    # Alpha VantageがRATE_LIMITを返した時点でフラグを立て、以降の銘柄・ニュース・
+    # 時価総額の呼び出しをすべて中断する（枯渇している状態でこれ以上呼んでも
+    # 無駄打ちになるだけで、自己申告予算とのズレを広げるだけのため）。
+    rate_limited = False
 
     for ticker in tickers:
+        if rate_limited:
+            skipped.append(ticker)
+            continue
+
         budget_left, _ = remaining_budget()
         if budget_left <= 0:
             print(f"[WARN] {ticker}: API予算を使い切ったためスキップ（前回データを維持）")
@@ -119,33 +127,37 @@ def run_refresh(tickers, api_key):
             continue
 
         try:
-            dates, closes, volumes = logic.fetch_daily_series(ticker, api_key)
-            store.incr_api_budget(date_key, 1)
+            dates, closes, volumes, attempts = logic.fetch_daily_series(ticker, api_key)
+            store.incr_api_budget(date_key, attempts)
             fetched_price[ticker] = (dates, closes, volumes)
         except logic.ApiError as e:
-            store.incr_api_budget(date_key, 1)
+            store.incr_api_budget(date_key, e.attempts)
             _mark_stale(ticker, e.error_type, e.message)
             failed.append({"ticker": ticker, "type": e.error_type, "message": e.message})
             print(f"[NG] {ticker}: {e.error_type} - {e.message}")
+            if e.error_type == "RATE_LIMIT":
+                rate_limited = True
+                print("[WARN] Alpha VantageがRATE_LIMITを返したため、以降の呼び出しを中断します。")
         except Exception as e:
             # 想定外の例外。予算は消費していない可能性が高いため加算しない。
             _mark_stale(ticker, "UNKNOWN", str(e))
             failed.append({"ticker": ticker, "type": "UNKNOWN", "message": str(e)})
             print(f"[NG] {ticker}: UNKNOWN - {e}")
 
-    # ニュースは対象銘柄まとめて1コール（予算が残っていて、価格取得に成功した銘柄がある場合のみ）
+    # ニュースは対象銘柄まとめて1コール（予算が残っていて、価格取得に成功した銘柄があり、
+    # かつRATE_LIMITで中断していない場合のみ）
     news_items = []
     budget_left, _ = remaining_budget()
-    if budget_left > 0 and fetched_price:
+    if not rate_limited and budget_left > 0 and fetched_price:
         try:
             news_items = logic.fetch_news(list(fetched_price.keys()), api_key)
             store.incr_api_budget(date_key, 1)
         except Exception as e:
             print(f"[WARN] ニュース取得に失敗しました: {e}", file=sys.stderr)
 
-    # 時価総額（OVERVIEW）は1回の実行につき最大1銘柄のみ
+    # 時価総額（OVERVIEW）は1回の実行につき最大1銘柄のみ（RATE_LIMIT中断時は呼ばない）
     cap_ticker, cap_info = (None, None)
-    if fetched_price:
+    if not rate_limited and fetched_price:
         cap_ticker, cap_info = _pick_and_fetch_stale_cap(list(fetched_price.keys()), api_key, date_key)
 
     for ticker, (dates, closes, volumes) in fetched_price.items():
@@ -210,6 +222,31 @@ def update_rank_snapshot(tickers):
         print(f"[WARN] rank_snapshotの更新に失敗しました: {e}", file=sys.stderr)
 
 
+def _priority_order(tickers):
+    """前回の実行で失敗・スキップになった銘柄と、そもそも未取得/前回エラーのままの
+    銘柄を先頭に並べ替える。ウォッチリストを毎回同じ順序で処理すると、予算や
+    Alpha Vantage側のクォータが尽きたときに常に同じ（後方の）銘柄だけが
+    取得できないまま固定化されてしまうため、それを避ける。
+
+    新たなAPI呼び出しは発生させず、既存のRedis記録（前回実行サマリーと各銘柄の
+    レコード）だけを参照する。各グループ内の相対順序は元のウォッチリスト順を保つ。
+    """
+    last = store.get_last_refresh() or {}
+    prev_failed = {f.get("ticker") for f in last.get("failed", []) if isinstance(f, dict)}
+    prev_skipped = set(last.get("skipped", []))
+    prev_needs_retry = prev_failed | prev_skipped
+
+    def needs_priority(t):
+        if t in prev_needs_retry:
+            return True
+        rec = store.get_ticker_record(t)
+        return not rec or not rec.get("last_trade_date") or bool(rec.get("is_stale"))
+
+    priority = [t for t in tickers if needs_priority(t)]
+    rest = [t for t in tickers if not needs_priority(t)]
+    return priority + rest
+
+
 def main():
     api_key = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
     if not api_key:
@@ -228,7 +265,12 @@ def main():
     _, used_before = remaining_budget()
     print(f"[INFO] 本日のAPI使用実績: {used_before}回 / 自己申告上限 {logic.DAILY_API_BUDGET}回")
 
-    result = run_refresh(tickers, api_key)
+    ordered = _priority_order(tickers)
+    if ordered != tickers:
+        print(f"[INFO] 前回失敗/未取得の銘柄を優先: {ordered}")
+    result = run_refresh(ordered, api_key)
+    # ランキングの同点順位はウォッチリストの元の並びで安定させたいため、
+    # 取得優先順（ordered）ではなく元の順序（tickers）を渡す。
     update_rank_snapshot(tickers)
 
     _, used_after = remaining_budget()

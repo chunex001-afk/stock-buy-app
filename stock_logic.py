@@ -33,11 +33,18 @@ _last_call_ts = 0.0
 
 
 class ApiError(Exception):
-    """Alpha Vantage呼び出しに関する分類済みエラー。"""
+    """Alpha Vantage呼び出しに関する分類済みエラー。
 
-    def __init__(self, error_type, message):
+    attempts: このエラーに至るまでに実際にAlpha Vantageへ送信したHTTPリクエスト回数。
+    ネットワークエラー時のリトライで2回送信していた場合は2になる。自己申告の
+    APIカウンタ（redis_store）を実消費と一致させるため、呼び出し元はこの値を
+    使って予算を加算する。
+    """
+
+    def __init__(self, error_type, message, attempts=1):
         self.error_type = error_type
         self.message = message
+        self.attempts = attempts
         super().__init__(message)
 
 
@@ -71,52 +78,59 @@ def classify_error(data):
 
 
 def api_get(params, api_key, retry_network=True):
-    """Alpha Vantageへの1コール。ネットワーク系エラーのみ最大1回リトライする。"""
+    """Alpha Vantageへの1コール。ネットワーク系エラーのみ最大1回リトライする。
+
+    戻り値: (data, attempts) — attemptsは実際にAlpha Vantageへ送信したHTTPリクエスト
+    回数（リトライで2回送信していれば2）。呼び出し元はこれを使って自己申告の
+    APIカウンタを正確に加算する（1コール=1加算という誤った前提を避ける）。
+    """
     if not api_key:
-        raise ApiError("UNKNOWN", "ALPHAVANTAGE_API_KEYが未設定です")
+        raise ApiError("UNKNOWN", "ALPHAVANTAGE_API_KEYが未設定です", attempts=0)
 
     p = dict(params)
     p["apikey"] = api_key
-    attempts = 2 if retry_network else 1
+    max_attempts = 2 if retry_network else 1
     last_exc = None
 
-    for attempt in range(attempts):
+    for attempt in range(max_attempts):
         _throttle()
+        attempts_made = attempt + 1
         try:
             r = requests.get(API_URL, params=p, timeout=20)
             r.raise_for_status()
         except (requests.Timeout, requests.ConnectionError) as e:
             last_exc = e
-            if attempt < attempts - 1:
+            if attempt < max_attempts - 1:
                 time.sleep(2)
                 continue
-            raise ApiError("NETWORK", f"通信エラー: {_redact(e)}")
+            raise ApiError("NETWORK", f"通信エラー: {_redact(e)}", attempts=attempts_made)
         except requests.RequestException as e:
-            raise ApiError("NETWORK", f"通信エラー: {_redact(e)}")
+            raise ApiError("NETWORK", f"通信エラー: {_redact(e)}", attempts=attempts_made)
 
         try:
             data = r.json()
         except ValueError:
-            raise ApiError("UNKNOWN", "Alpha VantageからJSONを受け取れませんでした")
+            raise ApiError("UNKNOWN", "Alpha VantageからJSONを受け取れませんでした", attempts=attempts_made)
 
         err_type, err_msg = classify_error(data)
         if err_type:
-            raise ApiError(err_type, _redact(err_msg))
-        return data
+            raise ApiError(err_type, _redact(err_msg), attempts=attempts_made)
+        return data, attempts_made
 
     # ここには到達しない想定だが、念のため
-    raise ApiError("NETWORK", f"通信エラー: {_redact(last_exc)}")
+    raise ApiError("NETWORK", f"通信エラー: {_redact(last_exc)}", attempts=max_attempts)
 
 
 def fetch_daily_series(ticker, api_key):
-    """日足の終値・出来高を古い順に取得する。"""
-    data = api_get(
+    """日足の終値・出来高を古い順に取得する。
+    戻り値: (dates, closes, volumes, attempts)。attemptsは実際のAPI呼び出し回数。"""
+    data, attempts = api_get(
         {"function": "TIME_SERIES_DAILY", "symbol": ticker, "outputsize": "compact"},
         api_key,
     )
     series = data.get("Time Series (Daily)")
     if not series or not isinstance(series, dict):
-        raise ApiError("NO_DATA", "株価データを取得できませんでした")
+        raise ApiError("NO_DATA", "株価データを取得できませんでした", attempts=attempts)
 
     rows = []
     for d, v in series.items():
@@ -129,12 +143,12 @@ def fetch_daily_series(ticker, api_key):
     rows.sort(key=lambda x: x[0])
 
     if len(rows) < 20:
-        raise ApiError("NO_DATA", "データ不足のため判定できません")
+        raise ApiError("NO_DATA", "データ不足のため判定できません", attempts=attempts)
 
     dates = [r[0] for r in rows]
     closes = [r[1] for r in rows]
     volumes = [r[2] for r in rows]
-    return dates, closes, volumes
+    return dates, closes, volumes, attempts
 
 
 def fetch_news(tickers, api_key):
@@ -146,7 +160,7 @@ def fetch_news(tickers, api_key):
     if not tickers:
         return []
     try:
-        data = api_get(
+        data, _ = api_get(
             {
                 "function": "NEWS_SENTIMENT",
                 "tickers": ",".join(tickers),
@@ -227,7 +241,7 @@ def _clean_overview_field(v):
 
 def fetch_overview(ticker, api_key):
     """OVERVIEWエンドポイントから時価総額・セクター・業種を取得する（日次では最大1銘柄のみ呼ぶ）。"""
-    data = api_get({"function": "OVERVIEW", "symbol": ticker}, api_key, retry_network=False)
+    data, _ = api_get({"function": "OVERVIEW", "symbol": ticker}, api_key, retry_network=False)
     if not isinstance(data, dict) or not data.get("Symbol"):
         raise ApiError("NO_DATA", "企業情報を取得できませんでした")
 
