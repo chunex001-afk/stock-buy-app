@@ -1,0 +1,18 @@
+{
+  "source": "Twelve Data (adjust=splits) 252営業日ローリング再検証、2021-09-24〜2026-09-15、REFERENCE_UNIVERSE 49銘柄。Stage24〜28(Yahoo Finance)の検証結果と構造的に一致することを2026-09-16に確認済み。",
+  "note": "将来の予測値ではなく、過去にQ5と判定された局面の統計的な実績である。",
+  "h60_median_pct": 28.15,
+  "h60_n": 12271,
+  "h120_median_pct": 48.76,
+  "h120_n": 11476,
+  "events": [
+    {"within_days": 5, "threshold_pct": 10, "reach_rate_pct": 27.92, "n": 13195},
+    {"within_days": 5, "threshold_pct": 20, "reach_rate_pct": 9.74, "n": 13195},
+    {"within_days": 10, "threshold_pct": 20, "reach_rate_pct": 20.55, "n": 13133},
+    {"within_days": 10, "threshold_pct": 30, "reach_rate_pct": 10.52, "n": 13133},
+    {"within_days": 20, "threshold_pct": 30, "reach_rate_pct": 23.18, "n": 12975},
+    {"within_days": 20, "threshold_pct": 50, "reach_rate_pct": 11.23, "n": 12975},
+    {"within_days": 30, "threshold_pct": 50, "reach_rate_pct": 17.78, "n": 12803},
+    {"within_days": 60, "threshold_pct": 100, "reach_rate_pct": 14.64, "n": 12271}
+  ]
+}

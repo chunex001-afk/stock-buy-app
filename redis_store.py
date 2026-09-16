@@ -145,3 +145,58 @@ def get_last_manual_refresh():
 
 def set_last_manual_refresh(iso_timestamp):
     return set_("last_manual_refresh", iso_timestamp)
+
+
+# ---------------------------------------------------------------------------
+# Q1〜Q5判定(Twelve Data、quintile_logic.py)専用のキー。
+# IMPLEMENTATION_DESIGN_quintile_q1q5.md 2-7節の設計通り、生の株価履歴は
+# 保存しない(pred_score等の軽量な計算結果のみ)。既存キー・既存関数は
+# 一切変更していない(追加のみ)。
+# ---------------------------------------------------------------------------
+
+def get_refpool_score(ticker):
+    """参照母集団(REFERENCE_UNIVERSE)1銘柄の最新pred_score等を取得する。
+    戻り値: {"pred_score": float, "last_updated": "YYYY-MM-DD", "features": {...}} または None。"""
+    return get_json(f"quintile:refpool:{ticker.upper()}")
+
+
+def set_refpool_score(ticker, data):
+    return set_json(f"quintile:refpool:{ticker.upper()}", data)
+
+
+def get_pool_history():
+    """直近252営業日分の参照母集団プール履歴を取得する。
+    戻り値: {"dates": [...], "scores_by_date": {"YYYY-MM-DD": [float, ...]}} または None
+    (Noneの場合、quintile_logic.update_pool_historyが新規作成する)。"""
+    return get_json("quintile:pool_history")
+
+
+def set_pool_history(data):
+    return set_json("quintile:pool_history", data)
+
+
+def get_td_api_budget(date_str):
+    """Twelve Data専用の当日消費credits数を取得する(Alpha Vantage用の
+    get_api_budgetとはキーのprefixが異なる別カウンタ、完全に独立)。"""
+    v = get(f"td_api_budget:{date_str}")
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def incr_td_api_budget(date_str, by=1):
+    key = f"td_api_budget:{date_str}"
+    new_val = incrby(key, by)
+    expire(key, 2 * 24 * 3600)
+    return new_val
+
+
+def get_quintile_state(ticker):
+    """ユーザー監視銘柄1件のQ状態履歴を取得する。
+    戻り値: {"current_q": "Q3", "previous_q": "Q4", "history": [...]} または None。"""
+    return get_json(f"quintile:state:{ticker.upper()}")
+
+
+def set_quintile_state(ticker, data):
+    return set_json(f"quintile:state:{ticker.upper()}", data)

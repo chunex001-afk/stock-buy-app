@@ -24,8 +24,10 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import quintile_logic
 import redis_store as store
 import stock_logic as logic
+import twelvedata_client as td
 
 
 def _today_str():
@@ -247,6 +249,191 @@ def _priority_order(tickers):
     return priority + rest
 
 
+# ---------------------------------------------------------------------------
+# Q1〜Q5判定(Twelve Data、quintile_logic.py)。Alpha Vantageの既存フロー
+# (run_refresh/remaining_budget等)とは完全に独立した処理で、既存コードは
+# 一切変更していない(追加のみ)。IMPLEMENTATION_DESIGN_quintile_q1q5.md、
+# および2026-09-16の本番実装レビューで確定した流れ:
+# ① SPY取得 ② 当日のreference group取得 ③ ユーザー監視銘柄取得
+# ④ 9特徴量計算 ⑤ pred_score計算 ⑥ reference pool更新
+# ⑦ rolling 252日poolからpercentile境界計算 ⑧ Q1〜Q5判定
+# ⑨ state history更新 ⑩ Redis保存
+# ---------------------------------------------------------------------------
+
+MAX_QUINTILE_STATE_HISTORY = 60
+
+
+def remaining_td_budget():
+    """(Twelve Dataの残りcredits, 本日の使用済みcredits) を返す。
+    Alpha Vantage用のremaining_budget()とは別カウンタ・別上限。"""
+    used = store.get_td_api_budget(_today_str())
+    return td.DAILY_API_BUDGET - used, used
+
+
+def _td_fetch_one(ticker, api_key, date_key):
+    """Twelve Dataから1銘柄取得し、成功なら(dates, closes, volumes)、
+    失敗ならNoneを返す。RATE_LIMIT発生時は第2戻り値をTrueにする
+    (以降の新規Twelve Data呼び出しを中断すべきというシグナル)。
+    使用credits(attempts)は必ずtd_api_budgetへ加算する。"""
+    try:
+        dates, closes, volumes, attempts = td.fetch_daily_series(ticker, api_key)
+        store.incr_td_api_budget(date_key, attempts)
+        return (dates, closes, volumes), False
+    except td.TdApiError as e:
+        store.incr_td_api_budget(date_key, e.attempts)
+        print(f"[Q1-5][NG] {ticker}: {e.error_type} - {e.message}")
+        return None, e.error_type == "RATE_LIMIT"
+    except Exception as e:
+        print(f"[Q1-5][NG] {ticker}: 予期しないエラー: {e}", file=sys.stderr)
+        return None, False
+
+
+def _update_quintile_state(ticker, score, bounds, date_key):
+    """ユーザー監視銘柄1件のQ状態を判定し、状態が変化した場合のみ履歴に追記する。
+    「売り」「失敗」等の否定的な意味は一切持たせず、単なる状態記録として保存する
+    (design 13の方針)。"""
+    q = quintile_logic.assign_quintile(score, bounds)
+    prev_state = store.get_quintile_state(ticker) or {}
+    prev_q = prev_state.get("current_q")
+    history = list(prev_state.get("history", []))
+
+    if not history or prev_q != q:
+        history.append({"date": date_key, "q": q})
+        history = history[-MAX_QUINTILE_STATE_HISTORY:]
+
+    new_state = {
+        "current_q": q,
+        "previous_q": prev_q,
+        "pred_score": score,
+        "history": history,
+        "last_updated": date_key,
+    }
+    store.set_quintile_state(ticker, new_state)
+    return new_state
+
+
+def run_quintile_refresh(api_key, watchlist):
+    """Q1〜Q5判定の日次処理本体。1銘柄の取得失敗が他銘柄の処理を止めない、
+    未来データを一切参照しない、という既存run_refreshと同じ設計原則を踏襲する。
+    戻り値: {"fetched": [...], "failed": [...], "rate_limited": bool} または、
+    APIキー未設定/予算切れで何もしなかった場合は None。
+    """
+    if not api_key:
+        print("[Q1-5][WARN] TWELVEDATA_API_KEYが未設定のため、Q1〜Q5処理をスキップします。")
+        return None
+
+    date_key = _today_str()
+    budget_left, _ = remaining_td_budget()
+    if budget_left <= 0:
+        print("[Q1-5][WARN] Twelve Data予算を使い切ったため、Q1〜Q5処理をスキップします。")
+        return None
+
+    fetched = {}
+    failed = []
+    rate_limited = False
+
+    # ① SPY取得(rel_strength_spy特徴量の鮮度を保つため、ローテーションと無関係に毎日取得)
+    budget_left, _ = remaining_td_budget()
+    if budget_left > 0:
+        result, hit_rate_limit = _td_fetch_one("SPY", api_key, date_key)
+        if result:
+            fetched["SPY"] = result
+        else:
+            failed.append("SPY")
+            rate_limited = rate_limited or hit_rate_limit
+
+    # ② 当日のreference group取得(SPYを除いた48銘柄、14日ローテーション)
+    if not rate_limited:
+        group_idx = quintile_logic.rotation_group_for_date(date_key)
+        rotation_tickers = quintile_logic.tickers_for_group(group_idx)
+        print(f"[Q1-5][INFO] 本日のローテーショングループ: {group_idx} ({rotation_tickers})")
+        for ticker in rotation_tickers:
+            if rate_limited:
+                break
+            budget_left, _ = remaining_td_budget()
+            if budget_left <= 0:
+                print("[Q1-5][WARN] Twelve Data予算切れのため、ローテーション取得を中断します。")
+                break
+            result, hit_rate_limit = _td_fetch_one(ticker, api_key, date_key)
+            if result:
+                fetched[ticker] = result
+            else:
+                failed.append(ticker)
+                rate_limited = rate_limited or hit_rate_limit
+
+    # ③ ユーザー監視銘柄取得(最大15、毎日)
+    if not rate_limited:
+        for ticker in watchlist[: logic.MAX_TICKERS]:
+            if rate_limited:
+                break
+            budget_left, _ = remaining_td_budget()
+            if budget_left <= 0:
+                print("[Q1-5][WARN] Twelve Data予算切れのため、ユーザー監視銘柄の取得を中断します。")
+                break
+            if ticker in fetched:
+                continue  # 参照母集団のローテーションと重複している場合は再取得しない
+            result, hit_rate_limit = _td_fetch_one(ticker, api_key, date_key)
+            if result:
+                fetched[ticker] = result
+            else:
+                failed.append(ticker)
+                rate_limited = rate_limited or hit_rate_limit
+
+    if rate_limited:
+        print("[Q1-5][WARN] Twelve DataがRATE_LIMITを返したため、以降の新規取得を中断しました。")
+
+    # ④⑤ 9特徴量・pred_score計算(取得できた銘柄のみ、未来データは一切参照しない)
+    spy_dates, spy_closes = None, None
+    if "SPY" in fetched:
+        spy_dates, spy_closes, _ = fetched["SPY"]
+
+    scores_today = {}
+    for ticker, (dates, closes, volumes) in fetched.items():
+        try:
+            features = quintile_logic.compute_features(dates, closes, volumes, spy_dates, spy_closes)
+            score = quintile_logic.knn_predict_score(features)
+        except Exception as e:
+            print(f"[Q1-5][NG] {ticker}: 特徴量/pred_score計算に失敗: {e}", file=sys.stderr)
+            continue
+        scores_today[ticker] = score
+        # ⑥ reference pool(quintile:refpool:<TICKER>)更新。当日取得できた銘柄のみ。
+        store.set_refpool_score(ticker, {
+            "pred_score": score, "last_updated": date_key, "features": features,
+        })
+
+    # ⑦ rolling 252日pool更新。REFERENCE_UNIVERSE全49銘柄について、当日取得分は
+    # 新しい値を、それ以外は直近のrefpoolキャッシュ値(前回そのティッカーが
+    # ローテーション/ユーザー監視で取得された時点の値)を使う。
+    scores_by_ticker = {}
+    for sym in quintile_logic.REFERENCE_UNIVERSE:
+        if sym in scores_today:
+            scores_by_ticker[sym] = scores_today[sym]
+        else:
+            cached = store.get_refpool_score(sym)
+            if cached and cached.get("pred_score") is not None:
+                scores_by_ticker[sym] = cached["pred_score"]
+
+    pool_history = store.get_pool_history()
+    pool_history = quintile_logic.update_pool_history(pool_history, date_key, scores_by_ticker)
+    store.set_pool_history(pool_history)
+
+    bounds = quintile_logic.pool_percentile_bounds(pool_history)
+
+    # ⑧⑨ ユーザー監視銘柄のQ1〜Q5判定・状態履歴更新 ⑩ Redis保存(set_quintile_state内で実施)
+    if bounds is not None:
+        for ticker in watchlist[: logic.MAX_TICKERS]:
+            score = scores_today.get(ticker)
+            if score is None:
+                cached = store.get_refpool_score(ticker)
+                score = cached.get("pred_score") if cached else None
+            if score is None:
+                continue  # まだ一度もTwelve Dataで取得できていない銘柄は判定待ちのまま
+            state = _update_quintile_state(ticker, score, bounds, date_key)
+            print(f"[Q1-5][OK] {ticker}: {state['current_q']} (pred_score={score:.2f})")
+
+    return {"fetched": list(fetched.keys()), "failed": failed, "rate_limited": rate_limited}
+
+
 def main():
     api_key = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
     if not api_key:
@@ -291,6 +478,20 @@ def main():
         f"[DONE] 成功 {len(result['success'])}件 / 失敗 {len(result['failed'])}件 / "
         f"スキップ {len(result['skipped'])}件 / 本日のAPI使用 {used_after}回"
     )
+
+    # Q1〜Q5判定(Twelve Data)。既存のAlpha Vantageフローとは完全に独立しており、
+    # ここで例外が起きても既存の購入判定(上のresult/summary)には一切影響しない。
+    try:
+        td_api_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
+        td_result = run_quintile_refresh(td_api_key, tickers)
+        if td_result is not None:
+            print(
+                f"[Q1-5][DONE] 取得成功 {len(td_result['fetched'])}件 / "
+                f"失敗 {len(td_result['failed'])}件 / RATE_LIMIT={td_result['rate_limited']}"
+            )
+    except Exception as e:
+        print(f"[Q1-5][WARN] Q1〜Q5処理で予期しないエラーが発生しました: {e}", file=sys.stderr)
+
     # 一部失敗があってもプロセス自体は正常終了させる（他銘柄は正常に更新済みのため）
     return 0
 

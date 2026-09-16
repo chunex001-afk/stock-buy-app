@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, render_template_string
 
+import quintile_logic
 import redis_store as store
 import stock_logic as logic
 import refresh
@@ -75,9 +76,52 @@ def _freshness(record):
     }
 
 
+# Q1〜Q5の表示ラベル(design 13の方針: Q3=発見・Q4=準備・Q5=購入判断。
+# Q5→Q4を「失敗」「売却」等の否定的な意味にしない、既存の購入判定
+# upside_score/judgment等とは完全に独立した別軸の表示であることに注意)。
+QUINTILE_LABELS = {
+    "Q1": "Q1（低調）", "Q2": "Q2（弱含み）", "Q3": "Q3（発見）",
+    "Q4": "Q4（準備）", "Q5": "Q5（購入判断）",
+}
+
+
+def _build_quintile_view(ticker):
+    """Q1〜Q5表示用データを組み立てる。Redisの`quintile:state:<TICKER>`を
+    読むだけで、Twelve Dataへのライブ呼び出しは一切行わない(design 12)。
+    まだ日次バッチで一度も判定されていない銘柄は「判定待ち」として表示する。"""
+    state = store.get_quintile_state(ticker)
+    if not state or not state.get("current_q"):
+        return {
+            "status": "pending",
+            "current_q": None, "current_q_label": None,
+            "previous_q": None, "last_updated": None,
+            "history": [], "q5_stats": None,
+            "message": "Q判定は次回日次更新後に反映されます。",
+        }
+
+    current_q = state.get("current_q")
+    view = {
+        "status": "ready",
+        "current_q": current_q,
+        "current_q_label": QUINTILE_LABELS.get(current_q, current_q),
+        "previous_q": state.get("previous_q"),
+        "last_updated": state.get("last_updated"),
+        "history": state.get("history", []),
+        "q5_stats": None,
+        "message": None,
+    }
+    if current_q == "Q5":
+        try:
+            view["q5_stats"] = quintile_logic.load_q5_stats()
+        except Exception:
+            view["q5_stats"] = None
+    return view
+
+
 def _build_row(ticker):
     record = store.get_ticker_record(ticker)
     freshness = _freshness(record)
+    quintile_view = _build_quintile_view(ticker)
 
     if not record or not record.get("last_trade_date"):
         return {
@@ -92,6 +136,7 @@ def _build_row(ticker):
             "judgment": "判定不可",
             "comment": "まだデータを取得できていません。追加直後は自動で取得を試みます。",
             "freshness": freshness,
+            "quintile": quintile_view,
         }
 
     market_cap = record.get("market_cap")
@@ -116,6 +161,7 @@ def _build_row(ticker):
         "judgment": record.get("judgment", "判定不可"),
         "comment": record.get("comment", ""),
         "freshness": freshness,
+        "quintile": quintile_view,
     }
 
 
@@ -231,6 +277,17 @@ details.moredetail[open] summary::before{content:"▾ "}
 .hero-buy .herobadge.j-strong_buy{background:#fff;color:#087443}
 .hero-buy .herobadge.j-buy{background:#fff;color:#087443}
 
+/* Q1〜Q5(参照母集団内の相対的な状態、既存judgmentとは別軸の情報。
+   design 13: Q3=発見・Q4=準備・Q5=購入判断。Q5→Q4を否定的な色にしない) */
+.qbadge{display:inline-block;padding:3px 10px;border-radius:999px;font-weight:800;font-size:11px;white-space:nowrap}
+.q-q1{background:#f2f2f2;color:#98a2b3}.q-q2{background:#eef1f5;color:#758096}
+.q-q3{background:#eaf2ff;color:#175cd3}.q-q4{background:#fff1db;color:#9a6a00}
+.q-q5{background:#087443;color:#fff}.q-pending{background:#f2f2f2;color:#98a2b3;font-style:italic}
+.qhistory{font-size:12px;color:#475467;line-height:1.8}
+.q5stats{background:#f0f9f4;border-radius:13px;padding:12px 14px;font-size:12px;line-height:1.8;margin-top:8px}
+.q5stats .q5title{font-weight:800;color:#087443;margin-bottom:4px}
+.q5stats .q5note{color:#758096;font-size:11px;margin-top:6px}
+
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}}
 </style>
 </head>
@@ -276,6 +333,7 @@ const CARDCLASS = {
   "強く買いたい":"cj-strong_buy","買い候補":"cj-buy","まだ買わない":"cj-wait","過熱のため買わない":"cj-overheat","判定不可":"cj-unknown"
 };
 const BUY_JUDGMENTS = new Set(["強く買いたい","買い候補"]);
+const QBADGE = {"Q1":"q-q1","Q2":"q-q2","Q3":"q-q3","Q4":"q-q4","Q5":"q-q5"};
 
 function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));}
 function fmt(v,suf){return (v===null||v===undefined)?"—":((v>0&&suf==="%")?"+":"")+v+(suf||"");}
@@ -375,6 +433,38 @@ function freshTagHtml(f){
   return `<span class="freshtag nonebadge">⚪ データなし</span>`;
 }
 
+// Q1〜Q5(参照母集団内での相対的な状態)。既存のupside_score/judgmentとは
+// 完全に独立した別軸の情報であり、混同されないよう別バッジとして表示する。
+function qBadgeHtml(q){
+  q = q || {};
+  if(q.status !== "ready"){
+    return `<span class="qbadge q-pending">Q判定：次回日次更新後に反映</span>`;
+  }
+  return `<span class="qbadge ${QBADGE[q.current_q]||"q-pending"}">${esc(q.current_q_label)}</span>`;
+}
+
+function qHistoryHtml(q){
+  if(!q || q.status !== "ready" || !q.history || !q.history.length) return "";
+  const items = q.history.slice(-8).map(h=>`${fmtDate(h.date)}: ${esc(h.q)}`).join(" → ");
+  return `<div class="qhistory">状態推移: ${items}</div>`;
+}
+
+// Q5の過去実績統計。あくまで「過去の類似状態における統計」であり、
+// 将来この銘柄が同じように上がると予測するものではないことを明記する(design 14)。
+function q5StatsHtml(q){
+  if(!q || q.status !== "ready" || q.current_q !== "Q5" || !q.q5_stats) return "";
+  const s = q.q5_stats;
+  const events = (s.events||[]).map(e=>
+    `${e.within_days}日以内+${e.threshold_pct}%到達: ${e.reach_rate_pct}%(n=${e.n})`
+  ).join("　");
+  return `<div class="q5stats">
+    <div class="q5title">📊 Q5該当銘柄の過去の類似状態における実績統計</div>
+    <div>60日最大上昇率 中央値: ${s.h60_median_pct}%(n=${s.h60_n})　120日: ${s.h120_median_pct}%(n=${s.h120_n})</div>
+    <div>${events}</div>
+    <div class="q5note">※将来の予測ではなく、過去にQ5と判定された局面の統計的な実績です。${esc(s.note||"")}</div>
+  </div>`;
+}
+
 function renderHero(rows){
   const heroEl = document.getElementById("hero");
   if(!rows || !rows.length){ heroEl.innerHTML=""; return; }
@@ -432,6 +522,9 @@ function render(rows){
         <span class="judgebadge pill ${cls}">${esc(x.judgment)}</span>
       </div>
       <div class="rankdetail">${rc?esc(rc.label):""}</div>
+      <div class="rankdetail">${qBadgeHtml(x.quintile)}</div>
+      ${qHistoryHtml(x.quintile)}
+      ${q5StatsHtml(x.quintile)}
 
       <div class="statrow">
         <div class="stat"><div class="statlabel">株価</div><div class="statval">${fmt(x.price)}</div></div>
