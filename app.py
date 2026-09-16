@@ -210,38 +210,30 @@ details.logicinfo .small{margin-top:10px}
 .zerobanner{background:#eef1f5;color:#475467;font-weight:800;padding:14px 18px;border-radius:16px;margin-bottom:14px;font-size:15px;line-height:1.5}
 .zerobanner .sub2{display:block;font-weight:600;font-size:12px;color:#758096;margin-top:3px}
 
+/* Q5該当銘柄のハイライト表示(design方針: Q1〜Q5をメインの判定として扱う)。
+   旧upside_score/judgment基準の「今日の注目銘柄」表示は2026-09-16のUI修正で
+   置き換えた(Q1〜Q5と混在して矛盾して見えることを避けるため)。 */
 .hero{border-radius:22px;padding:20px 22px;margin-bottom:18px;box-shadow:0 4px 20px #0000001a}
 .hero-buy{background:linear-gradient(135deg,#0c7a49,#0a5c38);color:#fff}
-.hero-caution{background:#fff;border:2px solid #e3b400}
 .herolabel{font-size:12px;font-weight:800;opacity:.9;margin-bottom:10px;letter-spacing:.02em}
-.hero-caution .herolabel{color:#8a6500}
 .heroline{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px}
-.herorank{font-size:15px;font-weight:900;opacity:.85}
-.heroticker{font-size:32px;font-weight:900;letter-spacing:.01em}
-.herorc{font-size:12px;opacity:.85;margin-bottom:14px}
-.hero-caution .herorc{color:#758096}
-.herostats{display:flex;gap:24px;flex-wrap:wrap;font-size:14px;margin-bottom:14px}
-.herostats b{font-size:19px}
-.herostats .up{color:#baf3d7}.herostats .down{color:#ffd0c7}
-.hero-caution .herostats .up{color:#087443}.hero-caution .herostats .down{color:#b42318}
-.herocomment{font-size:15px;line-height:1.75;background:rgba(255,255,255,.16);border-radius:14px;padding:14px 16px}
-.hero-caution .herocomment{background:#f7f9fc;color:#172033}
-.herowarn{margin-top:14px;background:#fff5cc;color:#8a6500;font-weight:800;padding:12px 14px;border-radius:12px;font-size:13px;line-height:1.6}
-.hero-buy .herowarn{background:rgba(255,255,255,.92)}
+.heroticker{font-size:26px;font-weight:900;letter-spacing:.01em}
+.herocomment{font-size:14px;line-height:1.75;background:rgba(255,255,255,.16);border-radius:14px;padding:14px 16px}
 
 .list{display:grid;grid-template-columns:1fr;gap:14px}
 @media(min-width:760px){.list{grid-template-columns:repeat(2,1fr)}}
 
 .tcard{background:white;border-radius:20px;padding:18px 20px;box-shadow:0 2px 14px #0000000c;border-left:5px solid #e5e7eb}
-.tcard.cj-strong_buy{border-left-color:#087443}
-.tcard.cj-buy{border-left-color:#4fb488}
-.tcard.cj-wait{border-left-color:#c9cfd8}
-.tcard.cj-overheat{border-left-color:#e3b400}
+.tcard.cq-q5{border-left-color:#087443}
+.tcard.cq-q4{border-left-color:#c98a00}
+.tcard.cq-q3{border-left-color:#175cd3}
+.tcard.cq-q2{border-left-color:#c9cfd8}
+.tcard.cq-q1{border-left-color:#c9cfd8}
+.tcard.cq-pending{border-left-color:#e5e7eb}
 .rankline{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;margin-bottom:2px}
 .rankbig{font-size:17px;font-weight:900;color:#344054;white-space:nowrap}
 .tickerbig{font-size:20px;font-weight:900;letter-spacing:.01em}
 .rankarrow{font-size:14px;font-weight:900}
-.judgebadge{margin-left:auto}
 .rc-up{color:#087443}.rc-down{color:#b42318}.rc-same{color:#98a2b3}.rc-new{color:#98a2b3}
 .rankdetail{font-size:12px;color:#758096;margin-bottom:12px}
 
@@ -252,30 +244,14 @@ details.logicinfo .small{margin-top:10px}
 .statval.up{color:#087443}.statval.down{color:#b42318}
 .captag{display:block;font-size:10px;color:#98a2b3;font-weight:600;margin-top:1px}
 
-.commentbox{background:#f7f9fc;border-radius:13px;padding:12px 14px;font-size:14px;line-height:1.65;margin-bottom:10px}
 .newsblock{font-size:13px;line-height:1.7;margin-bottom:10px}
 .newsblock a{color:#175cd3;text-decoration:none}
 .newsblock a:hover{text-decoration:underline}
 .newsblock .nonews{color:#98a2b3}
 
-details.moredetail{margin-top:2px}
-details.moredetail summary{cursor:pointer;font-size:12px;color:#475467;font-weight:700;list-style:none;padding:4px 0}
-details.moredetail summary::-webkit-details-marker{display:none}
-details.moredetail summary::before{content:"▸ "}
-details.moredetail[open] summary::before{content:"▾ "}
-.detailgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(108px,1fr));gap:10px 16px;margin:10px 0 6px;font-size:12px}
-.detailgrid .dl{color:#98a2b3;margin-bottom:2px}
-.detailgrid .dv{font-weight:700}
-
 .cardfoot{display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px;flex-wrap:wrap}
 .fresh{color:#087443;font-weight:700}.stalebadge{color:#8a6500;font-weight:700}.nonebadge{color:#98a2b3;font-weight:700}
 .freshtag{font-size:11px}
-
-.pill{display:inline-block;padding:6px 12px;border-radius:999px;font-weight:800;font-size:12px;white-space:nowrap}
-.j-strong_buy{background:#087443;color:#fff}.j-buy{background:#e7f6ed;color:#087443}
-.j-wait{background:#eef1f5;color:#475467}.j-overheat{background:#fff5cc;color:#8a6500}.j-unknown{background:#f2f2f2;color:#98a2b3;font-style:italic}
-.hero-buy .herobadge.j-strong_buy{background:#fff;color:#087443}
-.hero-buy .herobadge.j-buy{background:#fff;color:#087443}
 
 /* Q1〜Q5(参照母集団内の相対的な状態、既存judgmentとは別軸の情報。
    design 13: Q3=発見・Q4=準備・Q5=購入判断。Q5→Q4を否定的な色にしない) */
@@ -324,15 +300,8 @@ RSIや高値からの乖離、1か月の上昇率が過大な場合は、底打�
 </div>
 
 <script>
-const JBADGE = {
-  "強く買いたい":"j-strong_buy","買い候補":"j-buy","まだ買わない":"j-wait","過熱のため買わない":"j-overheat","判定不可":"j-unknown"
-};
-// カード全体の縁取り色分け用。JBADGEと同名にするとバッジ用の塗りつぶし背景色まで
-// カード全体に適用されてしまうため、別名にしている。
-const CARDCLASS = {
-  "強く買いたい":"cj-strong_buy","買い候補":"cj-buy","まだ買わない":"cj-wait","過熱のため買わない":"cj-overheat","判定不可":"cj-unknown"
-};
-const BUY_JUDGMENTS = new Set(["強く買いたい","買い候補"]);
+// メイン画面はQ1〜Q5の情報のみで構成する(2026-09-16のUI修正で旧judgment/
+// 旧コメント/upside_score等の従来指標の表示を完全に削除した)。
 const QBADGE = {"Q1":"q-q1","Q2":"q-q2","Q3":"q-q3","Q4":"q-q4","Q5":"q-q5"};
 
 function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));}
@@ -443,9 +412,26 @@ function qBadgeHtml(q){
   return `<span class="qbadge ${QBADGE[q.current_q]||"q-pending"}">${esc(q.current_q_label)}</span>`;
 }
 
+// 同じ日付のエントリが連続する場合(同日に複数回バッチが走った場合など)、
+// その日の最新の状態だけを残す。日付をまたいだ本来の状態推移(例: 9/15 Q5 →
+// 9/16 Q2)はそのまま表示する(2026-09-16のUI修正で追加、表示層のみの対応)。
+function dedupeHistoryByDate(history){
+  const out = [];
+  for(const h of history){
+    if(out.length && out[out.length-1].date === h.date){
+      out[out.length-1] = h;
+    }else{
+      out.push(h);
+    }
+  }
+  return out;
+}
+
 function qHistoryHtml(q){
   if(!q || q.status !== "ready" || !q.history || !q.history.length) return "";
-  const items = q.history.slice(-8).map(h=>`${fmtDate(h.date)}: ${esc(h.q)}`).join(" → ");
+  const deduped = dedupeHistoryByDate(q.history);
+  if(deduped.length < 2) return "";
+  const items = deduped.slice(-8).map(h=>`${fmtDate(h.date)}: ${esc(h.q)}`).join(" → ");
   return `<div class="qhistory">状態推移: ${items}</div>`;
 }
 
@@ -465,64 +451,51 @@ function q5StatsHtml(q){
   </div>`;
 }
 
+// Q1〜Q5をメインの判定として扱う(design方針)。旧upside_score/judgment基準の
+// 「今日の注目銘柄」ランキング表示はここでは使わない(Q1〜Q5と旧判定が同じ画面で
+// 矛盾して見えることを避けるため、2026-09-16のUI修正で全面的に置き換えた)。
 function renderHero(rows){
   const heroEl = document.getElementById("hero");
   if(!rows || !rows.length){ heroEl.innerHTML=""; return; }
 
-  const strongCount = rows.filter(x=>x.judgment==="強く買いたい").length;
-  const top = rows[0];
-  const isBuy = BUY_JUDGMENTS.has(top.judgment);
-  const cls = JBADGE[top.judgment]||"j-unknown";
+  const ready = rows.filter(x=>x.quintile && x.quintile.status==="ready");
+  const q5 = ready.filter(x=>x.quintile.current_q==="Q5");
 
-  let banner = "";
-  if(strongCount===0){
-    banner = `<div class="zerobanner">📋 今日は積極的に買いたい銘柄なし<span class="sub2">「強く買いたい」判定は現在0件です</span></div>`;
+  if(q5.length){
+    const names = q5.map(x=>esc(x.ticker)).join("　");
+    heroEl.innerHTML = `
+      <div class="hero hero-buy">
+        <div class="herolabel">📌 現在Q5（購入判断）の銘柄</div>
+        <div class="heroline"><span class="heroticker">${names}</span></div>
+        <div class="herocomment">💬 過去の類似Q5状態の実績統計は、各銘柄カード内をご確認ください。「必ず上がる」という意味ではありません。</div>
+      </div>
+    `;
+    return;
   }
 
-  let warn = "";
-  if(top.judgment==="判定不可"){
-    warn = `<div class="herowarn">⏳ まだデータを取得できていません。自動更新をお待ちください。</div>`;
-  }else if(!isBuy){
-    warn = `<div class="herowarn">⚠️ ランキング1位ですが、現在は買いを推奨しません（判定：${esc(top.judgment)}）。</div>`;
+  if(ready.length){
+    heroEl.innerHTML = `<div class="zerobanner">📋 現在Q5（購入判断）の銘柄はありません<span class="sub2">Q1〜Q5判定は各銘柄カードでご確認いただけます</span></div>`;
+    return;
   }
 
-  heroEl.innerHTML = `
-    ${banner}
-    <div class="hero ${isBuy?'hero-buy':'hero-caution'}">
-      <div class="herolabel">📌 今日の注目銘柄（ランキング1位）</div>
-      <div class="heroline">
-        <span class="herorank">1位</span>
-        <span class="heroticker">${esc(top.ticker)}</span>
-        ${rankArrowHtml(top.rank_change)}
-        <span class="pill herobadge ${cls}">${esc(top.judgment)}</span>
-      </div>
-      <div class="herorc">${top.rank_change?esc(top.rank_change.label):""}</div>
-      <div class="herostats">
-        <span>株価 <b>${fmt(top.price)}</b></span>
-        <span class="${top.change_pct>0?'up':top.change_pct<0?'down':''}">前日比 <b>${fmt(top.change_pct,"%")}</b></span>
-      </div>
-      <div class="herocomment">💬 ${esc(top.comment||"")}</div>
-      ${warn}
-    </div>
-  `;
+  heroEl.innerHTML = `<div class="zerobanner">⏳ Q1〜Q5判定はまだありません<span class="sub2">次回の日次更新（GitHub Actions）後に反映されます</span></div>`;
 }
 
 function render(rows){
   renderHero(rows);
   const list=document.getElementById("list");
   list.innerHTML = rows.map((x,i)=>{
-    const cls = JBADGE[x.judgment]||"j-unknown";
+    const q = x.quintile || {};
+    const cardCls = q.status==="ready" ? (QBADGE[q.current_q]||"q-pending").replace("q-","cq-") : "cq-pending";
     const rc = x.rank_change;
-    const cardCls = CARDCLASS[x.judgment]||"cj-unknown";
     return `<div class="tcard ${cardCls}">
       <div class="rankline">
         <span class="rankbig">${i+1}位</span>
         <span class="tickerbig">${esc(x.ticker)}</span>
         ${rankArrowHtml(rc)}
-        <span class="judgebadge pill ${cls}">${esc(x.judgment)}</span>
+        ${qBadgeHtml(x.quintile)}
       </div>
       <div class="rankdetail">${rc?esc(rc.label):""}</div>
-      <div class="rankdetail">${qBadgeHtml(x.quintile)}</div>
       ${qHistoryHtml(x.quintile)}
       ${q5StatsHtml(x.quintile)}
 
@@ -534,22 +507,7 @@ function render(rows){
         <div class="stat"><div class="statlabel">時価総額</div><div class="statval">${esc(x.market_cap_text||"—")}${x.market_cap_label?`<span class="captag">${esc(x.market_cap_label)}</span>`:""}</div></div>
       </div>
 
-      <div class="commentbox">💬 ${esc(x.comment||"")}</div>
       ${newsHtml(x.news)}
-
-      <details class="moredetail">
-        <summary>詳細指標を見る</summary>
-        <div class="detailgrid">
-          <div><div class="dl">MA20</div><div class="dv">${fmt(x.ma20)}</div></div>
-          <div><div class="dl">MA50</div><div class="dv">${fmt(x.ma50)}</div></div>
-          <div><div class="dl">高値乖離</div><div class="dv">${fmt(x.high_gap,"%")}</div></div>
-          <div><div class="dl">出来高比</div><div class="dv">${fmt(x.volume_ratio)}</div></div>
-          <div><div class="dl">上昇余地</div><div class="dv">${fmt(x.upside_score)}</div></div>
-          <div><div class="dl">過熱リスク</div><div class="dv">${fmt(x.overheat_score)}</div></div>
-          <div><div class="dl">底打ち状態</div><div class="dv">${esc(x.bottom_status||"—")}</div></div>
-          <div><div class="dl">局面</div><div class="dv">${esc(x.phase||"—")}</div></div>
-        </div>
-      </details>
 
       <div class="cardfoot">
         ${freshTagHtml(x.freshness)}
