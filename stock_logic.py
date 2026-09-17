@@ -1,224 +1,27 @@
-"""Alpha Vantage取得・指標計算・購入判定ロジックの共通モジュール。
+"""指標計算・購入判定ロジックの共通モジュール。
 
 app.py（Webサービス）と refresh.py（日次自動更新ジョブ）の両方から import される。
+
+2026-09-17: Alpha Vantage撤去・Twelve Data一本化に伴い、Alpha Vantageへの
+通信を行っていたコード(api_get/fetch_daily_series/fetch_news/fetch_overview等)
+はすべて削除した。株価データはrefresh.py側でtwelvedata_client.fetch_daily_series
+から取得し、本モジュールの計算関数(compute_indicators等)にそのまま渡す
+(twelvedata_client.fetch_daily_seriesはこのモジュールの旧fetch_daily_seriesと
+同じ戻り値の形で設計されているため、計算関数側は無変更で動作する)。
+ニュース・企業情報(時価総額)はTwelve Dataで代替できないため機能ごと撤去し、
+build_result()はnews_items/market_cap等を渡さない(=Noneのまま)呼び出しに
+変更した想定。build_result自体のロジックはNone/空リスト入力を既に許容して
+いたため無変更。
 """
 
-import re
-import time
-import threading
-from datetime import datetime, timezone, timedelta
-
-import requests
-
-_APIKEY_RE = re.compile(r"apikey=[^&\s'\")]+", re.IGNORECASE)
-
-
-def _redact(text):
-    """requestsの通信エラーはURL（apikey付き）をそのまま文字列化することがあるため、
-    ログ・エラーメッセージに出す前に必ずAPIキーを伏字にする。"""
-    return _APIKEY_RE.sub("apikey=***", str(text))
-
-API_URL = "https://www.alphavantage.co/query"
 DEFAULT_TICKERS = ["AXTI", "NBIS", "AEHR", "MU", "SNDK", "BE", "IONQ", "CRDO"]
 MAX_TICKERS = 15
 
-# Alpha Vantage無料枠は25 requests/dayだが、リトライ・手動更新の余裕を
-# 残すため、アプリ側ではさらに厳しい自己申告の上限を設ける。
-DAILY_API_BUDGET = 22
-
-MIN_CALL_INTERVAL = 1.05  # 無料プランのバースト制限対策（秒）
-
-_lock = threading.Lock()
-_last_call_ts = 0.0
-
-
-class ApiError(Exception):
-    """Alpha Vantage呼び出しに関する分類済みエラー。
-
-    attempts: このエラーに至るまでに実際にAlpha Vantageへ送信したHTTPリクエスト回数。
-    ネットワークエラー時のリトライで2回送信していた場合は2になる。自己申告の
-    APIカウンタ（redis_store）を実消費と一致させるため、呼び出し元はこの値を
-    使って予算を加算する。
-    """
-
-    def __init__(self, error_type, message, attempts=1):
-        self.error_type = error_type
-        self.message = message
-        self.attempts = attempts
-        super().__init__(message)
-
-
-def _throttle():
-    global _last_call_ts
-    with _lock:
-        wait = MIN_CALL_INTERVAL - (time.time() - _last_call_ts)
-        if wait > 0:
-            time.sleep(wait)
-        _last_call_ts = time.time()
-
-
-def classify_error(data):
-    """Alpha Vantageのレスポンス本体からエラー種別を判定する。
-
-    戻り値: (error_type, message) 正常時は (None, None)
-    """
-    if not isinstance(data, dict):
-        return "UNKNOWN", "想定外のAPIレスポンス形式です"
-    if data.get("Note"):
-        return "RATE_LIMIT", str(data["Note"])
-    if data.get("Information"):
-        info = str(data["Information"])
-        lowered = info.lower()
-        if "rate limit" in lowered or "frequency" in lowered or "per day" in lowered or "premium" in lowered:
-            return "RATE_LIMIT", info
-        return "UNKNOWN", info
-    if data.get("Error Message"):
-        return "INVALID_SYMBOL", str(data["Error Message"])
-    return None, None
-
-
-def api_get(params, api_key, retry_network=True):
-    """Alpha Vantageへの1コール。ネットワーク系エラーのみ最大1回リトライする。
-
-    戻り値: (data, attempts) — attemptsは実際にAlpha Vantageへ送信したHTTPリクエスト
-    回数（リトライで2回送信していれば2）。呼び出し元はこれを使って自己申告の
-    APIカウンタを正確に加算する（1コール=1加算という誤った前提を避ける）。
-    """
-    if not api_key:
-        raise ApiError("UNKNOWN", "ALPHAVANTAGE_API_KEYが未設定です", attempts=0)
-
-    p = dict(params)
-    p["apikey"] = api_key
-    max_attempts = 2 if retry_network else 1
-    last_exc = None
-
-    for attempt in range(max_attempts):
-        _throttle()
-        attempts_made = attempt + 1
-        try:
-            r = requests.get(API_URL, params=p, timeout=20)
-            r.raise_for_status()
-        except (requests.Timeout, requests.ConnectionError) as e:
-            last_exc = e
-            if attempt < max_attempts - 1:
-                time.sleep(2)
-                continue
-            raise ApiError("NETWORK", f"通信エラー: {_redact(e)}", attempts=attempts_made)
-        except requests.RequestException as e:
-            raise ApiError("NETWORK", f"通信エラー: {_redact(e)}", attempts=attempts_made)
-
-        try:
-            data = r.json()
-        except ValueError:
-            raise ApiError("UNKNOWN", "Alpha VantageからJSONを受け取れませんでした", attempts=attempts_made)
-
-        err_type, err_msg = classify_error(data)
-        if err_type:
-            raise ApiError(err_type, _redact(err_msg), attempts=attempts_made)
-        return data, attempts_made
-
-    # ここには到達しない想定だが、念のため
-    raise ApiError("NETWORK", f"通信エラー: {_redact(last_exc)}", attempts=max_attempts)
-
-
-def fetch_daily_series(ticker, api_key):
-    """日足の終値・出来高を古い順に取得する。
-    戻り値: (dates, closes, volumes, attempts)。attemptsは実際のAPI呼び出し回数。"""
-    data, attempts = api_get(
-        {"function": "TIME_SERIES_DAILY", "symbol": ticker, "outputsize": "compact"},
-        api_key,
-    )
-    series = data.get("Time Series (Daily)")
-    if not series or not isinstance(series, dict):
-        raise ApiError("NO_DATA", "株価データを取得できませんでした", attempts=attempts)
-
-    rows = []
-    for d, v in series.items():
-        try:
-            close = float(v["4. close"])
-            volume = int(float(v.get("5. volume", 0)))
-        except (KeyError, TypeError, ValueError):
-            continue
-        rows.append((d, close, volume))
-    rows.sort(key=lambda x: x[0])
-
-    if len(rows) < 20:
-        raise ApiError("NO_DATA", "データ不足のため判定できません", attempts=attempts)
-
-    dates = [r[0] for r in rows]
-    closes = [r[1] for r in rows]
-    volumes = [r[2] for r in rows]
-    return dates, closes, volumes, attempts
-
-
-def fetch_news(tickers, api_key):
-    """対象銘柄群についてのニュース（センチメント付き）をまとめて1コールで取得する。
-
-    失敗時は空リスト。各アイテムには一致した銘柄ごとの
-    {"score": float, "relevance": float, "label": str} を持つ "sentiment" 辞書を含める。
-    """
-    if not tickers:
-        return []
-    try:
-        data, _ = api_get(
-            {
-                "function": "NEWS_SENTIMENT",
-                "tickers": ",".join(tickers),
-                "sort": "LATEST",
-                "limit": 50,
-            },
-            api_key,
-            retry_network=False,
-        )
-    except ApiError:
-        return []
-
-    items = []
-    for x in data.get("feed", []) if isinstance(data, dict) else []:
-        published = x.get("time_published", "")
-        try:
-            dt = datetime.strptime(published[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - dt > timedelta(hours=36):
-                continue
-        except Exception:
-            pass
-
-        sentiment = {}
-        for ts in x.get("ticker_sentiment", []):
-            tk = ts.get("ticker")
-            if tk not in tickers:
-                continue
-            try:
-                score = float(ts.get("ticker_sentiment_score", 0))
-            except (TypeError, ValueError):
-                score = 0.0
-            try:
-                relevance = float(ts.get("relevance_score", 0))
-            except (TypeError, ValueError):
-                relevance = 0.0
-            sentiment[tk] = {
-                "score": score,
-                "relevance": relevance,
-                "label": ts.get("ticker_sentiment_label", ""),
-            }
-        if not sentiment:
-            continue
-
-        items.append(
-            {
-                "title": x.get("title", ""),
-                "url": x.get("url", ""),
-                "source": x.get("source", ""),
-                "published": published,
-                "tickers": list(sentiment.keys()),
-                "sentiment": sentiment,
-            }
-        )
-    return items[:30]
-
 
 def aggregate_sentiment(ticker, news_items):
-    """関連度で重み付けした平均センチメントスコア（おおむね-1〜1）を返す。データが無ければNone。"""
+    """関連度で重み付けした平均センチメントスコア（おおむね-1〜1）を返す。データが無ければNone。
+    ニュース機能撤去後はnews_itemsが常に空/Noneで呼ばれるため常にNoneを返すが、
+    build_result()からの呼び出し自体は変更していないため、この関数は残す。"""
     total_w = 0.0
     total = 0.0
     for n in news_items or []:
@@ -231,32 +34,6 @@ def aggregate_sentiment(ticker, news_items):
     if total_w == 0:
         return None
     return round(total / total_w, 3)
-
-
-def _clean_overview_field(v):
-    """Alpha VantageのOVERVIEWは値がない項目を文字列"None"で返すことがあるため空文字に正規化する。"""
-    v = (v or "").strip()
-    return "" if v in ("", "None", "-", "N/A") else v
-
-
-def fetch_overview(ticker, api_key):
-    """OVERVIEWエンドポイントから時価総額・セクター・業種を取得する（日次では最大1銘柄のみ呼ぶ）。"""
-    data, _ = api_get({"function": "OVERVIEW", "symbol": ticker}, api_key, retry_network=False)
-    if not isinstance(data, dict) or not data.get("Symbol"):
-        raise ApiError("NO_DATA", "企業情報を取得できませんでした")
-
-    cap_raw = data.get("MarketCapitalization")
-    try:
-        market_cap = int(cap_raw) if cap_raw not in (None, "", "None") else None
-    except (TypeError, ValueError):
-        market_cap = None
-
-    return {
-        "market_cap": market_cap,
-        "name": _clean_overview_field(data.get("Name")),
-        "sector": _clean_overview_field(data.get("Sector")),
-        "industry": _clean_overview_field(data.get("Industry")),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +343,7 @@ ERROR_LABELS = {
     "NETWORK": "通信エラー",
     "INVALID_SYMBOL": "無効な銘柄コード",
     "NO_DATA": "データ取得不可",
+    "AUTH": "APIキー認証エラー",  # Twelve Data(twelvedata_client.TdApiError)のエラー種別を追加
     "UNKNOWN": "不明なエラー",
 }
 

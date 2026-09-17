@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
 from flask import Flask, jsonify, request, render_template_string
 
@@ -8,45 +8,20 @@ import quintile_logic
 import redis_store as store
 import stock_logic as logic
 import refresh
+import twelvedata_client as td
 
 app = Flask(__name__)
 
-API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
-# Q1〜Q5(Twelve Data)の新規銘柄バックフィル専用。app.pyからTwelve Dataへ
-# 直接アクセスすることはなく、常にrefresh.backfill_quintile_history_for_new_ticker
+# 2026-09-17: Alpha Vantage完全撤去・Twelve Data一本化。app.pyからTwelve Data
+# へ直接アクセスすることはなく、常にrefresh.backfill_quintile_history_for_new_ticker
 # 経由で呼び出す(design方針「Twelve Dataをapp.pyから直接呼ばない」を維持)。
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
-
-# 手動更新のクールダウン。1日の自己申告予算(stock_logic.DAILY_API_BUDGET)に
-# 対して余裕が小さいため、自動更新より長めの間隔を空ける。
-MANUAL_REFRESH_COOLDOWN = 3 * 60 * 60  # 3時間
-
-# Redisのキャッシュがこの時間を超えて古い場合のみ、手動更新の対象に含める
-# （日次のGitHub Actionsジョブが何らかの理由で動かなかった場合の保険）。
-CACHE_FRESH_SECONDS = 20 * 60 * 60  # 20時間
 
 TICKER_RE = re.compile(r"[^A-Z0-9.\-]")
 
 
 def _sanitize_ticker(raw):
     return TICKER_RE.sub("", (raw or "").strip().upper())
-
-
-def _needs_refresh(record):
-    """Redis上のレコードが「取得済みキャッシュとして十分新しいか」を判定する。"""
-    if not record or not record.get("last_trade_date"):
-        return True
-    if record.get("is_stale"):
-        return True
-    fetched_at = record.get("fetched_at")
-    if not fetched_at:
-        return True
-    try:
-        fetched_dt = datetime.fromisoformat(fetched_at)
-    except ValueError:
-        return True
-    age = (datetime.now(timezone.utc).astimezone() - fetched_dt).total_seconds()
-    return age > CACHE_FRESH_SECONDS
 
 
 def _freshness(record):
@@ -392,7 +367,6 @@ details.logicinfo .small{margin-top:10px}
 
 <div class="card">
   <div class="controls">
-    <button onclick="manualRefresh()" id="refreshBtn">🔄 未取得/失敗分だけ今すぐ再取得</button>
     <input id="ticker" placeholder="例 NVDA" maxlength="10" onkeydown="if(event.key==='Enter')addTicker()">
     <button onclick="addTicker()" id="addBtn">＋追加（即時取得）</button>
   </div>
@@ -442,20 +416,6 @@ function renderOpInfo(j){
   document.getElementById("opinfo").textContent = msg;
 }
 
-async function manualRefresh(){
-  const btn=document.getElementById("refreshBtn");
-  btn.disabled=true;
-  document.getElementById("status").textContent="未取得・失敗銘柄を再取得中…";
-  try{
-    const r=await fetch("/api/refresh",{method:"POST"});
-    const j=await r.json();
-    if(!j.ok){document.getElementById("status").textContent="更新できません："+j.error;}
-    else{document.getElementById("status").textContent=j.message||"更新しました";}
-    await updateRanking();
-  }catch(e){document.getElementById("status").textContent="エラー："+e.message}
-  finally{btn.disabled=false;}
-}
-
 async function addTicker(){
   const el=document.getElementById("ticker"), t=el.value.trim().toUpperCase().replace(/[^A-Z0-9.\-]/g,"");
   if(!t)return;
@@ -493,16 +453,6 @@ async function delTicker(t){
     alert("削除エラー: "+e.message);
     await updateRanking();
   }
-}
-
-function newsHtml(news){
-  if(!news || !news.length) return `<div class="newsblock"><span class="nonews">📰 直近の重要ニュースなし</span></div>`;
-  return `<div class="newsblock">` + news.slice(0,2).map(n=>{
-    const title = esc(n.title||"");
-    return n.url
-      ? `📰 <a href="${esc(n.url)}" target="_blank" rel="noopener">${title}</a>`
-      : `📰 ${title}`;
-  }).join("<br>") + `</div>`;
 }
 
 function freshTagHtml(f){
@@ -693,10 +643,7 @@ function render(rows){
         <div class="stat"><div class="statlabel">前日比</div><div class="statval ${x.change_pct>0?'up':x.change_pct<0?'down':''}">${fmt(x.change_pct,"%")}</div></div>
         <div class="stat"><div class="statlabel">1ヶ月</div><div class="statval ${x.month_return>0?'up':x.month_return<0?'down':''}">${fmt(x.month_return,"%")}</div></div>
         <div class="stat"><div class="statlabel">RSI14</div><div class="statval">${fmt(x.rsi14)}</div></div>
-        <div class="stat"><div class="statlabel">時価総額</div><div class="statval">${esc(x.market_cap_text||"—")}${x.market_cap_label?`<span class="captag">${esc(x.market_cap_label)}</span>`:""}</div></div>
       </div>
-
-      ${newsHtml(x.news)}
 
       <div class="cardfoot">
         ${freshTagHtml(x.freshness)}
@@ -815,58 +762,21 @@ def add_watchlist():
         if not store.set_watchlist(tickers):
             return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
 
-        # 追加直後にその銘柄だけ即時取得する。GitHub Actionsの日次更新は待たない。
-        # 無駄なAPI呼び出しを避けるため、対象は今追加した1銘柄のみで、
-        # 本日のAPI予算が残っていない場合は取得をスキップする（次回自動更新で反映）。
+        # 2026-09-17: Alpha Vantage完全撤去・Twelve Data一本化。追加直後にTwelve Data
+        # を1回だけ取得し、その同じデータをrefresh.backfill_quintile_history_for_new_ticker
+        # 内で旧指標(株価・RSI等)・Q1〜Q5の両方に使う(追加のAPI呼び出しは発生しない)。
+        # これにより銘柄追加直後からpendingを経由せずready表示になる。
         fetch_note = None
-        if not API_KEY:
+        if not TD_API_KEY:
             fetch_note = "APIキー未設定のため、次回の自動更新までデータは表示されません。"
         elif not store.is_configured():
             fetch_note = "Redis未設定のため即時取得はできません。"
         else:
-            budget_left, _ = refresh.remaining_budget()
-            if budget_left <= 0:
-                fetch_note = "本日のAPI利用予算に達しているため、次回の自動更新でデータが反映されます。"
-            else:
-                try:
-                    result = refresh.run_refresh([ticker], API_KEY)
-                    if ticker in result["success"]:
-                        fetch_note = "最新データを取得しました。"
-                    elif result["failed"]:
-                        err_type = result["failed"][0].get("type")
-                        fetch_note = (
-                            f"データ取得に失敗しました（{logic.ERROR_LABELS.get(err_type, err_type)}）。"
-                            "次回の自動更新をお待ちください。"
-                        )
-                    else:
-                        fetch_note = "データを取得できませんでした。次回の自動更新をお待ちください。"
-                except Exception as e:
-                    fetch_note = f"即時取得中にエラーが発生しました: {e}"
-
-        # Q1〜Q5(Twelve Data)の過去分バックフィル。既存のAlpha Vantage即時取得
-        # とは完全に独立しており、ここで何が起きてもticker追加自体・上の
-        # fetch_noteには一切影響しない(design 2026-09-17: 新規追加銘柄も
-        # 可能な範囲で今日〜5日前のQ状態を表示するための橋渡し)。
-        # 2026-09-17の本番確認で、TD_API_KEY未設定等によりこのブロック自体が
-        # 無言でスキップされ、Renderログを見ても原因が分からない状態だったため、
-        # スキップ理由を必ずログへ出すようにした(画面表示・fetch_noteは変更しない)。
-        if not TD_API_KEY:
-            print(
-                f"[Q1-5][WARN] {ticker}: TWELVEDATA_API_KEYが未設定のため、過去分バックフィルを"
-                "スキップします(Render側の環境変数設定を確認してください)。"
-            )
-        elif not store.is_configured():
-            print(f"[Q1-5][WARN] {ticker}: Redis(Upstash)未設定のため、過去分バックフィルをスキップします。")
-        else:
             try:
                 ok = refresh.backfill_quintile_history_for_new_ticker(ticker, TD_API_KEY)
-                if not ok:
-                    print(
-                        f"[Q1-5][WARN] {ticker}: 過去分バックフィルが完了しませんでした"
-                        "(詳細な理由は直前の[Q1-5]ログを参照してください)。"
-                    )
+                fetch_note = "最新データを取得しました。" if ok else "データを取得できませんでした。次回の自動更新をお待ちください。"
             except Exception as e:
-                print(f"[Q1-5][WARN] {ticker}: バックフィル呼び出し中に予期しないエラー: {e}")
+                fetch_note = f"即時取得中にエラーが発生しました: {e}"
 
         return jsonify({"ok": True, "tickers": tickers, "fetch_note": fetch_note})
     except Exception as e:
@@ -902,62 +812,14 @@ def ranking():
                 "skipped_count": len(last_refresh.get("skipped", [])),
             }
 
-        budget_left, used = refresh.remaining_budget()
+        budget_left, used = refresh.remaining_td_budget()
 
         return jsonify({
             "ok": True,
             "rows": rows,
             "last_refresh": last_refresh_view,
-            "budget": {"used": used, "limit": logic.DAILY_API_BUDGET, "remaining": budget_left},
+            "budget": {"used": used, "limit": td.DAILY_API_BUDGET, "remaining": budget_left},
         })
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"予期しないエラーが発生しました: {e}"}), 200
-
-
-@app.post("/api/refresh")
-def manual_refresh():
-    try:
-        if not API_KEY:
-            return jsonify({"ok": False, "error": "ALPHAVANTAGE_API_KEYが未設定です"}), 200
-        if not store.is_configured():
-            return jsonify({"ok": False, "error": "Redis接続が未設定のため更新できません"}), 200
-
-        last_manual = store.get_last_manual_refresh()
-        if last_manual:
-            try:
-                last_dt = datetime.fromisoformat(last_manual)
-                elapsed = (datetime.now(timezone.utc).astimezone() - last_dt).total_seconds()
-                if elapsed < MANUAL_REFRESH_COOLDOWN:
-                    wait_min = int((MANUAL_REFRESH_COOLDOWN - elapsed) / 60) + 1
-                    return jsonify({
-                        "ok": False,
-                        "error": f"手動更新は前回から一定時間空ける必要があります（あと約{wait_min}分）",
-                    }), 200
-            except ValueError:
-                pass
-
-        budget_left, used = refresh.remaining_budget()
-        if budget_left <= 0:
-            return jsonify({
-                "ok": False,
-                "error": f"本日のAPI利用予算（{logic.DAILY_API_BUDGET}回）に達しています。翌日の自動更新をお待ちください。",
-            }), 200
-
-        tickers = _get_watchlist()
-        targets = [t for t in tickers if _needs_refresh(store.get_ticker_record(t))]
-
-        if not targets:
-            return jsonify({"ok": True, "message": "更新の必要はありません（全銘柄が20時間以内に取得済みです）"})
-
-        result = refresh.run_refresh(targets, API_KEY)
-        store.set_last_manual_refresh(datetime.now(timezone.utc).astimezone().isoformat())
-
-        msg = f"{len(result['success'])}件更新しました"
-        if result["failed"]:
-            msg += f"（{len(result['failed'])}件は取得失敗のため前回データのままです）"
-        if result["skipped"]:
-            msg += f"（{len(result['skipped'])}件はAPI予算切れのため未処理）"
-        return jsonify({"ok": True, "message": msg, "result": result})
     except Exception as e:
         return jsonify({"ok": False, "error": f"予期しないエラーが発生しました: {e}"}), 200
 
@@ -968,7 +830,7 @@ def health():
         "ok": True,
         "service": "stock-buy-app",
         "max_tickers": logic.MAX_TICKERS,
-        "api_key_configured": bool(API_KEY),
+        "api_key_configured": bool(TD_API_KEY),
         "redis_configured": store.is_configured(),
     })
 

@@ -1,23 +1,26 @@
-"""日次の株価自動更新ジョブ、および手動更新・銘柄追加時の即時取得から共通利用される更新ロジック。
+"""日次の株価自動更新ジョブ、および銘柄追加時の即時取得から共通利用される更新ロジック。
 
 GitHub Actions の schedule（.github/workflows/daily-refresh.yml）から
 1日1回 `python refresh.py` として実行される想定のエントリポイント。
 Render Web Service（app.py）はこのスクリプトが書き込んだUpstash Redis
-のデータを読むだけで、日常的には自らAlpha Vantageへ新規アクセスはしない。
-ただし app.py は本モジュールの `run_refresh` を import し、
-(1) 未取得/失敗銘柄だけの限定的な手動更新、および
-(2) 銘柄追加直後の即時取得（1銘柄のみ）
-の2箇所で再利用する。
+のデータを読むだけで、日常的には自らTwelve Dataへ新規アクセスはしない。
+ただし app.py は本モジュールの `backfill_quintile_history_for_new_ticker` を
+import し、銘柄追加直後の即時取得（1銘柄のみ）で再利用する。
+
+2026-09-17: Alpha Vantage完全撤去・Twelve Data一本化。株価取得は全て
+twelvedata_client経由になり、旧指標(stock_logic.build_result、株価・RSI・
+前日比・1ヶ月騰落率)とQ1〜Q5判定(quintile_logic)は、同じ1回のTwelve Data
+取得結果を共有して両方に使う(取得回数を増やさない)。ニュース・時価総額
+(企業情報)はTwelve Dataで代替できないため機能ごと撤去した。
 
 設計上の原則:
 - 1銘柄の取得失敗が他銘柄の処理を止めない（銘柄ごとにtry/except）
-- Alpha Vantage無料枠(25 req/day)を超えないよう、自己申告の予算
-  (stock_logic.DAILY_API_BUDGET) を使い切ったら残りは前回データのまま
+- Twelve Data Basicプラン(800 credits/day)を超えないよう、自己申告の予算
+  (twelvedata_client.DAILY_API_BUDGET)を使い切ったら残りは前回データのまま
   スキップする
-- 株価取得を最優先し、ニュース・時価総額（OVERVIEW）は株価取得後に
-  予算が残っている場合だけ呼ぶ（ニュースは対象銘柄まとめて1コール、
-  時価総額は1回の実行につき最大1銘柄のみ・30日に1回程度の頻度）
 - Redis接続断など想定外の例外でもプロセス全体をクラッシュさせない
+- Q1〜Q5判定ロジック(quintile_logic.py呼び出し部分)は今回のAlpha Vantage
+  撤去作業で一切変更していない
 """
 
 import os
@@ -38,14 +41,9 @@ def _now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
-def remaining_budget():
-    """(残りコール数, 本日の使用済みコール数) を返す。"""
-    used = store.get_api_budget(_today_str())
-    return logic.DAILY_API_BUDGET - used, used
-
-
 def _mark_stale(ticker, error_type, message):
-    """取得失敗時、前回の正常データを保持したまま失敗理由だけを上書きする。"""
+    """取得失敗時、前回の正常データを保持したまま失敗理由だけを上書きする。
+    Alpha Vantage固有の処理ではなく、Twelve Data撤去後も無変更で使う。"""
     try:
         rec = store.get_ticker_record(ticker) or {"ticker": ticker}
         rec["is_stale"] = True
@@ -55,149 +53,6 @@ def _mark_stale(ticker, error_type, message):
         store.set_ticker_record(ticker, rec)
     except Exception as e:  # Redis書き込み自体の失敗もジョブを止めない
         print(f"[WARN] {ticker}: 失敗記録の保存にも失敗しました: {e}", file=sys.stderr)
-
-
-def _is_market_cap_stale(rec):
-    if rec.get("market_cap") is None:
-        return True
-    fetched_at = rec.get("market_cap_fetched_at")
-    if not fetched_at:
-        return True
-    try:
-        dt = datetime.fromisoformat(fetched_at)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return True
-    return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).days >= 30
-
-
-def _pick_and_fetch_stale_cap(tickers, api_key, date_key):
-    """時価総額が未取得/30日以上古い銘柄のうち先頭1件だけOVERVIEWを取得する。
-    1回の実行につきAPIコールは最大1回に制限してAlpha Vantageの無料枠を守る。"""
-    budget_left, _ = remaining_budget()
-    if budget_left <= 0:
-        return None, None
-
-    for ticker in tickers:
-        rec = store.get_ticker_record(ticker) or {}
-        if not _is_market_cap_stale(rec):
-            continue
-        try:
-            info = logic.fetch_overview(ticker, api_key)
-            store.incr_api_budget(date_key, 1)
-            return ticker, info
-        except logic.ApiError as e:
-            store.incr_api_budget(date_key, 1)
-            print(f"[WARN] {ticker}: 時価総額（OVERVIEW）取得に失敗: {e.error_type} - {e.message}")
-            return None, None
-        except Exception as e:
-            print(f"[WARN] {ticker}: 時価総額（OVERVIEW）取得中に予期しないエラー: {e}", file=sys.stderr)
-            return None, None
-    return None, None
-
-
-def run_refresh(tickers, api_key):
-    """指定銘柄群を取得しRedisへ保存する。1銘柄の失敗は他に影響しない。
-
-    GitHub Actionsの日次ジョブ（全銘柄）からも、app.pyの限定的な手動更新
-    （未取得/失敗分）・銘柄追加時の即時取得（1銘柄）からも呼ばれる共通ロジック。
-    株価取得を最優先し、ニュース・時価総額は株価取得後に予算が残っていれば
-    追加で取得する（＝APIキーの少ない銘柄追加時でも株価だけは即時反映されやすい）。
-
-    戻り値: {"success": [...], "failed": [...], "skipped": [...]}
-    """
-    date_key = _today_str()
-    tickers = [t.strip().upper() for t in tickers if t and t.strip()][: logic.MAX_TICKERS]
-
-    success, failed, skipped = [], [], []
-    fetched_price = {}
-    # Alpha VantageがRATE_LIMITを返した時点でフラグを立て、以降の銘柄・ニュース・
-    # 時価総額の呼び出しをすべて中断する（枯渇している状態でこれ以上呼んでも
-    # 無駄打ちになるだけで、自己申告予算とのズレを広げるだけのため）。
-    rate_limited = False
-
-    for ticker in tickers:
-        if rate_limited:
-            skipped.append(ticker)
-            continue
-
-        budget_left, _ = remaining_budget()
-        if budget_left <= 0:
-            print(f"[WARN] {ticker}: API予算を使い切ったためスキップ（前回データを維持）")
-            skipped.append(ticker)
-            continue
-
-        try:
-            dates, closes, volumes, attempts = logic.fetch_daily_series(ticker, api_key)
-            store.incr_api_budget(date_key, attempts)
-            fetched_price[ticker] = (dates, closes, volumes)
-        except logic.ApiError as e:
-            store.incr_api_budget(date_key, e.attempts)
-            _mark_stale(ticker, e.error_type, e.message)
-            failed.append({"ticker": ticker, "type": e.error_type, "message": e.message})
-            print(f"[NG] {ticker}: {e.error_type} - {e.message}")
-            if e.error_type == "RATE_LIMIT":
-                rate_limited = True
-                print("[WARN] Alpha VantageがRATE_LIMITを返したため、以降の呼び出しを中断します。")
-        except Exception as e:
-            # 想定外の例外。予算は消費していない可能性が高いため加算しない。
-            _mark_stale(ticker, "UNKNOWN", str(e))
-            failed.append({"ticker": ticker, "type": "UNKNOWN", "message": str(e)})
-            print(f"[NG] {ticker}: UNKNOWN - {e}")
-
-    # ニュースは対象銘柄まとめて1コール（予算が残っていて、価格取得に成功した銘柄があり、
-    # かつRATE_LIMITで中断していない場合のみ）
-    news_items = []
-    budget_left, _ = remaining_budget()
-    if not rate_limited and budget_left > 0 and fetched_price:
-        try:
-            news_items = logic.fetch_news(list(fetched_price.keys()), api_key)
-            store.incr_api_budget(date_key, 1)
-        except Exception as e:
-            print(f"[WARN] ニュース取得に失敗しました: {e}", file=sys.stderr)
-
-    # 時価総額（OVERVIEW）は1回の実行につき最大1銘柄のみ（RATE_LIMIT中断時は呼ばない）
-    cap_ticker, cap_info = (None, None)
-    if not rate_limited and fetched_price:
-        cap_ticker, cap_info = _pick_and_fetch_stale_cap(list(fetched_price.keys()), api_key, date_key)
-
-    for ticker, (dates, closes, volumes) in fetched_price.items():
-        old = store.get_ticker_record(ticker) or {}
-        if ticker == cap_ticker and cap_info:
-            market_cap = cap_info["market_cap"]
-            sector = cap_info["sector"]
-            industry = cap_info["industry"]
-            company_name = cap_info["name"]
-            cap_fetched_at = _now_iso()
-        else:
-            market_cap = old.get("market_cap")
-            sector = old.get("sector", "")
-            industry = old.get("industry", "")
-            company_name = old.get("company_name", "")
-            cap_fetched_at = old.get("market_cap_fetched_at")
-
-        try:
-            record = logic.build_result(
-                ticker, dates, closes, volumes, news_items=news_items,
-                market_cap=market_cap, sector=sector, industry=industry, company_name=company_name,
-            )
-            record["fetched_at"] = _now_iso()
-            record["is_stale"] = False
-            record["last_error"] = None
-            record["last_error_message"] = None
-            record["last_error_at"] = None
-            record["market_cap_fetched_at"] = cap_fetched_at
-
-            store.set_ticker_record(ticker, record)
-            success.append(ticker)
-            print(f"[OK] {ticker}: {record['judgment']}（最終取引日 {record['last_trade_date']}）")
-        except Exception as e:
-            _mark_stale(ticker, "UNKNOWN", str(e))
-            failed.append({"ticker": ticker, "type": "UNKNOWN", "message": str(e)})
-            print(f"[NG] {ticker}: 判定計算中に予期しないエラー: {e}")
-
-    return {"success": success, "failed": failed, "skipped": skipped}
 
 
 def _build_rank_rows(tickers):
@@ -224,36 +79,10 @@ def update_rank_snapshot(tickers):
         print(f"[WARN] rank_snapshotの更新に失敗しました: {e}", file=sys.stderr)
 
 
-def _priority_order(tickers):
-    """前回の実行で失敗・スキップになった銘柄と、そもそも未取得/前回エラーのままの
-    銘柄を先頭に並べ替える。ウォッチリストを毎回同じ順序で処理すると、予算や
-    Alpha Vantage側のクォータが尽きたときに常に同じ（後方の）銘柄だけが
-    取得できないまま固定化されてしまうため、それを避ける。
-
-    新たなAPI呼び出しは発生させず、既存のRedis記録（前回実行サマリーと各銘柄の
-    レコード）だけを参照する。各グループ内の相対順序は元のウォッチリスト順を保つ。
-    """
-    last = store.get_last_refresh() or {}
-    prev_failed = {f.get("ticker") for f in last.get("failed", []) if isinstance(f, dict)}
-    prev_skipped = set(last.get("skipped", []))
-    prev_needs_retry = prev_failed | prev_skipped
-
-    def needs_priority(t):
-        if t in prev_needs_retry:
-            return True
-        rec = store.get_ticker_record(t)
-        return not rec or not rec.get("last_trade_date") or bool(rec.get("is_stale"))
-
-    priority = [t for t in tickers if needs_priority(t)]
-    rest = [t for t in tickers if not needs_priority(t)]
-    return priority + rest
-
-
 # ---------------------------------------------------------------------------
-# Q1〜Q5判定(Twelve Data、quintile_logic.py)。Alpha Vantageの既存フロー
-# (run_refresh/remaining_budget等)とは完全に独立した処理で、既存コードは
-# 一切変更していない(追加のみ)。IMPLEMENTATION_DESIGN_quintile_q1q5.md、
-# および2026-09-16の本番実装レビューで確定した流れ:
+# Q1〜Q5判定(Twelve Data、quintile_logic.py)。IMPLEMENTATION_DESIGN_quintile_q1q5.md、
+# および2026-09-16の本番実装レビューで確定した流れ(①〜⑩の判定ロジック自体は
+# 2026-09-17のAlpha Vantage撤去作業でも一切変更していない):
 # ① SPY取得 ② 当日のreference group取得 ③ ユーザー監視銘柄取得
 # ④ 9特徴量計算 ⑤ pred_score計算 ⑥ reference pool更新
 # ⑦ rolling 252日poolからpercentile境界計算 ⑧ Q1〜Q5判定
@@ -264,8 +93,7 @@ MAX_QUINTILE_STATE_HISTORY = 60
 
 
 def remaining_td_budget():
-    """(Twelve Dataの残りcredits, 本日の使用済みcredits) を返す。
-    Alpha Vantage用のremaining_budget()とは別カウンタ・別上限。"""
+    """(Twelve Dataの残りcredits, 本日の使用済みcredits) を返す。"""
     used = store.get_td_api_budget(_today_str())
     return td.DAILY_API_BUDGET - used, used
 
@@ -323,6 +151,13 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
     Q1〜Q5をlook-ahead biasなしで再計算し、quintile:state:<TICKER>の初期
     historyとして登録する(design: 2026-09-17ユーザー確定仕様)。
 
+    2026-09-17のAlpha Vantage撤去に伴い、この関数内で取得したTwelve Data
+    株価データを使って旧指標(stock_logic.build_result)も同じタイミングで
+    計算・保存するようになった(追加のAPI呼び出しは発生しない、詳細は
+    関数内の該当コメント参照)。これにより銘柄追加直後から旧指標・Q1〜5の
+    両方がready状態で表示される。この部分の追加はQ1〜Q5計算ロジック
+    (以下のlook-ahead bias対策・pool_history絞り込み等)には一切影響しない。
+
     既存のQ1〜Q5判定ロジック(quintile_logic.py)・Q5シグナル有効期限ロジック
     (app.py)・redis_store.pyは一切変更しない。ここで作るhistoryは、
     _update_quintile_stateが日々追記していくものと全く同じ形式
@@ -376,6 +211,25 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
     if result is None:
         return False
     dates, closes, volumes = result
+
+    # 旧指標(stock_logic、株価・RSI・前日比・1ヶ月騰落率)も、上のTwelve Data
+    # 取得結果を再利用してこの場で計算・保存する(design 2026-09-17: 銘柄追加時に
+    # Twelve Dataを1回取得するだけで旧指標・Q1〜Q5の両方をready表示にする)。
+    # 追加のAPI呼び出しは発生しない。失敗してもQ1〜5側のバックフィル処理は
+    # 継続する(このtry/exceptの外には一切影響を及ぼさない、Q1〜5計算ロジック
+    # 自体には触れていない)。
+    try:
+        legacy_record = logic.build_result(ticker, dates, closes, volumes)
+        legacy_record["fetched_at"] = _now_iso()
+        legacy_record["is_stale"] = False
+        legacy_record["last_error"] = None
+        legacy_record["last_error_message"] = None
+        legacy_record["last_error_at"] = None
+        store.set_ticker_record(ticker, legacy_record)
+        print(f"[OK] {ticker}: {legacy_record['judgment']}（最終取引日 {legacy_record['last_trade_date']}）")
+    except Exception as e:
+        _mark_stale(ticker, "UNKNOWN", str(e))
+        print(f"[WARN] {ticker}: 旧指標の計算・保存に失敗しました: {e}", file=sys.stderr)
 
     pool_history = store.get_pool_history()
     if not pool_history or not pool_history.get("scores_by_date"):
@@ -569,13 +423,61 @@ def run_quintile_refresh(api_key, watchlist):
             state = _update_quintile_state(ticker, score, bounds, date_key)
             print(f"[Q1-5][OK] {ticker}: {state['current_q']} (pred_score={score:.2f})")
 
-    return {"fetched": list(fetched.keys()), "failed": failed, "rate_limited": rate_limited}
+    # 旧指標(stock_logic)側が同じ取得結果を再利用できるよう、監視銘柄分の生データ
+    # (dates/closes/volumes)を戻り値に追加する(design 2026-09-17: Alpha Vantage撤去
+    # に伴う追加。上記①〜⑩のQ1〜Q5計算そのものには一切影響しない、戻り値への追記のみ)。
+    raw_watchlist_data = {
+        t: fetched[t] for t in watchlist[: logic.MAX_TICKERS] if t in fetched
+    }
+
+    return {
+        "fetched": list(fetched.keys()), "failed": failed, "rate_limited": rate_limited,
+        "raw_watchlist_data": raw_watchlist_data,
+    }
+
+
+def _update_legacy_records(raw_watchlist_data, tickers):
+    """run_quintile_refreshが監視銘柄向けに取得済みのTwelve Data生データ
+    (dates/closes/volumes)を再利用し、旧指標(stock_logic.build_result、
+    株価・RSI・前日比・1ヶ月騰落率)を計算してRedisへ保存する(design
+    2026-09-17: Alpha Vantage撤去に伴う追加、新規API呼び出しは発生しない)。
+
+    stock_logic.compute_indicators/build_result自体のロジックは無変更。
+    ニュース・時価総額は渡さない(build_resultのデフォルト=None/空のまま)。
+    1銘柄の失敗が他銘柄・Q1〜5側の処理に影響しないよう、個別にtry/exceptする。
+
+    戻り値: {"success": [...], "failed": [...]}
+    """
+    success, failed = [], []
+    for ticker in tickers[: logic.MAX_TICKERS]:
+        data = raw_watchlist_data.get(ticker)
+        if not data:
+            continue  # Q1〜5側で取得できなかった銘柄はこちらでも新規取得しない
+        dates, closes, volumes = data
+        try:
+            record = logic.build_result(ticker, dates, closes, volumes)
+            record["fetched_at"] = _now_iso()
+            record["is_stale"] = False
+            record["last_error"] = None
+            record["last_error_message"] = None
+            record["last_error_at"] = None
+            store.set_ticker_record(ticker, record)
+            success.append(ticker)
+            print(f"[OK] {ticker}: {record['judgment']}（最終取引日 {record['last_trade_date']}）")
+        except Exception as e:
+            _mark_stale(ticker, "UNKNOWN", str(e))
+            failed.append({"ticker": ticker, "type": "UNKNOWN", "message": str(e)})
+            print(f"[NG] {ticker}: 判定計算中に予期しないエラー: {e}")
+    return {"success": success, "failed": failed}
 
 
 def main():
-    api_key = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
-    if not api_key:
-        print("[ERROR] ALPHAVANTAGE_API_KEYが設定されていません。処理を中止します。", file=sys.stderr)
+    # 2026-09-17: Alpha Vantage完全撤去。TWELVEDATA_API_KEYだけが処理全体の
+    # 前提になり、以前のように「Alpha Vantageキーが無いとQ1〜Q5処理にすら
+    # 到達しない」という依存関係は解消した。
+    td_api_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
+    if not td_api_key:
+        print("[ERROR] TWELVEDATA_API_KEYが設定されていません。処理を中止します。", file=sys.stderr)
         return 1
 
     tickers = store.get_watchlist()
@@ -587,25 +489,37 @@ def main():
         except Exception as e:
             print(f"[WARN] watchlistの初期化に失敗しました: {e}", file=sys.stderr)
 
-    _, used_before = remaining_budget()
-    print(f"[INFO] 本日のAPI使用実績: {used_before}回 / 自己申告上限 {logic.DAILY_API_BUDGET}回")
+    _, td_used_before = remaining_td_budget()
+    print(f"[INFO] 本日のTwelve Data使用実績: {td_used_before}回 / 自己申告上限 {td.DAILY_API_BUDGET}回")
 
-    ordered = _priority_order(tickers)
-    if ordered != tickers:
-        print(f"[INFO] 前回失敗/未取得の銘柄を優先: {ordered}")
-    result = run_refresh(ordered, api_key)
-    # ランキングの同点順位はウォッチリストの元の並びで安定させたいため、
-    # 取得優先順（ordered）ではなく元の順序（tickers）を渡す。
+    # Q1〜Q5判定(quintile_logic.py、①〜⑩の判定ロジック自体は無変更)。
+    # この呼び出しの中で監視銘柄のTwelve Data取得も行われ、その生データが
+    # 戻り値のraw_watchlist_dataに含まれる。
+    legacy_result = {"success": [], "failed": []}
+    try:
+        td_result = run_quintile_refresh(td_api_key, tickers)
+        if td_result is not None:
+            print(
+                f"[Q1-5][DONE] 取得成功 {len(td_result['fetched'])}件 / "
+                f"失敗 {len(td_result['failed'])}件 / RATE_LIMIT={td_result['rate_limited']}"
+            )
+            # 旧指標側は、Q1〜5側が既に取得済みの生データを再利用するだけ
+            # (追加のAPI呼び出しは発生しない)。この処理が失敗してもQ1〜5側の
+            # 結果(上のtd_result)には一切影響しない。
+            legacy_result = _update_legacy_records(td_result.get("raw_watchlist_data", {}), tickers)
+    except Exception as e:
+        print(f"[Q1-5][WARN] Q1〜Q5処理で予期しないエラーが発生しました: {e}", file=sys.stderr)
+
     update_rank_snapshot(tickers)
 
-    _, used_after = remaining_budget()
+    _, td_used_after = remaining_td_budget()
     summary = {
         "run_at": _now_iso(),
-        "success": result["success"],
-        "failed": result["failed"],
-        "skipped": result["skipped"],
-        "api_calls_used_today": used_after,
-        "api_budget": logic.DAILY_API_BUDGET,
+        "success": legacy_result["success"],
+        "failed": legacy_result["failed"],
+        "skipped": [],
+        "api_calls_used_today": td_used_after,
+        "api_budget": td.DAILY_API_BUDGET,
     }
     try:
         store.set_last_refresh(summary)
@@ -613,22 +527,9 @@ def main():
         print(f"[WARN] last_refreshサマリーの保存に失敗しました: {e}", file=sys.stderr)
 
     print(
-        f"[DONE] 成功 {len(result['success'])}件 / 失敗 {len(result['failed'])}件 / "
-        f"スキップ {len(result['skipped'])}件 / 本日のAPI使用 {used_after}回"
+        f"[DONE] 成功 {len(legacy_result['success'])}件 / 失敗 {len(legacy_result['failed'])}件 / "
+        f"本日のTwelve Data使用 {td_used_after}回"
     )
-
-    # Q1〜Q5判定(Twelve Data)。既存のAlpha Vantageフローとは完全に独立しており、
-    # ここで例外が起きても既存の購入判定(上のresult/summary)には一切影響しない。
-    try:
-        td_api_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
-        td_result = run_quintile_refresh(td_api_key, tickers)
-        if td_result is not None:
-            print(
-                f"[Q1-5][DONE] 取得成功 {len(td_result['fetched'])}件 / "
-                f"失敗 {len(td_result['failed'])}件 / RATE_LIMIT={td_result['rate_limited']}"
-            )
-    except Exception as e:
-        print(f"[Q1-5][WARN] Q1〜Q5処理で予期しないエラーが発生しました: {e}", file=sys.stderr)
 
     # 一部失敗があってもプロセス自体は正常終了させる（他銘柄は正常に更新済みのため）
     return 0
