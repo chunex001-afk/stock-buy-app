@@ -101,19 +101,23 @@ def remaining_td_budget():
 def _td_fetch_one(ticker, api_key, date_key):
     """Twelve Dataから1銘柄取得し、成功なら(dates, closes, volumes)、
     失敗ならNoneを返す。RATE_LIMIT発生時は第2戻り値をTrueにする
-    (以降の新規Twelve Data呼び出しを中断すべきというシグナル)。
-    使用credits(attempts)は必ずtd_api_budgetへ加算する。"""
+    (以降の新規Twelve Data呼び出しを中断すべきというシグナル)。第3戻り値は
+    失敗時のtwelvedata_client.TdApiError.error_type(例: "INVALID_SYMBOL"、
+    成功時や予期しない例外時はNone/"UNKNOWN")。第4戻り値は失敗時の詳細
+    メッセージ(成功時はNone)、_mark_staleへそのまま渡してRedisに記録し、
+    「原因不明」状態をなくすために使う(2026-09-17、SKHY/AXT障害調査を受けて
+    追加)。使用credits(attempts)は必ずtd_api_budgetへ加算する。"""
     try:
         dates, closes, volumes, attempts = td.fetch_daily_series(ticker, api_key)
         store.incr_td_api_budget(date_key, attempts)
-        return (dates, closes, volumes), False
+        return (dates, closes, volumes), False, None, None
     except td.TdApiError as e:
         store.incr_td_api_budget(date_key, e.attempts)
         print(f"[Q1-5][NG] {ticker}: {e.error_type} - {e.message}")
-        return None, e.error_type == "RATE_LIMIT"
+        return None, e.error_type == "RATE_LIMIT", e.error_type, e.message
     except Exception as e:
         print(f"[Q1-5][NG] {ticker}: 予期しないエラー: {e}", file=sys.stderr)
-        return None, False
+        return None, False, "UNKNOWN", str(e)
 
 
 def _update_quintile_state(ticker, score, bounds, date_key):
@@ -174,7 +178,7 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
     SPYが毎日取得されるため、rel_strength_spy込みの完全な計算に自然に
     引き継がれる(この関数はあくまで初期表示のための「橋渡し」)。
 
-    look-ahead bias対策:
+    look-ahead bias対策(Q1〜Q5計算ロジック本体、2026-09-17以降無変更):
     - 各日の9特徴量は、その日"以前"の株価データだけ(closes等をその日の
       インデックスまでスライス)を使って計算する(quintile_logic.compute_features
       をそのまま呼ぶだけ、ロジック自体は無変更)。
@@ -187,37 +191,81 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
       スキップする(historyに追加しない。表示側は既存のresolveQForDateが
       「データがない日」を「—」として扱う)。
 
-    戻り値: 何らかのhistoryを登録できればTrue、株価取得自体の失敗や
-    データ不足で1日分も計算できなければFalse。
+    2026-09-17(2回目の改修、SKHY/AXT障害調査を受けて): 旧指標・Q1〜5の
+    それぞれについて「既に正常なデータがあるか」を個別に見て、壊れている側
+    だけを取得・再構築できるようにした(「追加→旧指標だけ失敗→削除→
+    再追加」で自己修復できることが目的)。
+
+    2026-09-18(3回目の改修、ユーザー確認済み): 「Q1〜5・旧指標とも既に
+    正常」なケースでもTwelve Data取得自体は毎回必ず1回行うように変更した
+    (delete→再addのたびに旧指標側の表示が古いまま固定されてしまう問題を
+    防ぐため)。ただし取得した結果の使い方は非対称にした:
+    - 旧指標(legacy record)は、fetchが成功するたびに常に作り直す
+      (「壊れていない状態を保つ」以上の意味を持たない単純な最新表示のため、
+      既存データがあっても上書きして構わない)。
+    - Q1〜5履歴(quintile:state)は、既に正常なhistoryがある場合は一切
+      上書きしない(look-ahead biasなしで積み上げてきた履歴を、単なる
+      鮮度目的で不要に再計算・上書きするべきではないため)。
+    結果として、Twelve Data呼び出しは「APIキー未設定/予算切れ/取得失敗」
+    以外の全ケースで必ずちょうど1回だけ発生する。
+
+    戻り値: {"ok": bool, "error_type": str|None, "message": str|None}
+      ok: 呼び出し後、旧指標・Q1〜5のうち少なくとも一方が(既存データ含め)
+          正常な状態であればTrue。
+      error_type: Twelve Data取得自体が失敗した場合のtwelvedata_client.
+          TdApiErrorのerror_type(例: "INVALID_SYMBOL")。取得を試みな
+          かった場合・取得に成功した場合はNone。
+      message: 呼び出し元(app.py)がそのままユーザーに提示してよい説明文。
+          Noneの場合は呼び出し元がok/error_typeから組み立てる。
     """
     if not api_key:
         print(f"[Q1-5][WARN] {ticker}: APIキー未指定のため、過去分バックフィルをスキップします。")
-        return False
+        return {"ok": False, "error_type": None, "message": "APIキー未設定のため、次回の自動更新までデータは表示されません。"}
 
     existing_state = store.get_quintile_state(ticker)
-    if existing_state and existing_state.get("history"):
-        # すでにhistoryがある銘柄には行わない(通常は新規追加直後にしか
-        # 呼ばれない想定だが、既存データを誤って上書きしないための保険)。
-        print(f"[Q1-5][INFO] {ticker}: 既にhistoryが存在するため、過去分バックフィルは行いません。")
-        return False
+    have_quintile_history = bool(existing_state and existing_state.get("history"))
+
+    existing_record = store.get_ticker_record(ticker)
+    have_legacy_record = bool(existing_record and existing_record.get("last_trade_date"))
+    have_both_already = have_quintile_history and have_legacy_record
 
     date_key = _today_str()
     budget_left, _ = remaining_td_budget()
     if budget_left <= 0:
-        print(f"[Q1-5][WARN] {ticker}: Twelve Data予算切れのため、過去分の再計算をスキップします。")
-        return False
+        print(f"[Q1-5][WARN] {ticker}: Twelve Data予算切れのため、取得をスキップします。")
+        if have_both_already:
+            return {
+                "ok": True, "error_type": None,
+                "message": "既存のデータを表示します（本日のTwelve Data利用上限に達したため、最新化は見送りました）。",
+            }
+        return {
+            "ok": have_quintile_history or have_legacy_record, "error_type": None,
+            "message": "本日のTwelve Data利用上限に達しました。次回の自動更新をお待ちください。",
+        }
 
-    result, _hit_rate_limit = _td_fetch_one(ticker, api_key, date_key)
+    result, _hit_rate_limit, error_type, _message = _td_fetch_one(ticker, api_key, date_key)
     if result is None:
-        return False
+        if have_both_already:
+            return {
+                "ok": True, "error_type": None,
+                "message": "既存のデータを表示します（今回の取得には失敗しました）。",
+            }
+        if have_quintile_history or have_legacy_record:
+            # 片方だけでも既存データがあるなら、それを表示できる旨を明示する
+            # ("最新データを取得しました"という誤った表示を避けるため、messageを
+            # 必ず埋める。error_typeはINVALID_SYMBOL等の判別に使われるが、既存
+            # データがある以上「待っても直らない」わけではないのでmessage優先)。
+            return {
+                "ok": True, "error_type": error_type,
+                "message": "既存の一部データを表示します（今回の取得には失敗しました）。",
+            }
+        return {"ok": False, "error_type": error_type, "message": None}
     dates, closes, volumes = result
 
-    # 旧指標(stock_logic、株価・RSI・前日比・1ヶ月騰落率)も、上のTwelve Data
-    # 取得結果を再利用してこの場で計算・保存する(design 2026-09-17: 銘柄追加時に
-    # Twelve Dataを1回取得するだけで旧指標・Q1〜Q5の両方をready表示にする)。
-    # 追加のAPI呼び出しは発生しない。失敗してもQ1〜5側のバックフィル処理は
-    # 継続する(このtry/exceptの外には一切影響を及ぼさない、Q1〜5計算ロジック
-    # 自体には触れていない)。
+    # 旧指標(stock_logic、株価・RSI・前日比・1ヶ月騰落率)は、fetchが成功
+    # した今回は常に作り直す(design 2026-09-18、上のdocstring参照)。
+    # 失敗してもQ1〜5側のバックフィル処理は継続する(このtry/exceptの外には
+    # 一切影響を及ぼさない、Q1〜5計算ロジック自体には触れていない)。
     try:
         legacy_record = logic.build_result(ticker, dates, closes, volumes)
         legacy_record["fetched_at"] = _now_iso()
@@ -226,15 +274,24 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
         legacy_record["last_error_message"] = None
         legacy_record["last_error_at"] = None
         store.set_ticker_record(ticker, legacy_record)
+        have_legacy_record = True
         print(f"[OK] {ticker}: {legacy_record['judgment']}（最終取引日 {legacy_record['last_trade_date']}）")
     except Exception as e:
         _mark_stale(ticker, "UNKNOWN", str(e))
         print(f"[WARN] {ticker}: 旧指標の計算・保存に失敗しました: {e}", file=sys.stderr)
 
+    if have_quintile_history:
+        # Q1〜5側は既に正常なため、既存historyには一切手を加えない(design
+        # 2026-09-18、上のdocstring参照)。旧指標側の結果だけを反映して終える。
+        # okはTrue固定(Q1〜5は表示可能な状態にあるため。旧指標の修復が
+        # 今回失敗していても、それはis_stale/last_errorとして別途記録済みで、
+        # このbackfill呼び出し全体を「失敗」とは呼ばない)。
+        return {"ok": True, "error_type": None, "message": None}
+
     pool_history = store.get_pool_history()
     if not pool_history or not pool_history.get("scores_by_date"):
         print(f"[Q1-5][WARN] {ticker}: pool_historyが未初期化のため、過去分の再計算をスキップします。")
-        return False
+        return {"ok": have_legacy_record, "error_type": None, "message": None}
 
     n_dates = len(dates)
     computed = []  # [{"date":..., "q":...}, ...] 古い→新しい順
@@ -279,7 +336,7 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
 
     if not computed:
         print(f"[Q1-5][WARN] {ticker}: 過去分を1日も再計算できませんでした(データ不足)。")
-        return False
+        return {"ok": have_legacy_record, "error_type": None, "message": None}
 
     # 既存history形式(変化した日だけを記録)に合わせて圧縮する。
     compact_history = []
@@ -301,7 +358,7 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
         f"[Q1-5][OK] {ticker}: バックフィル完了({len(computed)}/{BACKFILL_DAYS_BACK + 1}日分計算、"
         f"history {len(compact_history)}件、current_q={last_entry['q']})"
     )
-    return True
+    return {"ok": True, "error_type": None, "message": None}
 
 
 def run_quintile_refresh(api_key, watchlist):
@@ -327,7 +384,7 @@ def run_quintile_refresh(api_key, watchlist):
     # ① SPY取得(rel_strength_spy特徴量の鮮度を保つため、ローテーションと無関係に毎日取得)
     budget_left, _ = remaining_td_budget()
     if budget_left > 0:
-        result, hit_rate_limit = _td_fetch_one("SPY", api_key, date_key)
+        result, hit_rate_limit, _error_type, _message = _td_fetch_one("SPY", api_key, date_key)
         if result:
             fetched["SPY"] = result
         else:
@@ -346,7 +403,7 @@ def run_quintile_refresh(api_key, watchlist):
             if budget_left <= 0:
                 print("[Q1-5][WARN] Twelve Data予算切れのため、ローテーション取得を中断します。")
                 break
-            result, hit_rate_limit = _td_fetch_one(ticker, api_key, date_key)
+            result, hit_rate_limit, _error_type, _message = _td_fetch_one(ticker, api_key, date_key)
             if result:
                 fetched[ticker] = result
             else:
@@ -364,12 +421,19 @@ def run_quintile_refresh(api_key, watchlist):
                 break
             if ticker in fetched:
                 continue  # 参照母集団のローテーションと重複している場合は再取得しない
-            result, hit_rate_limit = _td_fetch_one(ticker, api_key, date_key)
+            result, hit_rate_limit, error_type, message = _td_fetch_one(ticker, api_key, date_key)
             if result:
                 fetched[ticker] = result
             else:
                 failed.append(ticker)
                 rate_limited = rate_limited or hit_rate_limit
+                # 2026-09-17(SKHY/AXT障害調査を受けて): Alpha Vantage撤去(3c3f3f5)で
+                # 落ちていた呼び出し。旧指標側の株価取得(=ここ)自体が失敗した場合、
+                # 失敗理由をticker_recordに書き残さないと、is_stale/last_errorが
+                # ずっと空のまま(=UIに「⚪ データなし」しか出ず原因不明)になる。
+                # Q1〜5側の計算・保存には一切影響しない(このfor文はraw_watchlist_data
+                # 経由で旧指標に渡す生データ取得のみを担当)。
+                _mark_stale(ticker, error_type, message)
 
     if rate_limited:
         print("[Q1-5][WARN] Twelve DataがRATE_LIMITを返したため、以降の新規取得を中断しました。")

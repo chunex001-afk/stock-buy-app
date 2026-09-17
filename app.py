@@ -25,14 +25,23 @@ def _sanitize_ticker(raw):
 
 
 def _freshness(record):
-    """画面表示用の鮮度情報を組み立てる。"""
+    """画面表示用の鮮度情報を組み立てる。
+
+    2026-09-17(SKHY/AXT障害調査を受けて): last_trade_dateが無い(=旧指標を
+    一度も正常計算できていない)場合でも、last_error/last_error_messageが
+    Redisに記録されていればそれをそのまま返すようにした。「Q1〜5はready
+    なのに旧指標は判定不可で原因不明」という状態をなくすことが目的で、
+    表示ロジックの追加のみ。Q1〜Q5判定・Q5シグナル等には一切関係しない。"""
     if not record or not record.get("last_trade_date"):
+        last_error = (record or {}).get("last_error")
+        last_error_message = (record or {}).get("last_error_message")
         return {
             "status": "none",
-            "label": "⚪ データなし",
+            "label": "⚪ データなし" if not last_error else "🔴 取得失敗",
             "last_trade_date": None,
             "fetched_at": None,
-            "last_error_label": None,
+            "last_error_label": logic.ERROR_LABELS.get(last_error, last_error) if last_error else None,
+            "last_error_message": last_error_message,
         }
 
     is_stale = bool(record.get("is_stale"))
@@ -43,6 +52,7 @@ def _freshness(record):
             "last_trade_date": record.get("last_trade_date"),
             "fetched_at": record.get("fetched_at"),
             "last_error_label": None,
+            "last_error_message": None,
         }
 
     err_type = record.get("last_error")
@@ -52,6 +62,7 @@ def _freshness(record):
         "last_trade_date": record.get("last_trade_date"),
         "fetched_at": record.get("fetched_at"),
         "last_error_label": logic.ERROR_LABELS.get(err_type, err_type or "不明なエラー"),
+        "last_error_message": record.get("last_error_message"),
     }
 
 
@@ -329,7 +340,7 @@ details.logicinfo .small{margin-top:10px}
 .newsblock .nonews{color:#98a2b3}
 
 .cardfoot{display:flex;justify-content:space-between;align-items:center;margin-top:8px;gap:10px;flex-wrap:wrap}
-.fresh{color:#087443;font-weight:700}.stalebadge{color:#8a6500;font-weight:700}.nonebadge{color:#98a2b3;font-weight:700}
+.fresh{color:#087443;font-weight:700}.stalebadge{color:#8a6500;font-weight:700}.failbadge{color:#b42318;font-weight:700}.nonebadge{color:#98a2b3;font-weight:700}
 .freshtag{font-size:11px}
 
 /* Q1〜Q5(参照母集団内の相対的な状態、既存judgmentとは別軸の情報。
@@ -458,7 +469,9 @@ async function delTicker(t){
 function freshTagHtml(f){
   f = f||{};
   if(f.status==="fresh") return `<span class="freshtag fresh">🟢 最新（${fmtDate(f.last_trade_date)}取引分・${fmtDt(f.fetched_at)}取得）</span>`;
-  if(f.status==="stale") return `<span class="freshtag stalebadge">🟡 前回データ（${esc(f.last_error_label||"エラー")}）</span>`;
+  const titleAttr = f.last_error_message ? ` title="${esc(f.last_error_message)}"` : "";
+  if(f.status==="stale") return `<span class="freshtag stalebadge"${titleAttr}>🟡 前回データ（${esc(f.last_error_label||"エラー")}）</span>`;
+  if(f.last_error_label) return `<span class="freshtag failbadge"${titleAttr}>🔴 取得失敗（${esc(f.last_error_label)}）</span>`;
   return `<span class="freshtag nonebadge">⚪ データなし</span>`;
 }
 
@@ -773,10 +786,33 @@ def add_watchlist():
             fetch_note = "Redis未設定のため即時取得はできません。"
         else:
             try:
-                ok = refresh.backfill_quintile_history_for_new_ticker(ticker, TD_API_KEY)
-                fetch_note = "最新データを取得しました。" if ok else "データを取得できませんでした。次回の自動更新をお待ちください。"
+                result = refresh.backfill_quintile_history_for_new_ticker(ticker, TD_API_KEY)
             except Exception as e:
+                result = None
                 fetch_note = f"即時取得中にエラーが発生しました: {e}"
+
+            if result is not None:
+                # 2026-09-17(SKHY/AXT障害調査を受けて): backfillの戻り値が
+                # {"ok","error_type","message"}になった。とくにerror_typeが
+                # "INVALID_SYMBOL"の場合は「次回の自動更新を待てば直る」わけ
+                # ではない(Twelve Dataがそもそも認識できないシンボルのため
+                # 待っても解決しない)ので、待たせる文言にせず明確に伝える。
+                # AXT→AXTIのような正式シンボルへの自動変換・自動登録は行わない
+                # (ユーザー確認事項どおり、勝手な変換はしない)。
+                if result["message"]:
+                    fetch_note = result["message"]
+                elif result["ok"]:
+                    fetch_note = "最新データを取得しました。"
+                elif result["error_type"] == "INVALID_SYMBOL":
+                    fetch_note = (
+                        f"銘柄コード「{ticker}」はTwelve Dataで認識できませんでした。"
+                        "正式なティッカーシンボルをご確認のうえ、再度お試しください。"
+                    )
+                elif result["error_type"]:
+                    label = logic.ERROR_LABELS.get(result["error_type"], result["error_type"])
+                    fetch_note = f"データ取得中にエラーが発生しました（{label}）。次回の自動更新をお待ちください。"
+                else:
+                    fetch_note = "データを取得できませんでした。次回の自動更新をお待ちください。"
 
         return jsonify({"ok": True, "tickers": tickers, "fetch_note": fetch_note})
     except Exception as e:
