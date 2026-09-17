@@ -12,6 +12,10 @@ import refresh
 app = Flask(__name__)
 
 API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+# Q1〜Q5(Twelve Data)の新規銘柄バックフィル専用。app.pyからTwelve Dataへ
+# 直接アクセスすることはなく、常にrefresh.backfill_quintile_history_for_new_ticker
+# 経由で呼び出す(design方針「Twelve Dataをapp.pyから直接呼ばない」を維持)。
+TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
 # 手動更新のクールダウン。1日の自己申告予算(stock_logic.DAILY_API_BUDGET)に
 # 対して余裕が小さいため、自動更新より長めの間隔を空ける。
@@ -708,6 +712,16 @@ def add_watchlist():
                         fetch_note = "データを取得できませんでした。次回の自動更新をお待ちください。"
                 except Exception as e:
                     fetch_note = f"即時取得中にエラーが発生しました: {e}"
+
+        # Q1〜Q5(Twelve Data)の過去分バックフィル。既存のAlpha Vantage即時取得
+        # とは完全に独立しており、ここで例外が起きてもticker追加自体・上の
+        # fetch_noteには一切影響しない(design 2026-09-17: 新規追加銘柄も
+        # 可能な範囲で今日〜5日前のQ状態を表示するための橋渡し)。
+        if TD_API_KEY and store.is_configured():
+            try:
+                refresh.backfill_quintile_history_for_new_ticker(ticker, TD_API_KEY)
+            except Exception as e:
+                print(f"[Q1-5][WARN] {ticker}: バックフィル呼び出し中に予期しないエラー: {e}")
 
         return jsonify({"ok": True, "tickers": tickers, "fetch_note": fetch_note})
     except Exception as e:

@@ -312,6 +312,142 @@ def _update_quintile_state(ticker, score, bounds, date_key):
     return new_state
 
 
+# BACKFILL_DAYS_BACK: 新規銘柄追加時に遡って再計算する日数(今日を含めて
+# BACKFILL_DAYS_BACK+1日分。app.pyの表示が「今日・昨日・2〜5日前」の6列
+# であることに合わせている)。
+BACKFILL_DAYS_BACK = 5
+
+
+def backfill_quintile_history_for_new_ticker(ticker, api_key):
+    """新規追加銘柄について、過去BACKFILL_DAYS_BACK日分(当日含め最大6日分)の
+    Q1〜Q5をlook-ahead biasなしで再計算し、quintile:state:<TICKER>の初期
+    historyとして登録する(design: 2026-09-17ユーザー確定仕様)。
+
+    既存のQ1〜Q5判定ロジック(quintile_logic.py)・Q5シグナル有効期限ロジック
+    (app.py)・redis_store.pyは一切変更しない。ここで作るhistoryは、
+    _update_quintile_stateが日々追記していくものと全く同じ形式
+    ({"date": "YYYY-MM-DD", "q": "Q1"〜"Q5"})であるため、翌日以降の通常の
+    日次バッチ(run_quintile_refresh)にそのまま引き継がれ、app.py側の
+    Q5シグナル計算(_compute_q5_signal)もそのまま正しく動作する。
+
+    Twelve Dataへの追加API呼び出しは、対象銘柄の株価取得1回のみ
+    (twelvedata_client.fetch_daily_series経由の_td_fetch_one、既存の
+    ユーザー監視銘柄取得と同一関数)。SPYの追加取得は行わない(design方針
+    「1銘柄1回の追加取得で済ませる」を優先するため)。そのためrel_strength_spy
+    特徴量は過去日分についてはNoneのまま渡し、既存のTRAIN中央値補完
+    (quintile_logic._standardize)に委ねる。翌日以降の通常の日次バッチでは
+    SPYが毎日取得されるため、rel_strength_spy込みの完全な計算に自然に
+    引き継がれる(この関数はあくまで初期表示のための「橋渡し」)。
+
+    look-ahead bias対策:
+    - 各日の9特徴量は、その日"以前"の株価データだけ(closes等をその日の
+      インデックスまでスライス)を使って計算する(quintile_logic.compute_features
+      をそのまま呼ぶだけ、ロジック自体は無変更)。
+    - 分位境界は、Redisにすでに保存されている本番の実データ
+      quintile:pool_history(日次バッチが実際に記録してきた履歴)を、
+      その日"以前"の日付だけに絞り込んでquintile_logic.pool_percentile_bounds
+      に渡す。これにより「その日に実際に存在した境界」を、未来のプール
+      更新を一切参照せずに再現する。
+    - 必要な株価データ・プール履歴が不足している日は、その日のQを推測せず
+      スキップする(historyに追加しない。表示側は既存のresolveQForDateが
+      「データがない日」を「—」として扱う)。
+
+    戻り値: 何らかのhistoryを登録できればTrue、株価取得自体の失敗や
+    データ不足で1日分も計算できなければFalse。
+    """
+    if not api_key:
+        return False
+
+    existing_state = store.get_quintile_state(ticker)
+    if existing_state and existing_state.get("history"):
+        # すでにhistoryがある銘柄には行わない(通常は新規追加直後にしか
+        # 呼ばれない想定だが、既存データを誤って上書きしないための保険)。
+        return False
+
+    date_key = _today_str()
+    budget_left, _ = remaining_td_budget()
+    if budget_left <= 0:
+        print(f"[Q1-5][WARN] {ticker}: Twelve Data予算切れのため、過去分の再計算をスキップします。")
+        return False
+
+    result, _hit_rate_limit = _td_fetch_one(ticker, api_key, date_key)
+    if result is None:
+        return False
+    dates, closes, volumes = result
+
+    pool_history = store.get_pool_history()
+    if not pool_history or not pool_history.get("scores_by_date"):
+        print(f"[Q1-5][WARN] {ticker}: pool_historyが未初期化のため、過去分の再計算をスキップします。")
+        return False
+
+    n_dates = len(dates)
+    computed = []  # [{"date":..., "q":...}, ...] 古い→新しい順
+    for k in range(BACKFILL_DAYS_BACK, -1, -1):
+        target_idx = n_dates - 1 - k
+        if target_idx < 0:
+            continue  # その日の株価データ自体がまだ存在しない(上場間もない等)
+        target_date = dates[target_idx]
+
+        try:
+            features = quintile_logic.compute_features(
+                dates[: target_idx + 1], closes[: target_idx + 1], volumes[: target_idx + 1],
+            )
+        except Exception as e:
+            print(f"[Q1-5][WARN] {ticker} {target_date}: 特徴量計算に失敗、この日はスキップ: {e}")
+            continue
+
+        # その日"以前"の日付だけにpool_historyを絞り込む(未来のプール更新は
+        # 一切参照しない。dates文字列はYYYY-MM-DD形式のため単純な文字列比較で
+        # 時系列順と一致する、既存コード各所と同じ前提)。
+        filtered_scores_by_date = {
+            d: v for d, v in pool_history["scores_by_date"].items() if d <= target_date
+        }
+        if not filtered_scores_by_date:
+            continue  # その日の時点でプールにまだ何も蓄積されていない
+        filtered_pool_history = {
+            "dates": sorted(filtered_scores_by_date.keys()),
+            "scores_by_date": filtered_scores_by_date,
+        }
+        bounds = quintile_logic.pool_percentile_bounds(filtered_pool_history)
+        if bounds is None:
+            continue
+
+        try:
+            score = quintile_logic.knn_predict_score(features)
+        except Exception as e:
+            print(f"[Q1-5][WARN] {ticker} {target_date}: pred_score計算に失敗、この日はスキップ: {e}")
+            continue
+
+        q = quintile_logic.assign_quintile(score, bounds)
+        computed.append({"date": target_date, "q": q, "score": score})
+
+    if not computed:
+        print(f"[Q1-5][WARN] {ticker}: 過去分を1日も再計算できませんでした(データ不足)。")
+        return False
+
+    # 既存history形式(変化した日だけを記録)に合わせて圧縮する。
+    compact_history = []
+    for entry in computed:
+        if compact_history and compact_history[-1]["q"] == entry["q"]:
+            continue
+        compact_history.append({"date": entry["date"], "q": entry["q"]})
+
+    last_entry = computed[-1]
+    new_state = {
+        "current_q": last_entry["q"],
+        "previous_q": compact_history[-2]["q"] if len(compact_history) > 1 else None,
+        "pred_score": last_entry["score"],
+        "history": compact_history,
+        "last_updated": date_key,
+    }
+    store.set_quintile_state(ticker, new_state)
+    print(
+        f"[Q1-5][OK] {ticker}: バックフィル完了({len(computed)}/{BACKFILL_DAYS_BACK + 1}日分計算、"
+        f"history {len(compact_history)}件、current_q={last_entry['q']})"
+    )
+    return True
+
+
 def run_quintile_refresh(api_key, watchlist):
     """Q1〜Q5判定の日次処理本体。1銘柄の取得失敗が他銘柄の処理を止めない、
     未来データを一切参照しない、という既存run_refreshと同じ設計原則を踏襲する。
