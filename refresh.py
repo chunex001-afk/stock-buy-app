@@ -356,12 +356,14 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
     データ不足で1日分も計算できなければFalse。
     """
     if not api_key:
+        print(f"[Q1-5][WARN] {ticker}: APIキー未指定のため、過去分バックフィルをスキップします。")
         return False
 
     existing_state = store.get_quintile_state(ticker)
     if existing_state and existing_state.get("history"):
         # すでにhistoryがある銘柄には行わない(通常は新規追加直後にしか
         # 呼ばれない想定だが、既存データを誤って上書きしないための保険)。
+        print(f"[Q1-5][INFO] {ticker}: 既にhistoryが存在するため、過去分バックフィルは行いません。")
         return False
 
     date_key = _today_str()

@@ -103,6 +103,25 @@ def _days_between(from_date_str, to_date_str):
     return (date.fromisoformat(to_date_str) - date.fromisoformat(from_date_str)).days
 
 
+def _dedupe_history_by_date(history):
+    """同じ日付のエントリが連続する場合、その日の最終状態だけを残す。
+    JS側のdedupeHistoryByDate(今日〜5日前テーブルの表示に使用)と全く同じ
+    正規化をPython側でも行う(design: 2026-09-17本番確認で発覚した不整合の
+    修正)。同日中にQ1〜5バッチが複数回実行され、その都度プール境界が変わって
+    Q値が複数回変化した場合でも(例: 同日中にQ5→Q2→Q3のように記録された場合)、
+    「その日に実際にQ5だったこと」にはならない(最終的にQ5でなかった以上、
+    その日をQ5として扱うと架空の実績になってしまうため)。既存のhistory保存
+    方式(refresh.py)・表示テーブルのロジックは一切変更しない、表示専用の
+    正規化。"""
+    out = []
+    for h in history:
+        if out and out[-1].get("date") == h.get("date"):
+            out[-1] = h
+        else:
+            out.append(h)
+    return out
+
+
 def _compute_q5_signal(current_q, history, anchor_date):
     """Q5シグナル(新規購入シグナル)の状態を計算する(design: 上記
     Q5_SIGNAL_EXPIRY_DAYS参照)。既存のhistory(Qが変化した日だけを記録する
@@ -110,25 +129,36 @@ def _compute_q5_signal(current_q, history, anchor_date):
     であり、Redisへの新規書き込みは行わない。
 
     仕様(ユーザー確定、2026-09-17):
-    - 「Q5シグナルDay 0」= 最後にQ5だった日。現在Q5ならそのQ5エントリの日付。
-      Q5から外れている場合は、historyが「変化した日だけ」を記録する仕様のため、
-      Q5エントリの直後にある「Q5から変化した日」の前日を「最後にQ5だった日」
-      として逆算する(Q5が複数日連続した場合、historyにはQ5開始日しか
-      残らないため、これをそのままDay0にすると、長くQ5が続いた銘柄ほど
-      離脱直後から不当に失効扱いになってしまうバグがあり、この逆算で回避する)。
+    - 判定の前に、まずhistoryを_dedupe_history_by_dateで正規化する(同一日付に
+      複数のQが記録されている場合、その日の最終状態だけを採用する。2026-09-17
+      の本番確認で、同日中の複数回バッチ実行により実在しない日付をDay0として
+      表示してしまう不整合が見つかったため追加した正規化ステップ)。
+    - 「Q5シグナルDay 0」= 正規化後のhistoryにおける「最後にQ5だった日」。
+      現在Q5ならそのQ5エントリの日付。Q5から外れている場合は、historyが
+      「変化した日だけ」を記録する仕様のため、Q5エントリの直後にある
+      「Q5から変化した日」の前日を「最後にQ5だった日」として逆算する(Q5が
+      複数日連続した場合、historyにはQ5開始日しか残らないため、これを
+      そのままDay0にすると、長くQ5が続いた銘柄ほど離脱直後から不当に失効
+      扱いになってしまうバグがあり、この逆算で回避する)。正規化後の
+      historyにQ5エントリが1件も残っていなければ(=その日の最終状態としては
+      一度もQ5になっていない)、架空の日付は一切生成せずNoneを返す。
     - 現在Q5なら status="ok"(経過日数によらず常に「購入OK」)。
     - Q5から外れている場合、上記Day0からanchor_date(通常は当日=last_updated)
       までの経過日数を数え、Q5_SIGNAL_EXPIRY_DAYS(8日)未満ならstatus="active"
       (シグナルまだ有効)、8日以上でstatus="expired"(失効)。
-    - 8日が経過する前に再びQ5になった場合、historyには新しいq=="Q5"エントリ
-      が追加されるため、このロジックは自動的にその新しい日付をDay0として扱う
-      (Q5→Q4→Q3→Q4→Q5のように途中で複数回Q3/Q4を経由しても、直近のQ5
-      エントリだけを見るため、再度Q5になった時点で自動的に新しいシグナルへ
-      リセットされる。追加の状態保存は不要)。
+    - 8日が経過する前に再びQ5になった場合、正規化後のhistoryには新しい
+      q=="Q5"エントリが追加されるため、このロジックは自動的にその新しい
+      日付をDay0として扱う(Q5→Q4→Q3→Q4→Q5のように途中で複数回Q3/Q4を
+      経由しても、直近のQ5エントリだけを見るため、再度Q5になった時点で
+      自動的に新しいシグナルへリセットされる。追加の状態保存は不要)。
     - 一度もQ5になったことがなければNoneを返す(シグナル自体が存在しない)。
     - Q5からの低下(Q4/Q3等)は売却シグナルとして扱わない(新規購入判断専用、
       既存保有分の売却判断はこの仕組みの対象外)。
     """
+    if not history:
+        return None
+
+    history = _dedupe_history_by_date(history)
     if not history:
         return None
 
@@ -714,12 +744,27 @@ def add_watchlist():
                     fetch_note = f"即時取得中にエラーが発生しました: {e}"
 
         # Q1〜Q5(Twelve Data)の過去分バックフィル。既存のAlpha Vantage即時取得
-        # とは完全に独立しており、ここで例外が起きてもticker追加自体・上の
+        # とは完全に独立しており、ここで何が起きてもticker追加自体・上の
         # fetch_noteには一切影響しない(design 2026-09-17: 新規追加銘柄も
         # 可能な範囲で今日〜5日前のQ状態を表示するための橋渡し)。
-        if TD_API_KEY and store.is_configured():
+        # 2026-09-17の本番確認で、TD_API_KEY未設定等によりこのブロック自体が
+        # 無言でスキップされ、Renderログを見ても原因が分からない状態だったため、
+        # スキップ理由を必ずログへ出すようにした(画面表示・fetch_noteは変更しない)。
+        if not TD_API_KEY:
+            print(
+                f"[Q1-5][WARN] {ticker}: TWELVEDATA_API_KEYが未設定のため、過去分バックフィルを"
+                "スキップします(Render側の環境変数設定を確認してください)。"
+            )
+        elif not store.is_configured():
+            print(f"[Q1-5][WARN] {ticker}: Redis(Upstash)未設定のため、過去分バックフィルをスキップします。")
+        else:
             try:
-                refresh.backfill_quintile_history_for_new_ticker(ticker, TD_API_KEY)
+                ok = refresh.backfill_quintile_history_for_new_ticker(ticker, TD_API_KEY)
+                if not ok:
+                    print(
+                        f"[Q1-5][WARN] {ticker}: 過去分バックフィルが完了しませんでした"
+                        "(詳細な理由は直前の[Q1-5]ログを参照してください)。"
+                    )
             except Exception as e:
                 print(f"[Q1-5][WARN] {ticker}: バックフィル呼び出し中に予期しないエラー: {e}")
 
