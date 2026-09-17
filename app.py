@@ -280,6 +280,13 @@ HTML = r"""
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#111827">
 <title>保有銘柄のQ1〜Q5状態</title>
+<!-- PWA化(design 2026-09-17): 表示層の追加のみ。Q1〜Q5判定・Q5シグナル等の
+     ロジック・API呼び出しには一切影響しない(/sw.jsはapi/*を明示的にキャッシュ対象外にする)。 -->
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Q1〜Q5状態">
 <style>
 *{box-sizing:border-box} body{margin:0;background:#f4f6f8;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif}
 .wrap{max-width:880px;margin:auto;padding:18px}
@@ -686,15 +693,86 @@ function render(rows){
 }
 
 updateRanking();
+
+// PWA化(design 2026-09-17): ホーム画面追加・スタンドアロン起動のためのSW登録のみ。
+// /sw.js側でAPI(/api/*)は明示的にキャッシュ対象外にしており、株価・Q1〜Q5・
+// Q5シグナルの表示は従来通り毎回サーバーから取得する(挙動・API呼び出しは無変更)。
+if("serviceWorker" in navigator){
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js"));
+}
 </script>
 </body>
 </html>
 """
 
 
+# PWA用Service Worker(design 2026-09-17)。/staticではなくルート直下(/sw.js)で
+# 配信することで、制御範囲(scope)をアプリ全体(/)にする。
+#
+# キャッシュ戦略(最重要、株価・Q1〜Q5・Q5シグナルを古いキャッシュで
+# 表示しないための設計):
+# - /api/ 配下(watchlist・ranking・refresh等)は一切キャッシュ対象にしない。
+#   fetchハンドラの先頭でパスを判定し、該当すればそのままreturnして処理せず、
+#   ブラウザの通常の(Service Workerを介さない)ネットワーク取得に完全に委ねる。
+# - それ以外(HTML本体・manifest・アイコン)はnetwork-first。オンライン時は
+#   常にネットワークから取得し直し、取得できた場合だけキャッシュを更新する。
+#   キャッシュを使うのはネットワーク取得が失敗した場合(オフライン時)のみ。
+# - CACHE_NAMEにバージョン番号を含め、activateイベントで旧バージョンの
+#   キャッシュを削除する。将来更新する際はこの番号を上げるだけでよい。
+#
+# Q1〜Q5判定ロジック・Q5シグナル・Twelve Data/Redis処理・watchlist処理・
+# API予算/レート制限には一切関与しない(表示層の追加のみ)。
+SW_JS = r"""
+const CACHE_NAME = "q1q5-shell-v1";
+
+self.addEventListener("install", (event) => {
+  self.skipWaiting();
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener("fetch", (event) => {
+  const url = new URL(event.request.url);
+
+  // /api/ 配下は絶対にキャッシュしない(株価・Q1〜Q5・Q5シグナルは常に最新を取得する)。
+  if (url.pathname.startsWith("/api/")) {
+    return;
+  }
+  // GET以外(POST/DELETE等)もキャッシュ対象にしない。
+  if (event.request.method !== "GET") {
+    return;
+  }
+
+  // HTML本体・manifest・アイコン等はnetwork-first。オンライン時は常に最新を
+  // 取得し、取得できた場合だけキャッシュを更新する。取得に失敗した場合
+  // (オフライン時)のみキャッシュへフォールバックする。
+  event.respondWith(
+    fetch(event.request)
+      .then((res) => {
+        const resClone = res.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, resClone));
+        return res;
+      })
+      .catch(() => caches.match(event.request))
+  );
+});
+"""
+
+
 @app.get("/")
 def index():
     return render_template_string(HTML)
+
+
+@app.get("/sw.js")
+def service_worker():
+    return app.response_class(SW_JS, mimetype="application/javascript")
 
 
 @app.get("/api/watchlist")
