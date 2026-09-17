@@ -179,7 +179,7 @@ HTML = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#111827">
-<title>今買うべき銘柄ランキング</title>
+<title>保有銘柄のQ1〜Q5状態</title>
 <style>
 *{box-sizing:border-box} body{margin:0;background:#f4f6f8;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif}
 .wrap{max-width:880px;margin:auto;padding:18px}
@@ -231,10 +231,7 @@ details.logicinfo .small{margin-top:10px}
 .tcard.cq-q1{border-left-color:#c9cfd8}
 .tcard.cq-pending{border-left-color:#e5e7eb}
 .rankline{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;margin-bottom:2px}
-.rankbig{font-size:17px;font-weight:900;color:#344054;white-space:nowrap}
 .tickerbig{font-size:20px;font-weight:900;letter-spacing:.01em}
-.rankarrow{font-size:14px;font-weight:900}
-.rc-up{color:#087443}.rc-down{color:#b42318}.rc-same{color:#98a2b3}.rc-new{color:#98a2b3}
 .rankdetail{font-size:12px;color:#758096;margin-bottom:12px}
 
 .statrow{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid #eef1f5}
@@ -259,7 +256,12 @@ details.logicinfo .small{margin-top:10px}
 .q-q1{background:#f2f2f2;color:#98a2b3}.q-q2{background:#eef1f5;color:#758096}
 .q-q3{background:#eaf2ff;color:#175cd3}.q-q4{background:#fff1db;color:#9a6a00}
 .q-q5{background:#087443;color:#fff}.q-pending{background:#f2f2f2;color:#98a2b3;font-style:italic}
-.qhistory{font-size:12px;color:#475467;line-height:1.8}
+.qdaily-wrap{overflow-x:auto;margin:8px 0;-webkit-overflow-scrolling:touch}
+.qdaily-table{border-collapse:collapse;background:#f7f9fc;border-radius:13px;width:100%}
+.qdaily-table th,.qdaily-table td{padding:7px 8px;text-align:center;min-width:50px;white-space:nowrap}
+.qdaily-table th{font-size:10px;color:#98a2b3;font-weight:700;border-bottom:1px solid #e5e7eb}
+.qdaily-table td{font-size:14px;font-weight:800;color:#172033}
+.qcont{margin:6px 2px 0;font-size:13px;font-weight:800;color:#087443}
 .q5stats{background:#f0f9f4;border-radius:13px;padding:12px 14px;font-size:12px;line-height:1.8;margin-top:8px}
 .q5stats .q5title{font-weight:800;color:#087443;margin-bottom:4px}
 .q5stats .q5note{color:#758096;font-size:11px;margin-top:6px}
@@ -269,8 +271,8 @@ details.logicinfo .small{margin-top:10px}
 </head>
 <body>
 <div class="wrap">
-<div class="title">🏆 今買うべき銘柄ランキング</div>
-<div class="sub">実データ版｜最大15銘柄｜毎朝サーバー側で自動更新｜「今日どれを優先すべきか」が一目で分かることを目指しています</div>
+<div class="title">📊 保有銘柄のQ1〜Q5状態</div>
+<div class="sub">実データ版｜最大15銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
 
 <div class="card">
   <div class="controls">
@@ -287,13 +289,13 @@ details.logicinfo .small{margin-top:10px}
 
 <div class="card">
 <details class="logicinfo">
-<summary><b>🧠 判定ロジック（概要）</b></summary>
+<summary><b>🧠 Q1〜Q5判定について（概要）</b></summary>
 <div class="small">
-最終判定は「強く買いたい／買い候補／まだ買わない／過熱のため買わない」の4種類のみです。底打ち状態・局面・上昇余地スコア・過熱リスクスコアに加え、ニュースの内容（センチメント）と時価総額規模を補正材料として統合して決めます。<br>
-RSIや高値からの乖離、1か月の上昇率が過大な場合は、底打ち後の反発局面であっても「過熱のため買わない」を優先します。単純に値上がり中の銘柄を高評価する設計ではありません。<br>
-一言コメントはニュースがあれば最優先で反映し、無ければ銘柄固有の事業テーマとテクニカル指標から生成します。テクニカル材料はその銘柄で実際に値が突出している指標を優先して選ぶため、全銘柄で同じ文面にはなりません。<br>
-順位変化は前日（直近の自動更新時点）のランキングとの比較です。カードの「詳細指標を見る」から、MA20/MA50・高値乖離・出来高比・上昇余地／過熱リスクスコア・底打ち状態などの内訳を確認できます。<br>
-株価・ニュースは1日1回、GitHub Actionsによる自動ジョブがAlpha Vantageから取得しUpstash Redisに保存します。時価総額は変動が小さいため1回の自動更新につき最大1銘柄のみ取得し、API無料枠を圧迫しないようにしています。銘柄を「＋追加」した際はその銘柄のみ即時に取得します（右上のボタンは未取得・失敗銘柄限定の再取得です）。
+複数の市場データ・テクニカル指標から、各銘柄の現在の状態をQ1〜Q5の5段階で判定します。<br>
+Q3＝発見、Q4＝準備、Q5＝購入判断という位置づけです。Q5→Q4への変化は「失敗」「売却」等を意味するものではありません。<br>
+Q5に表示される過去実績統計（60日/120日最大上昇率・到達率）は、過去にQ5と判定された局面の統計的な実績であり、この銘柄が将来同じように上がることを予測するものではありません。<br>
+状態履歴には、日々の判定結果（今日・昨日・直近数日のQ状態、Q5継続日数）を表示します。記録がない日は「—」と表示され、過去データを推測で補うことはしていません。<br>
+Q1〜Q5判定は1日1回、GitHub Actionsによる自動ジョブがTwelve Dataから取得しUpstash Redisに保存します。銘柄を「＋追加」した際は、次回の自動更新以降にQ1〜Q5判定が反映されます。
 </div>
 </details>
 </div>
@@ -334,7 +336,6 @@ function renderOpInfo(j){
     ? `自動更新: ${lr.success_count}件成功／${lr.failed_count}件失敗（${fmtDt(lr.run_at)}実行）`
     : "自動更新はまだ実行されていません";
   msg += ` ｜ 本日のAPI使用: ${budget.used??"—"}/${budget.limit??"—"}`;
-  if(j.rank_reference_date) msg += ` ｜ 前日順位の基準日: ${fmtDate(j.rank_reference_date)}`;
   document.getElementById("opinfo").textContent = msg;
 }
 
@@ -375,14 +376,6 @@ async function delTicker(t){
     if(!j.ok){alert(j.error||"削除できませんでした");return;}
     await updateRanking();
   }catch(e){alert("削除エラー: "+e.message)}
-}
-
-function rankArrowHtml(rc){
-  if(!rc) return "";
-  if(rc.direction==="up") return `<span class="rankarrow rc-up">↑${rc.diff}</span>`;
-  if(rc.direction==="down") return `<span class="rankarrow rc-down">↓${Math.abs(rc.diff)}</span>`;
-  if(rc.direction==="same") return `<span class="rankarrow rc-same">→</span>`;
-  return `<span class="rankarrow rc-new">NEW</span>`;
 }
 
 function newsHtml(news){
@@ -427,12 +420,62 @@ function dedupeHistoryByDate(history){
   return out;
 }
 
-function qHistoryHtml(q){
-  if(!q || q.status !== "ready" || !q.history || !q.history.length) return "";
-  const deduped = dedupeHistoryByDate(q.history);
-  if(deduped.length < 2) return "";
-  const items = deduped.slice(-8).map(h=>`${fmtDate(h.date)}: ${esc(h.q)}`).join(" → ");
-  return `<div class="qhistory">状態推移: ${items}</div>`;
+// dateStr("YYYY-MM-DD")にnDays日を加算した日付文字列を返す(負数で過去方向)。
+function addDaysToDateStr(dateStr, nDays){
+  const d = new Date(dateStr + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + nDays);
+  return d.toISOString().slice(0, 10);
+}
+
+function daysBetweenDateStr(fromStr, toStr){
+  const a = new Date(fromStr + "T00:00:00Z");
+  const b = new Date(toStr + "T00:00:00Z");
+  return Math.round((b - a) / 86400000);
+}
+
+// historyの保存方式(Qが変化した日だけ記録)はそのまま前提とし、表示層だけで
+// 「直近の確定した状態」を前方補完(carry-forward)する。historyはdate昇順
+// (dedupeHistoryByDate適用後)である前提で、targetDate以前の最新エントリを
+// 探す。それより前に一件もエントリがない日は「未確定」として「—」を返す
+// (過去のデータそのものを書き換えたり推測で作ったりはしない、表示上の補完のみ)。
+function resolveQForDate(history, targetDate){
+  let result = null;
+  for(const h of history){
+    if(h.date <= targetDate) result = h.q;
+    else break;
+  }
+  return result;
+}
+
+// 今日・昨日・2〜5日前(計6日分)のQ状態と、Q5継続日数を横長の表で表示する。
+// バックエンド(history保存方式・refresh.py・quintile_logic.py・Q1〜Q5判定
+// ロジック)は一切変更しない、表示層のみの対応。2026-09-17のUI修正で
+// 5日分→6日分・縦並びの補完なし表示→横長テーブル+前方補完表示に変更。
+function qDailyBreakdownHtml(q){
+  if(!q || q.status !== "ready" || !q.last_updated) return "";
+  const history = dedupeHistoryByDate(q.history || []);
+  const anchor = q.last_updated;
+  const labels = ["今日", "昨日", "2日前", "3日前", "4日前", "5日前"];
+
+  const values = labels.map((label, i) => {
+    // 今日は必ずcurrent_q(最新の実際の判定結果)を使う。
+    if(i === 0) return q.current_q;
+    const targetDate = addDaysToDateStr(anchor, -i);
+    return resolveQForDate(history, targetDate);
+  });
+
+  const headCells = labels.map(l => `<th>${esc(l)}</th>`).join("");
+  const valCells = values.map(v => `<td>${v ? esc(v) : "—"}</td>`).join("");
+
+  let cont = "";
+  if(q.current_q === "Q5" && history.length){
+    const lastEntry = history[history.length - 1];
+    const days = daysBetweenDateStr(lastEntry.date, anchor) + 1;
+    cont = `<div class="qcont">Q5継続：${days}日</div>`;
+  }
+
+  return `<div class="qdaily-wrap"><table class="qdaily-table"><thead><tr>${headCells}</tr></thead>`
+    + `<tbody><tr>${valCells}</tr></tbody></table></div>${cont}`;
 }
 
 // Q5の過去実績統計。あくまで「過去の類似状態における統計」であり、
@@ -487,16 +530,12 @@ function render(rows){
   list.innerHTML = rows.map((x,i)=>{
     const q = x.quintile || {};
     const cardCls = q.status==="ready" ? (QBADGE[q.current_q]||"q-pending").replace("q-","cq-") : "cq-pending";
-    const rc = x.rank_change;
     return `<div class="tcard ${cardCls}">
       <div class="rankline">
-        <span class="rankbig">${i+1}位</span>
         <span class="tickerbig">${esc(x.ticker)}</span>
-        ${rankArrowHtml(rc)}
         ${qBadgeHtml(x.quintile)}
       </div>
-      <div class="rankdetail">${rc?esc(rc.label):""}</div>
-      ${qHistoryHtml(x.quintile)}
+      ${qDailyBreakdownHtml(x.quintile)}
       ${q5StatsHtml(x.quintile)}
 
       <div class="statrow">
@@ -600,42 +639,12 @@ def delete_watchlist(ticker):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-def _attach_rank_changes(rows):
-    """RedisのRank_snapshot_prev（前日順位）と当日の順位を比較して各行に付与する。"""
-    prev_snapshot = store.get_json("rank_snapshot_prev") or {}
-    prev_ranks = prev_snapshot.get("ranks", {}) if isinstance(prev_snapshot, dict) else {}
-    prev_date = prev_snapshot.get("date") if isinstance(prev_snapshot, dict) else None
-
-    for i, row in enumerate(rows):
-        today_rank = i + 1
-        yesterday_rank = prev_ranks.get(row["ticker"])
-        if yesterday_rank is None:
-            row["rank_change"] = {
-                "yesterday": None, "today": today_rank, "diff": None,
-                "direction": "new", "label": f"今日{today_rank}位（前日データなし）",
-            }
-            continue
-        diff = yesterday_rank - today_rank
-        if diff > 0:
-            direction, label = "up", f"昨日{yesterday_rank}位 → 今日{today_rank}位 ↑{diff}"
-        elif diff < 0:
-            direction, label = "down", f"昨日{yesterday_rank}位 → 今日{today_rank}位 ↓{abs(diff)}"
-        else:
-            direction, label = "same", f"昨日{yesterday_rank}位 → 今日{today_rank}位 →"
-        row["rank_change"] = {
-            "yesterday": yesterday_rank, "today": today_rank, "diff": diff,
-            "direction": direction, "label": label,
-        }
-    return prev_date
-
-
 @app.get("/api/ranking")
 def ranking():
     try:
         tickers = _get_watchlist()
         rows = [_build_row(t) for t in tickers]
         rows = logic.sort_rows(rows)
-        rank_reference_date = _attach_rank_changes(rows)
 
         last_refresh = store.get_last_refresh()
         last_refresh_view = None
@@ -653,7 +662,6 @@ def ranking():
             "ok": True,
             "rows": rows,
             "last_refresh": last_refresh_view,
-            "rank_reference_date": rank_reference_date,
             "budget": {"used": used, "limit": logic.DAILY_API_BUDGET, "remaining": budget_left},
         })
     except Exception as e:
