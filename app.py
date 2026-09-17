@@ -366,7 +366,12 @@ details.logicinfo .small{margin-top:10px}
 .qdaily-table th{font-size:10px;color:#98a2b3;font-weight:700;border-bottom:1px solid #e5e7eb}
 .qdaily-table td{font-size:14px;font-weight:800;color:#172033}
 .qcont{margin:6px 2px 0;font-size:13px;font-weight:800;color:#087443}
-.q5stats{background:#f0f9f4;border-radius:13px;padding:12px 14px;font-size:12px;line-height:1.8;margin-top:8px}
+.q5stats{background:#f0f9f4;border-radius:13px;padding:10px 14px;font-size:12px;line-height:1.8;margin-top:8px}
+.q5stats summary{cursor:pointer;font-weight:800;color:#087443;font-size:13px;list-style:none}
+.q5stats summary::-webkit-details-marker{display:none}
+.q5stats summary::before{content:"▸ "}
+.q5stats[open] summary::before{content:"▾ "}
+.q5stats .q5statsbody{margin-top:8px}
 .q5stats .q5title{font-weight:800;color:#087443;margin-bottom:4px}
 .q5stats .q5note{color:#758096;font-size:11px;margin-top:6px}
 
@@ -390,19 +395,6 @@ details.logicinfo .small{margin-top:10px}
 
 <div id="hero"></div>
 <div class="list" id="list"></div>
-
-<div class="card">
-<details class="logicinfo">
-<summary><b>🧠 Q1〜Q5判定について（概要）</b></summary>
-<div class="small">
-複数の市場データ・テクニカル指標から、各銘柄の現在の状態をQ1〜Q5の5段階で判定します。<br>
-Q3＝発見、Q4＝準備、Q5＝購入判断という位置づけです。Q5→Q4への変化は「失敗」「売却」等を意味するものではありません。<br>
-Q5に表示される過去実績統計（60日/120日最大上昇率・到達率）は、過去にQ5と判定された局面の統計的な実績であり、この銘柄が将来同じように上がることを予測するものではありません。<br>
-状態履歴には、日々の判定結果（今日・昨日・直近数日のQ状態、Q5継続日数）を表示します。記録がない日は「—」と表示され、過去データを推測で補うことはしていません。<br>
-Q1〜Q5判定は1日1回、GitHub Actionsによる自動ジョブがTwelve Dataから取得しUpstash Redisに保存します。銘柄を「＋追加」した際は、次回の自動更新以降にQ1〜Q5判定が反映されます。
-</div>
-</details>
-</div>
 </div>
 
 <script>
@@ -600,18 +592,23 @@ function qDailyBreakdownHtml(q){
 
 // Q5の過去実績統計。あくまで「過去の類似状態における統計」であり、
 // 将来この銘柄が同じように上がると予測するものではないことを明記する(design 14)。
+// 2026-09-17のUI整理で、常時表示から「📊 過去実績」ボタン(details/summary)
+// クリックで展開する形式に変更。中身(数値・注意書き)は一切変更していない。
 function q5StatsHtml(q){
   if(!q || q.status !== "ready" || q.current_q !== "Q5" || !q.q5_stats) return "";
   const s = q.q5_stats;
   const events = (s.events||[]).map(e=>
     `${e.within_days}日以内+${e.threshold_pct}%到達: ${e.reach_rate_pct}%(n=${e.n})`
   ).join("　");
-  return `<div class="q5stats">
-    <div class="q5title">📊 Q5該当銘柄の過去の類似状態における実績統計</div>
-    <div>60日最大上昇率 中央値: ${s.h60_median_pct}%(n=${s.h60_n})　120日: ${s.h120_median_pct}%(n=${s.h120_n})</div>
-    <div>${events}</div>
-    <div class="q5note">※将来の予測ではなく、過去にQ5と判定された局面の統計的な実績です。${esc(s.note||"")}</div>
-  </div>`;
+  return `<details class="q5stats">
+    <summary>📊 過去実績</summary>
+    <div class="q5statsbody">
+      <div class="q5title">📊 Q5該当銘柄の過去の類似状態における実績統計</div>
+      <div>60日最大上昇率 中央値: ${s.h60_median_pct}%(n=${s.h60_n})　120日: ${s.h120_median_pct}%(n=${s.h120_n})</div>
+      <div>${events}</div>
+      <div class="q5note">※将来の予測ではなく、過去にQ5と判定された局面の統計的な実績です。${esc(s.note||"")}</div>
+    </div>
+  </details>`;
 }
 
 // Q1〜Q5をメインの判定として扱う(design方針)。旧upside_score/judgment基準の
@@ -630,7 +627,6 @@ function renderHero(rows){
       <div class="hero hero-buy">
         <div class="herolabel">📌 現在Q5（購入判断）の銘柄</div>
         <div class="heroline"><span class="heroticker">${names}</span></div>
-        <div class="herocomment">💬 過去の類似Q5状態の実績統計は、各銘柄カード内をご確認ください。「必ず上がる」という意味ではありません。</div>
       </div>
     `;
     return;
@@ -644,10 +640,22 @@ function renderHero(rows){
   heroEl.innerHTML = `<div class="zerobanner">⏳ Q1〜Q5判定はまだありません<span class="sub2">次回の日次更新（GitHub Actions）後に反映されます</span></div>`;
 }
 
+// カード表示順(表示専用)。サーバー側stock_logic.sort_rows(旧judgment基準)は
+// 無変更のまま、ここでcurrent_qを基準にJS側だけで並べ替える(design 2026-09-17)。
+// Array.prototype.sortは安定ソートのため、同じ優先度の銘柄同士は元の順番
+// (=サーバーから届いた順)をできるだけ維持する。
+const Q_SORT_PRIORITY = {"Q5":5,"Q4":4,"Q3":3,"Q2":2,"Q1":1};
+function qSortPriority(x){
+  const q = x.quintile;
+  if(!q || q.status!=="ready" || !q.current_q) return 0; // 判定待ちは最後
+  return Q_SORT_PRIORITY[q.current_q] || 0;
+}
+
 function render(rows){
   renderHero(rows);
+  const sortedRows = rows.slice().sort((a,b)=>qSortPriority(b)-qSortPriority(a));
   const list=document.getElementById("list");
-  list.innerHTML = rows.map((x,i)=>{
+  list.innerHTML = sortedRows.map((x,i)=>{
     const q = x.quintile || {};
     const cardCls = q.status==="ready" ? (QBADGE[q.current_q]||"q-pending").replace("q-","cq-") : "cq-pending";
     return `<div class="tcard ${cardCls}">
