@@ -473,12 +473,26 @@ async function addTicker(){
 }
 
 async function delTicker(t){
+  // 削除ボタンを押した直後に画面上から即時削除表示する(楽観的UI更新)。
+  // サーバー側の削除が成功すればそのまま(updateRankingで最新状態を反映)、
+  // 失敗した場合だけupdateRankingで最新状態(=まだ存在する)を再取得して
+  // 元に戻す。Q1〜Q5判定ロジック・Redis保存・PWA等の既存処理には無関係、
+  // /api/watchlist DELETEの呼び出し方自体は変更していない。
+  const card = document.querySelector(`.tcard[data-ticker="${t}"]`);
+  if(card) card.remove();
   try{
     const r=await fetch("/api/watchlist/"+encodeURIComponent(t),{method:"DELETE"});
     const j=await r.json();
-    if(!j.ok){alert(j.error||"削除できませんでした");return;}
+    if(!j.ok){
+      alert(j.error||"削除できませんでした");
+      await updateRanking();
+      return;
+    }
     await updateRanking();
-  }catch(e){alert("削除エラー: "+e.message)}
+  }catch(e){
+    alert("削除エラー: "+e.message);
+    await updateRanking();
+  }
 }
 
 function newsHtml(news){
@@ -665,7 +679,7 @@ function render(rows){
   list.innerHTML = sortedRows.map((x,i)=>{
     const q = x.quintile || {};
     const cardCls = q.status==="ready" ? (QBADGE[q.current_q]||"q-pending").replace("q-","cq-") : "cq-pending";
-    return `<div class="tcard ${cardCls}">
+    return `<div class="tcard ${cardCls}" data-ticker="${esc(x.ticker)}">
       <div class="rankline">
         <span class="tickerbig">${esc(x.ticker)}</span>
         ${qBadgeHtml(x.quintile)}
