@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request, render_template_string
 
@@ -84,6 +84,71 @@ QUINTILE_LABELS = {
     "Q4": "Q4（準備）", "Q5": "Q5（購入判断）",
 }
 
+# Q5シグナル(新規購入シグナル)の有効期限。2026-09-17のバックテスト検証
+# (fork「aca4da7」によるQ5→Q4/Q3/Q2/Q1遷移・経過日数・状態遷移モデルの検証)
+# で、Q5から離脱すると優位性の大半は1日目で失われるが、8日目あたりまでは
+# 「直近Q5履歴なし」の水準との差がまだ残ることが確認された。この検証結果に
+# 基づきユーザーが確定した仕様(2026-09-17)：最後にQ5になった日から8日間を
+# 新規購入シグナルの有効期間とする。既存のQ1〜Q5判定ロジック(quintile_logic.py
+# の9特徴量計算・pred_score・分位境界・assign_quintile)には一切触れない。
+Q5_SIGNAL_EXPIRY_DAYS = 8
+
+
+def _days_between(from_date_str, to_date_str):
+    """2つの"YYYY-MM-DD"文字列の間の暦日差(to - from)を返す。"""
+    return (date.fromisoformat(to_date_str) - date.fromisoformat(from_date_str)).days
+
+
+def _compute_q5_signal(current_q, history, anchor_date):
+    """Q5シグナル(新規購入シグナル)の状態を計算する(design: 上記
+    Q5_SIGNAL_EXPIRY_DAYS参照)。既存のhistory(Qが変化した日だけを記録する
+    変化ログ、redis_store/refresh.py無変更)から導出するだけの表示専用ロジック
+    であり、Redisへの新規書き込みは行わない。
+
+    仕様(ユーザー確定、2026-09-17):
+    - 「Q5シグナルDay 0」= 最後にQ5だった日。現在Q5ならそのQ5エントリの日付。
+      Q5から外れている場合は、historyが「変化した日だけ」を記録する仕様のため、
+      Q5エントリの直後にある「Q5から変化した日」の前日を「最後にQ5だった日」
+      として逆算する(Q5が複数日連続した場合、historyにはQ5開始日しか
+      残らないため、これをそのままDay0にすると、長くQ5が続いた銘柄ほど
+      離脱直後から不当に失効扱いになってしまうバグがあり、この逆算で回避する)。
+    - 現在Q5なら status="ok"(経過日数によらず常に「購入OK」)。
+    - Q5から外れている場合、上記Day0からanchor_date(通常は当日=last_updated)
+      までの経過日数を数え、Q5_SIGNAL_EXPIRY_DAYS(8日)未満ならstatus="active"
+      (シグナルまだ有効)、8日以上でstatus="expired"(失効)。
+    - 8日が経過する前に再びQ5になった場合、historyには新しいq=="Q5"エントリ
+      が追加されるため、このロジックは自動的にその新しい日付をDay0として扱う
+      (Q5→Q4→Q3→Q4→Q5のように途中で複数回Q3/Q4を経由しても、直近のQ5
+      エントリだけを見るため、再度Q5になった時点で自動的に新しいシグナルへ
+      リセットされる。追加の状態保存は不要)。
+    - 一度もQ5になったことがなければNoneを返す(シグナル自体が存在しない)。
+    - Q5からの低下(Q4/Q3等)は売却シグナルとして扱わない(新規購入判断専用、
+      既存保有分の売却判断はこの仕組みの対象外)。
+    """
+    if not history:
+        return None
+
+    last_q5_idx = None
+    for i in range(len(history) - 1, -1, -1):
+        if history[i].get("q") == "Q5":
+            last_q5_idx = i
+            break
+    if last_q5_idx is None:
+        return None
+
+    if current_q == "Q5":
+        return {"status": "ok", "day0_date": history[last_q5_idx]["date"], "days_elapsed": 0}
+
+    if last_q5_idx + 1 >= len(history):
+        # current_q!=Q5なのに直後の離脱エントリが存在しない状態で、
+        # 通常の日次更新フローでは起こらないはずだが、念のため未確定として扱う。
+        return None
+    depart_date = history[last_q5_idx + 1]["date"]
+    day0_date = (date.fromisoformat(depart_date) - timedelta(days=1)).isoformat()
+    days_elapsed = _days_between(depart_date, anchor_date) + 1
+    status = "expired" if days_elapsed >= Q5_SIGNAL_EXPIRY_DAYS else "active"
+    return {"status": status, "day0_date": day0_date, "days_elapsed": days_elapsed}
+
 
 def _build_quintile_view(ticker):
     """Q1〜Q5表示用データを組み立てる。Redisの`quintile:state:<TICKER>`を
@@ -95,7 +160,7 @@ def _build_quintile_view(ticker):
             "status": "pending",
             "current_q": None, "current_q_label": None,
             "previous_q": None, "last_updated": None,
-            "history": [], "q5_stats": None,
+            "history": [], "q5_stats": None, "q5_signal": None,
             "message": "Q判定は次回日次更新後に反映されます。",
         }
 
@@ -115,6 +180,7 @@ def _build_quintile_view(ticker):
             view["q5_stats"] = quintile_logic.load_q5_stats()
         except Exception:
             view["q5_stats"] = None
+    view["q5_signal"] = _compute_q5_signal(current_q, view["history"], view["last_updated"])
     return view
 
 
@@ -256,6 +322,10 @@ details.logicinfo .small{margin-top:10px}
 .q-q1{background:#f2f2f2;color:#98a2b3}.q-q2{background:#eef1f5;color:#758096}
 .q-q3{background:#eaf2ff;color:#175cd3}.q-q4{background:#fff1db;color:#9a6a00}
 .q-q5{background:#087443;color:#fff}.q-pending{background:#f2f2f2;color:#98a2b3;font-style:italic}
+.q5sig{display:flex;align-items:baseline;gap:8px;margin:4px 0 2px;flex-wrap:wrap}
+.q5sig .q5sigmain{font-weight:800;font-size:13px}
+.q5sig .q5sigsub{font-size:11px;font-weight:600;opacity:.85}
+.q5sig-ok{color:#087443}.q5sig-active{color:#9a6a00}.q5sig-expired{color:#98a2b3}
 .qdaily-wrap{overflow-x:auto;margin:8px 0;-webkit-overflow-scrolling:touch}
 .qdaily-table{border-collapse:collapse;background:#f7f9fc;border-radius:13px;width:100%}
 .qdaily-table th,.qdaily-table td{padding:7px 8px;text-align:center;min-width:50px;white-space:nowrap}
@@ -405,6 +475,22 @@ function qBadgeHtml(q){
   return `<span class="qbadge ${QBADGE[q.current_q]||"q-pending"}">${esc(q.current_q_label)}</span>`;
 }
 
+// Q5シグナル(新規購入シグナル)の有効期限表示。Q1〜Q5判定ロジックには一切
+// 関与しない、状態管理・表示専用(design: 2026-09-17のバックテスト検証に基づき
+// 最後にQ5になった日から8日間を新規購入シグナルの有効期間とする)。
+// Q5からの低下は売却シグナルではない(既存保有分の判断には使わない)。
+function q5SignalHtml(q){
+  if(!q || q.status !== "ready" || !q.q5_signal) return "";
+  const sig = q.q5_signal;
+  if(sig.status === "ok"){
+    return `<div class="q5sig q5sig-ok"><span class="q5sigmain">🟢 購入OK</span><span class="q5sigsub">Q5 Day 0</span></div>`;
+  }
+  if(sig.status === "active"){
+    return `<div class="q5sig q5sig-active"><span class="q5sigmain">前回Q5から${sig.days_elapsed}日</span><span class="q5sigsub">Q5シグナル有効</span></div>`;
+  }
+  return `<div class="q5sig q5sig-expired"><span class="q5sigmain">Q5シグナル失効</span></div>`;
+}
+
 // 同じ日付のエントリが連続する場合(同日に複数回バッチが走った場合など)、
 // その日の最新の状態だけを残す。日付をまたいだ本来の状態推移(例: 9/15 Q5 →
 // 9/16 Q2)はそのまま表示する(2026-09-16のUI修正で追加、表示層のみの対応)。
@@ -535,6 +621,7 @@ function render(rows){
         <span class="tickerbig">${esc(x.ticker)}</span>
         ${qBadgeHtml(x.quintile)}
       </div>
+      ${q5SignalHtml(x.quintile)}
       ${qDailyBreakdownHtml(x.quintile)}
       ${q5StatsHtml(x.quintile)}
 
