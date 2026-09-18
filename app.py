@@ -175,7 +175,7 @@ def _compute_q5_signal(current_q, history, anchor_date):
 # 「売却/除外/乗り換え」の判定ではなく、Q5 Day0以降の値動きの経過を確認する
 # ためだけの情報(過去の検証で使った閾値+3%/-3%/-7.5%をそのまま使用)。
 Q5_PROGRESS_BUCKETS = [
-    (3.0, float("inf"), "recover", "🟢", "回復"),
+    (3.0, float("inf"), "recover", "🟢", "上昇"),
     (-3.0, 3.0, "flat", "⚪", "停滞"),
     (-7.5, -3.0, "decline", "🟠", "下落"),
     (float("-inf"), -7.5, "plunge", "🔴", "続落"),
@@ -195,7 +195,7 @@ def _compute_q5_progress(price_path):
     Redisアクセス・書き込みなし)。price_pathが空(=一度もQ5になっていない、
     または未デプロイ時点のデータ)ならNoneを返す。
 
-    「回復」「停滞」「下落」「続落」は、購入・売却・除外・乗り換えの判定では
+    「上昇」「停滞」「下落」「続落」は、購入・売却・除外・乗り換えの判定では
     なく、Q5 Day0を基準にした累積騰落率を色分けしただけの状態表示である。"""
     if not price_path:
         return None
