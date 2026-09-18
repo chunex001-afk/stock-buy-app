@@ -355,6 +355,7 @@ HTML = r"""
 .wrap{max-width:880px;margin:auto;padding:18px}
 @media(min-width:760px){.wrap{max-width:1120px}}
 .title{font-size:24px;font-weight:800;margin-bottom:5px}
+.tickercount{color:#175cd3;font-weight:700;font-size:13px;margin-bottom:4px}
 .sub{color:#68748a;margin-bottom:18px;font-size:13px;line-height:1.6}
 .card{background:white;border-radius:22px;padding:18px;margin-bottom:16px;box-shadow:0 2px 14px #0000000c}
 .controls{display:flex;gap:8px;flex-wrap:wrap}
@@ -473,6 +474,7 @@ details.logicinfo .small{margin-top:10px}
 <body>
 <div class="wrap">
 <div class="title">📊 保有銘柄のQ1〜Q5状態</div>
+<div id="tickerCount" class="tickercount"></div>
 <div class="sub">実データ版｜最大15銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
 
 <div class="card">
@@ -512,8 +514,21 @@ async function updateRanking(extraMsg){
     if(!j.ok) throw new Error(j.error||"取得失敗");
     render(j.rows);
     renderOpInfo(j);
+    renderTickerCount(j);
     document.getElementById("status").textContent = extraMsg || "";
   }catch(e){document.getElementById("status").textContent="エラー："+e.message}
+}
+
+// 登録銘柄数の表示(design 2026-09-18)。/api/rankingが返すrows(=現在の
+// watchlist)の件数と、既存のstock_logic.MAX_TICKERS(max_ticketsとして
+// レスポンスに追加)をそのまま表示するだけの表示専用機能。Q1〜Q5判定・
+// Q5経過状態・追加/削除の既存処理には一切変更を加えない。
+function renderTickerCount(j){
+  const el = document.getElementById("tickerCount");
+  if(!el) return;
+  const n = (j.rows||[]).length;
+  const max = j.max_tickers ?? 15;
+  el.textContent = `登録銘柄：${n}/${max}`;
 }
 
 function renderOpInfo(j){
@@ -1002,6 +1017,7 @@ def ranking():
             "rows": rows,
             "last_refresh": last_refresh_view,
             "budget": {"used": used, "limit": td.DAILY_API_BUDGET, "remaining": budget_left},
+            "max_tickers": logic.MAX_TICKERS,
         })
     except Exception as e:
         return jsonify({"ok": False, "error": f"予期しないエラーが発生しました: {e}"}), 200
