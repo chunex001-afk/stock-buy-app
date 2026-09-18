@@ -93,7 +93,12 @@ class UpdateQuintileStatePricePathTests(unittest.TestCase):
     def test_fresh_q5_entry_resets_price_path(self):
         existing = {
             "current_q": "Q3", "previous_q": "Q2", "history": [{"date": "2026-08-20", "q": "Q3"}],
-            "q5_price_path": [{"date": "2026-08-10", "price": 50.0}],  # 前回のQ5サイクルの残骸
+            # 前回のQ5クールは既にDay0〜Day5(6件)で終了済み("残骸")
+            "q5_price_path": [
+                {"date": "2026-08-10", "price": 50.0}, {"date": "2026-08-11", "price": 51.0},
+                {"date": "2026-08-12", "price": 49.0}, {"date": "2026-08-13", "price": 48.0},
+                {"date": "2026-08-14", "price": 47.0}, {"date": "2026-08-17", "price": 46.0},
+            ],
             "last_updated": "2026-08-20",
         }
         set_state = self._patch_store(existing)
@@ -138,24 +143,46 @@ class UpdateQuintileStatePricePathTests(unittest.TestCase):
         self.assertEqual(len(state["q5_price_path"]), 3)
         self.assertEqual(state["q5_price_path"][-1], {"date": "2026-09-03", "price": 85.0})
 
-    def test_reentering_q5_resets_again(self):
-        """Q5→Q4→Q5と再突入した場合、新しいDay0でリセットされる。"""
+    def test_reentering_q5_mid_cool_does_not_reset(self):
+        """Q5後5営業日固定クール仕様(2026-09-18正式化): クールがまだDay5に
+        達していない間にQ4→Q5と再突入しても、Day0はリセットされず継続する。"""
         existing = {
             "current_q": "Q4", "previous_q": "Q5",
             "history": [{"date": "2026-09-01", "q": "Q5"}, {"date": "2026-09-04", "q": "Q4"}],
             "q5_price_path": [
-                {"date": "2026-09-01", "price": 100.0},
-                {"date": "2026-09-02", "price": 90.0},
-                {"date": "2026-09-03", "price": 88.0},
-                {"date": "2026-09-04", "price": 85.0},
+                {"date": "2026-09-01", "price": 100.0},  # Day0
+                {"date": "2026-09-02", "price": 90.0},   # Day1
+                {"date": "2026-09-03", "price": 88.0},   # Day2
+                {"date": "2026-09-04", "price": 85.0},   # Day3(Q4に降格した日)
             ],
             "last_updated": "2026-09-04",
         }
         self._patch_store(existing)
         bounds = [1, 2, 3, 4]  # scoreがこれ以上ならQ5
-        state = refresh._update_quintile_state("TST", score=10.0, bounds=bounds, date_key="2026-09-10", price=120.0)
+        state = refresh._update_quintile_state("TST", score=10.0, bounds=bounds, date_key="2026-09-05", price=120.0)
         self.assertEqual(state["current_q"], "Q5")
-        self.assertEqual(state["q5_price_path"], [{"date": "2026-09-10", "price": 120.0}])
+        self.assertEqual(state["q5_price_path"][0], {"date": "2026-09-01", "price": 100.0})  # Day0は不変
+        self.assertEqual(len(state["q5_price_path"]), 5)  # Day4が追記された
+        self.assertEqual(state["q5_price_path"][-1], {"date": "2026-09-05", "price": 120.0})
+
+    def test_reentering_q5_after_cool_ended_resets(self):
+        """クールが既にDay5まで終了した後にQ4→Q5と再突入した場合のみ、
+        新しいDay0でリセットされる。"""
+        existing = {
+            "current_q": "Q4", "previous_q": "Q5",
+            "history": [{"date": "2026-09-01", "q": "Q5"}, {"date": "2026-09-10", "q": "Q4"}],
+            "q5_price_path": [
+                {"date": "2026-09-01", "price": 100.0}, {"date": "2026-09-02", "price": 90.0},
+                {"date": "2026-09-03", "price": 88.0}, {"date": "2026-09-04", "price": 85.0},
+                {"date": "2026-09-05", "price": 83.0}, {"date": "2026-09-08", "price": 80.0},  # Day5でクール終了
+            ],
+            "last_updated": "2026-09-10",
+        }
+        self._patch_store(existing)
+        bounds = [1, 2, 3, 4]  # scoreがこれ以上ならQ5
+        state = refresh._update_quintile_state("TST", score=10.0, bounds=bounds, date_key="2026-09-15", price=120.0)
+        self.assertEqual(state["current_q"], "Q5")
+        self.assertEqual(state["q5_price_path"], [{"date": "2026-09-15", "price": 120.0}])
 
     def test_no_price_available_does_not_crash_or_append(self):
         existing = {

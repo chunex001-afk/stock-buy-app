@@ -246,6 +246,21 @@ def _compute_q5_progress(price_path):
     }
 
 
+def _compute_q5_warning_view(warning):
+    """refresh.pyのq5_warning(design 2026-09-18正式仕様: Q5クールのDay5時点の
+    Q5起点騰落率が-7.5%以下の場合にのみ発生する注意喚起)を表示用に整形するだけ
+    の純粋関数(Redisアクセスなし)。発生・保持・失効の判定はすべてrefresh.py側
+    で完了しており、ここでは値の解釈・失効判定は一切行わない。売却/除外/
+    購入不可などの判定には関与しない、補助的な警告表示専用。"""
+    if not warning:
+        return None
+    return {
+        "triggered_date": warning.get("triggered_date"),
+        "triggered_return_pct": warning.get("triggered_return_pct"),
+        "days_since_trigger": warning.get("days_since_trigger", 0),
+    }
+
+
 def _build_quintile_view(ticker):
     """Q1〜Q5表示用データを組み立てる。Redisの`quintile:state:<TICKER>`を
     読むだけで、Twelve Dataへのライブ呼び出しは一切行わない(design 12)。
@@ -257,6 +272,7 @@ def _build_quintile_view(ticker):
             "current_q": None, "current_q_label": None,
             "previous_q": None, "last_updated": None,
             "history": [], "q5_stats": None, "q5_signal": None, "q5_progress": None,
+            "q5_warning": None,
             "message": "Q判定は次回日次更新後に反映されます。",
         }
 
@@ -278,6 +294,7 @@ def _build_quintile_view(ticker):
             view["q5_stats"] = None
     view["q5_signal"] = _compute_q5_signal(current_q, view["history"], view["last_updated"])
     view["q5_progress"] = _compute_q5_progress(state.get("q5_price_path", []))
+    view["q5_warning"] = _compute_q5_warning_view(state.get("q5_warning"))
     return view
 
 
@@ -467,6 +484,12 @@ details.logicinfo .small{margin-top:10px}
 .q5progcp{margin-top:2px;color:#344054}
 .q5progroute{margin-top:2px;word-break:break-word}
 .q5prognote{color:#758096;font-size:11px;margin-top:6px}
+
+/* Q5 Day5注意喚起(design 2026-09-18正式実装)。購入不可等の判定には一切
+   影響しない、補助的な警告表示のみ。将来の下落を断定する表現にはしない。 */
+.q5warn{background:#fdeceb;border-radius:13px;padding:10px 14px;margin-top:6px}
+.q5warntop{font-weight:800;color:#b42318;font-size:13px}
+.q5warnnote{color:#8a3a30;font-size:11px;margin-top:4px;line-height:1.6}
 
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}}
 </style>
@@ -662,6 +685,20 @@ function q5ProgressHtml(q){
   </div>`;
 }
 
+// Q5 Day5注意喚起(design 2026-09-18の過去データ検証結果に基づく正式実装)。
+// Q5クールのDay5時点のQ5起点騰落率が-7.5%以下の場合にのみ発生し、以後は
+// 現在のQ5クールの状態(新クール開始・クール②のDay5回復)とは無関係に、
+// 発生から最大40営業日保持される(発生・保持・失効の判定はrefresh.py側で
+// 完結済み、ここは表示専用)。購入不可等の判定には一切関与しない。
+// 将来の下落を断定する表現(「〜になる確率」等)は使わない。
+function q5WarningHtml(q){
+  if(!q || q.status !== "ready" || !q.q5_warning) return "";
+  return `<div class="q5warn">
+    <div class="q5warntop">🔴 続落　⚠️ −20%程度までの下落に注意</div>
+    <div class="q5warnnote">過去の類似ケースでは、Q5開始後5日目の下落が大きい局面で、その後−20%程度まで下落したケースが多く確認されています。</div>
+  </div>`;
+}
+
 // 同じ日付のエントリが連続する場合(同日に複数回バッチが走った場合など)、
 // その日の最新の状態だけを残す。日付をまたいだ本来の状態推移(例: 9/15 Q5 →
 // 9/16 Q2)はそのまま表示する(2026-09-16のUI修正で追加、表示層のみの対応)。
@@ -810,6 +847,7 @@ function render(rows){
       </div>
       ${q5SignalHtml(x.quintile)}
       ${q5ProgressHtml(x.quintile)}
+      ${q5WarningHtml(x.quintile)}
       ${qDailyBreakdownHtml(x.quintile)}
       ${q5StatsHtml(x.quintile)}
 

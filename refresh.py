@@ -91,13 +91,26 @@ def update_rank_snapshot(tickers):
 
 MAX_QUINTILE_STATE_HISTORY = 60
 
-# Q5「経過状態」表示専用(design 2026-09-18、app.pyのQ5進捗カード)。
+# Q5後5営業日固定クール(design 2026-09-18正式仕様、過去データによる検証済み)。
 # Q1〜Q5判定ロジック(quintile_logic.py)・既存history・Q5シグナルには一切
 # 使わない、追加のみのフィールド。新規Q5突入日(Day0)からの終値を積み上げる。
-# 130件(前回までのバックテストで検証した最大観測horizonと同じ)に達したら
-# それ以上は追記しない(先頭=Day0は上書きせず、末尾から切り捨てない=Day0を
-# 失わないため、古い順の"trim"ではなく単純に追記を止めるだけにする)。
-MAX_Q5_PRICE_PATH_DAYS = 130
+# 「現在Q5かどうか」とは別管理: 途中でQ4以下に戻っても・途中で再びQ5に
+# なってもクールは継続・リセットされず、Day0からQ5_COOL_BUSINESS_DAYS営業日
+# (=Day0〜Day5の計MAX_Q5_PRICE_PATH_DAYS件)に達したらクール終了として
+# 追記を止める(先頭=Day0は上書きせず、末尾から切り捨てない)。クール終了後に
+# 「前日Q5でない→当日Q5」の genuine な再突入が起きた場合のみ、新しいクール
+# Day0としてリセットする。
+Q5_COOL_BUSINESS_DAYS = 5
+MAX_Q5_PRICE_PATH_DAYS = Q5_COOL_BUSINESS_DAYS + 1  # Day0〜Day5の6件
+
+# Q5注意喚起(design 2026-09-18正式仕様)。Q5クールのDay5時点(Day1/Day3等の
+# 中間値は使わない)のQ5起点騰落率がこの閾値以下の場合にのみ発生させる。
+Q5_WARNING_TRIGGER_PCT = -7.5
+# 発生した注意喚起は、現在のQ5クールの状態(新クール開始・クール②のDay5回復)
+# とは独立に、発生日から最大この営業日数まで保持し、それ以降は自動的に解除
+# する(過去データ検証の結果、次クールのDay5回復だけでは解除の根拠が弱いと
+# 判断したため、固定日数での失効とした)。
+Q5_WARNING_MAX_BUSINESS_DAYS = 40
 
 
 def remaining_td_budget():
@@ -128,20 +141,52 @@ def _td_fetch_one(ticker, api_key, date_key):
         return None, False, "UNKNOWN", str(e)
 
 
+def _advance_q5_warning(prev_warning, price_path, just_completed_day5, date_key):
+    """Q5クールDay5時点の注意喚起の発生・保持・失効を判定する(design 2026-09-18
+    正式仕様、Redisアクセスなしの純粋関数)。「現在のQ5クール」(price_path)とは
+    別状態として管理し、新しいQ5クールが始まっても、そのクールのDay5が-7.5%
+    より上に回復しても解除しない。発生からQ5_WARNING_MAX_BUSINESS_DAYS営業日
+    経過した時点でのみ自動的に解除する。既に有効な注意喚起がある間は、新たな
+    Day5<=-7.5%が発生しても上書きしない(最初の発生情報をそのまま保持する。
+    過去データ検証で、次クールのDay5回復だけでは解除の根拠が弱いと確認済み)。"""
+    warning = dict(prev_warning) if prev_warning else None
+    if warning is not None:
+        warning["days_since_trigger"] = warning.get("days_since_trigger", 0) + 1
+        if warning["days_since_trigger"] >= Q5_WARNING_MAX_BUSINESS_DAYS:
+            warning = None
+
+    if warning is None and just_completed_day5:
+        day0_price = price_path[0].get("price")
+        day5_price = price_path[Q5_COOL_BUSINESS_DAYS].get("price")
+        if day0_price and day5_price:
+            day5_return = (day5_price / day0_price - 1) * 100
+            if day5_return <= Q5_WARNING_TRIGGER_PCT:
+                warning = {
+                    "triggered_date": date_key,
+                    "triggered_return_pct": round(day5_return, 2),
+                    "days_since_trigger": 0,
+                }
+    return warning
+
+
 def _update_quintile_state(ticker, score, bounds, date_key, price=None):
     """ユーザー監視銘柄1件のQ状態を判定し、状態が変化した場合のみ履歴に追記する。
     「売り」「失敗」等の否定的な意味は一切持たせず、単なる状態記録として保存する
     (design 13の方針)。current_q/previous_q/history/pred_scoreの計算は無変更。
 
-    2026-09-18追加: q5_price_path(Q5「経過状態」表示専用、design参照)。
-    新規にQ5へ突入した日(前日Q5でない→当日Q5)を検知したら空にリセットし、
-    以後はQ5から外れても(Q4/Q3等に降格しても)priceが取れる限り追記し続ける
-    ("Q5後にどう動いたか"を見る機能のため、Q5を外れた瞬間に記録を止めない)。
-    再びQ5に突入したら、その時点で新しいDay0としてまたリセットする。
-    先頭の要素(Day0)は上書き・切り捨てしない(MAX_Q5_PRICE_PATH_DAYS件に
-    達したら単に追記を止める。古い方から捨てるtrimはしない)。
-    app.py側の表示専用ロジック(_compute_q5_progress)が読むだけで、
-    quintile_logic.py・history・pred_score・Q5シグナルには一切影響しない。"""
+    2026-09-18追加、同日に5営業日固定クール仕様として正式化: q5_price_path
+    (Q5「経過状態」表示専用、design参照)。「現在Q5かどうか」と「Q5後5営業日
+    のクール」は別管理: 新規にQ5へ突入した日(前日Q5でない→当日Q5)で、かつ
+    直前のクールが既にDay5まで終了している(またはそもそもクールが無い)場合
+    にのみ空にリセットして新Day0を開始する。クールの途中でQ4以下に戻っても・
+    途中で再びQ5になっても、そのクールの観測(Day0〜Day5)は継続してリセット
+    しない。Day0〜Day5(MAX_Q5_PRICE_PATH_DAYS件)に達したらクールは終了し、
+    それ以上は追記しない(先頭=Day0は上書き・切り捨てしない)。
+    Day5に到達した回だけ、_advance_q5_warningでその時点のQ5起点騰落率を見て
+    注意喚起(q5_warning)の発生を判定する。q5_warningはクールの状態とは独立に
+    保持・失効する(design参照)。
+    いずれもapp.py側の表示専用ロジックが読むだけで、quintile_logic.py・
+    history・pred_score・既存のQ5シグナルには一切影響しない。"""
     q = quintile_logic.assign_quintile(score, bounds)
     prev_state = store.get_quintile_state(ticker) or {}
     prev_q = prev_state.get("current_q")
@@ -152,12 +197,17 @@ def _update_quintile_state(ticker, score, bounds, date_key, price=None):
         history = history[-MAX_QUINTILE_STATE_HISTORY:]
 
     price_path = list(prev_state.get("q5_price_path", []))
-    is_fresh_q5_entry = (q == "Q5" and prev_q != "Q5")
-    if is_fresh_q5_entry:
+    cool_already_ended = len(price_path) >= MAX_Q5_PRICE_PATH_DAYS
+    is_new_cool = q == "Q5" and prev_q != "Q5" and (not price_path or cool_already_ended)
+    if is_new_cool:
         price_path = []
+    just_completed_day5 = False
     if price and (q == "Q5" or price_path) and len(price_path) < MAX_Q5_PRICE_PATH_DAYS:
         if not price_path or price_path[-1]["date"] != date_key:
             price_path.append({"date": date_key, "price": price})
+            just_completed_day5 = len(price_path) == MAX_Q5_PRICE_PATH_DAYS
+
+    warning = _advance_q5_warning(prev_state.get("q5_warning"), price_path, just_completed_day5, date_key)
 
     new_state = {
         "current_q": q,
@@ -165,6 +215,7 @@ def _update_quintile_state(ticker, score, bounds, date_key, price=None):
         "pred_score": score,
         "history": history,
         "q5_price_path": price_path,
+        "q5_warning": warning,
         "last_updated": date_key,
     }
     store.set_quintile_state(ticker, new_state)
