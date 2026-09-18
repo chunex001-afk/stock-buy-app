@@ -170,6 +170,82 @@ def _compute_q5_signal(current_q, history, anchor_date):
     return {"status": status, "day0_date": day0_date, "days_elapsed": days_elapsed}
 
 
+# Q5「経過状態」表示(design 2026-09-18)。Q1〜Q5判定ロジック(quintile_logic.py)
+# や既存のQ5シグナル(_compute_q5_signal)には一切関与しない、表示専用の追加機能。
+# 「売却/除外/乗り換え」の判定ではなく、Q5 Day0以降の値動きの経過を確認する
+# ためだけの情報(過去の検証で使った閾値+3%/-3%/-7.5%をそのまま使用)。
+Q5_PROGRESS_BUCKETS = [
+    (3.0, float("inf"), "recover", "🟢", "回復"),
+    (-3.0, 3.0, "flat", "⚪", "停滞"),
+    (-7.5, -3.0, "decline", "🟠", "下落"),
+    (float("-inf"), -7.5, "plunge", "🔴", "続落"),
+]
+
+
+def _progress_bucket(return_pct):
+    for lo, hi, key, emoji, label in Q5_PROGRESS_BUCKETS:
+        if lo <= return_pct < hi:
+            return key, emoji, label
+    return "flat", "⚪", "停滞"
+
+
+def _compute_q5_progress(price_path):
+    """refresh.py が積み上げるq5_price_path([{"date","price"}, ...]、
+    Day0=price_path[0])から、表示用の"経過状態"を組み立てる(純粋関数、
+    Redisアクセス・書き込みなし)。price_pathが空(=一度もQ5になっていない、
+    または未デプロイ時点のデータ)ならNoneを返す。
+
+    「回復」「停滞」「下落」「続落」は、購入・売却・除外・乗り換えの判定では
+    なく、Q5 Day0を基準にした累積騰落率を色分けしただけの状態表示である。"""
+    if not price_path:
+        return None
+    day0_price = price_path[0].get("price")
+    day0_date = price_path[0].get("date")
+    if not day0_price:
+        return None
+
+    daily = []
+    for i, entry in enumerate(price_path):
+        p = entry.get("price")
+        if not p:
+            continue
+        ret = (p / day0_price - 1) * 100
+        key, emoji, label = _progress_bucket(ret)
+        daily.append({
+            "day": i, "date": entry.get("date"), "return_pct": round(ret, 2),
+            "state_key": key, "state_emoji": emoji, "state_label": label,
+        })
+    if not daily:
+        return None
+
+    # 経過(状態が変化した日だけを記録、折りたたみ表示用のコンパクトな経路)
+    path = []
+    for d in daily:
+        if not path or path[-1]["state_key"] != d["state_key"]:
+            path.append(d)
+
+    current = daily[-1]
+    checkpoints = {}
+    for k in (1, 3, 5, 10, 20):
+        if k < len(daily):
+            checkpoints[k] = daily[k]["return_pct"]
+
+    return {
+        "day0_date": day0_date,
+        "days_elapsed": current["day"],
+        "current_return_pct": current["return_pct"],
+        "current_state_key": current["state_key"],
+        "current_state_emoji": current["state_emoji"],
+        "current_state_label": current["state_label"],
+        "checkpoints": checkpoints,
+        "path": [
+            {"day": p["day"], "date": p["date"], "return_pct": p["return_pct"],
+             "state_emoji": p["state_emoji"], "state_label": p["state_label"]}
+            for p in path
+        ],
+    }
+
+
 def _build_quintile_view(ticker):
     """Q1〜Q5表示用データを組み立てる。Redisの`quintile:state:<TICKER>`を
     読むだけで、Twelve Dataへのライブ呼び出しは一切行わない(design 12)。
@@ -180,7 +256,7 @@ def _build_quintile_view(ticker):
             "status": "pending",
             "current_q": None, "current_q_label": None,
             "previous_q": None, "last_updated": None,
-            "history": [], "q5_stats": None, "q5_signal": None,
+            "history": [], "q5_stats": None, "q5_signal": None, "q5_progress": None,
             "message": "Q判定は次回日次更新後に反映されます。",
         }
 
@@ -201,6 +277,7 @@ def _build_quintile_view(ticker):
         except Exception:
             view["q5_stats"] = None
     view["q5_signal"] = _compute_q5_signal(current_q, view["history"], view["last_updated"])
+    view["q5_progress"] = _compute_q5_progress(state.get("q5_price_path", []))
     return view
 
 
@@ -368,6 +445,28 @@ details.logicinfo .small{margin-top:10px}
 .q5stats .q5title{font-weight:800;color:#087443;margin-bottom:4px}
 .q5stats .q5note{color:#758096;font-size:11px;margin-top:6px}
 
+/* Q5「経過状態」表示(design 2026-09-18)。売却/除外/乗り換えの判定ではなく、
+   Q5 Day0以降の値動きの経過を確認するための表示。 */
+.q5prog{margin:6px 0 2px}
+.q5progtop{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
+.q5progday{font-weight:800;color:#172033}
+.q5progstate{font-weight:800;padding:2px 8px;border-radius:999px;font-size:12px}
+.q5progstate-recover{background:#e6f6ee;color:#087443}
+.q5progstate-flat{background:#f2f2f2;color:#758096}
+.q5progstate-decline{background:#fff1db;color:#9a6a00}
+.q5progstate-plunge{background:#fde8e6;color:#b42318}
+.q5progret{font-weight:700;font-size:12px}
+.q5progret.up{color:#087443}.q5progret.down{color:#b42318}
+.q5progpath{margin-top:4px;font-size:12px}
+.q5progpath summary{cursor:pointer;color:#175cd3;font-weight:700;font-size:12px;list-style:none}
+.q5progpath summary::-webkit-details-marker{display:none}
+.q5progpath summary::before{content:"▸ "}
+.q5progpath[open] summary::before{content:"▾ "}
+.q5progpathbody{margin-top:6px;line-height:1.8;color:#344054}
+.q5progcp{margin-top:2px;color:#344054}
+.q5progroute{margin-top:2px;word-break:break-word}
+.q5prognote{color:#758096;font-size:11px;margin-top:6px}
+
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}}
 </style>
 </head>
@@ -499,6 +598,53 @@ function q5SignalHtml(q){
     return `<div class="q5sig q5sig-active"><span class="q5sigmain">前回Q5から${sig.days_elapsed}日</span><span class="q5sigsub">Q5シグナル有効</span></div>`;
   }
   return `<div class="q5sig q5sig-expired"><span class="q5sigmain">Q5シグナル失効</span></div>`;
+}
+
+// Q5「経過状態」表示(design 2026-09-18)。バックエンド(_compute_q5_progress、
+// app.py)が組み立てたq5_progressをそのまま表示するだけ。Q1〜Q5判定ロジック・
+// Q5シグナル(q5SignalHtml)には一切関与しない。current_qがQ5でなくなった後
+// (Q4/Q3等に降格した後)でも、同じQ5サイクルの経過を追い続けるため表示する。
+// 重要: これは購入/売却/除外/乗り換えの判定ではなく、Q5後の値動きの経過を
+// 確認するためだけの表示。続落・下落と出ても「売却推奨」等は一切表示しない。
+const Q5PROG_STATE_CLASS = {
+  recover: "q5progstate-recover", flat: "q5progstate-flat",
+  decline: "q5progstate-decline", plunge: "q5progstate-plunge",
+};
+
+function fmtSignedPct(v){
+  if(v===null || v===undefined) return "";
+  return (v>=0?"+":"") + v.toFixed(1) + "%";
+}
+
+function q5ProgressHtml(q){
+  if(!q || q.status !== "ready" || !q.q5_progress) return "";
+  const p = q.q5_progress;
+  const stateCls = Q5PROG_STATE_CLASS[p.current_state_key] || "";
+  const retCls = p.current_return_pct >= 0 ? "up" : "down";
+
+  const cpParts = [1, 3, 5].filter(k => p.checkpoints && Object.prototype.hasOwnProperty.call(p.checkpoints, k))
+    .map(k => `Day${k}: ${fmtSignedPct(p.checkpoints[k])}`);
+  const cpLine = cpParts.length ? `<div class="q5progcp">${cpParts.join("　")}</div>` : "";
+
+  const routeParts = (p.path || []).map(s => `${s.state_emoji}${esc(s.state_label)}`);
+  const routeLine = routeParts.length ? routeParts.join(" → ") : "—";
+
+  return `<div class="q5prog">
+    <div class="q5progtop">
+      <span class="q5progday">Q5 Day ${p.days_elapsed}</span>
+      <span class="q5progstate ${stateCls}">${p.current_state_emoji} ${esc(p.current_state_label)}</span>
+      <span class="q5progret ${retCls}">Q5起点 ${fmtSignedPct(p.current_return_pct)}</span>
+    </div>
+    <details class="q5progpath">
+      <summary>経過を見る</summary>
+      <div class="q5progpathbody">
+        <div>Q5 Day0（${esc(fmtDate(p.day0_date))}）</div>
+        ${cpLine}
+        <div class="q5progroute">経過：${routeLine}</div>
+        <div class="q5prognote">※これは購入・売却・除外・乗り換えの判定ではありません。Q5後の値動きの経過を確認するための表示です。</div>
+      </div>
+    </details>
+  </div>`;
 }
 
 // 同じ日付のエントリが連続する場合(同日に複数回バッチが走った場合など)、
@@ -648,6 +794,7 @@ function render(rows){
         ${qBadgeHtml(x.quintile)}
       </div>
       ${q5SignalHtml(x.quintile)}
+      ${q5ProgressHtml(x.quintile)}
       ${qDailyBreakdownHtml(x.quintile)}
       ${q5StatsHtml(x.quintile)}
 

@@ -91,6 +91,14 @@ def update_rank_snapshot(tickers):
 
 MAX_QUINTILE_STATE_HISTORY = 60
 
+# Q5「経過状態」表示専用(design 2026-09-18、app.pyのQ5進捗カード)。
+# Q1〜Q5判定ロジック(quintile_logic.py)・既存history・Q5シグナルには一切
+# 使わない、追加のみのフィールド。新規Q5突入日(Day0)からの終値を積み上げる。
+# 130件(前回までのバックテストで検証した最大観測horizonと同じ)に達したら
+# それ以上は追記しない(先頭=Day0は上書きせず、末尾から切り捨てない=Day0を
+# 失わないため、古い順の"trim"ではなく単純に追記を止めるだけにする)。
+MAX_Q5_PRICE_PATH_DAYS = 130
+
 
 def remaining_td_budget():
     """(Twelve Dataの残りcredits, 本日の使用済みcredits) を返す。"""
@@ -120,10 +128,20 @@ def _td_fetch_one(ticker, api_key, date_key):
         return None, False, "UNKNOWN", str(e)
 
 
-def _update_quintile_state(ticker, score, bounds, date_key):
+def _update_quintile_state(ticker, score, bounds, date_key, price=None):
     """ユーザー監視銘柄1件のQ状態を判定し、状態が変化した場合のみ履歴に追記する。
     「売り」「失敗」等の否定的な意味は一切持たせず、単なる状態記録として保存する
-    (design 13の方針)。"""
+    (design 13の方針)。current_q/previous_q/history/pred_scoreの計算は無変更。
+
+    2026-09-18追加: q5_price_path(Q5「経過状態」表示専用、design参照)。
+    新規にQ5へ突入した日(前日Q5でない→当日Q5)を検知したら空にリセットし、
+    以後はQ5から外れても(Q4/Q3等に降格しても)priceが取れる限り追記し続ける
+    ("Q5後にどう動いたか"を見る機能のため、Q5を外れた瞬間に記録を止めない)。
+    再びQ5に突入したら、その時点で新しいDay0としてまたリセットする。
+    先頭の要素(Day0)は上書き・切り捨てしない(MAX_Q5_PRICE_PATH_DAYS件に
+    達したら単に追記を止める。古い方から捨てるtrimはしない)。
+    app.py側の表示専用ロジック(_compute_q5_progress)が読むだけで、
+    quintile_logic.py・history・pred_score・Q5シグナルには一切影響しない。"""
     q = quintile_logic.assign_quintile(score, bounds)
     prev_state = store.get_quintile_state(ticker) or {}
     prev_q = prev_state.get("current_q")
@@ -133,11 +151,20 @@ def _update_quintile_state(ticker, score, bounds, date_key):
         history.append({"date": date_key, "q": q})
         history = history[-MAX_QUINTILE_STATE_HISTORY:]
 
+    price_path = list(prev_state.get("q5_price_path", []))
+    is_fresh_q5_entry = (q == "Q5" and prev_q != "Q5")
+    if is_fresh_q5_entry:
+        price_path = []
+    if price and (q == "Q5" or price_path) and len(price_path) < MAX_Q5_PRICE_PATH_DAYS:
+        if not price_path or price_path[-1]["date"] != date_key:
+            price_path.append({"date": date_key, "price": price})
+
     new_state = {
         "current_q": q,
         "previous_q": prev_q,
         "pred_score": score,
         "history": history,
+        "q5_price_path": price_path,
         "last_updated": date_key,
     }
     store.set_quintile_state(ticker, new_state)
@@ -484,7 +511,10 @@ def run_quintile_refresh(api_key, watchlist):
                 score = cached.get("pred_score") if cached else None
             if score is None:
                 continue  # まだ一度もTwelve Dataで取得できていない銘柄は判定待ちのまま
-            state = _update_quintile_state(ticker, score, bounds, date_key)
+            # q5_price_path用: 当日実際に取得できた終値があれば渡す(取得できて
+            # いない日=fetched未成功の日は前回値のままpriceを渡さず、記録しない)。
+            price_today = fetched[ticker][1][-1] if ticker in fetched else None
+            state = _update_quintile_state(ticker, score, bounds, date_key, price=price_today)
             print(f"[Q1-5][OK] {ticker}: {state['current_q']} (pred_score={score:.2f})")
 
     # 旧指標(stock_logic)側が同じ取得結果を再利用できるよう、監視銘柄分の生データ
