@@ -1,3 +1,4 @@
+import bisect
 import os
 import re
 from datetime import date, timedelta
@@ -81,12 +82,54 @@ QUINTILE_LABELS = {
 # 基づきユーザーが確定した仕様(2026-09-17)：最後にQ5になった日から8日間を
 # 新規購入シグナルの有効期間とする。既存のQ1〜Q5判定ロジック(quintile_logic.py
 # の9特徴量計算・pred_score・分位境界・assign_quintile)には一切触れない。
+#
+# 2026-09-22改定: 単位を「8暦日」から「8取引日」に変更した(土日・米国市場
+# 休場日調査の結果、Q5 Day0〜Day5(5取引日)・Q5警告(最大40取引日)は元々
+# 取引日ベースの設計だったのに対し、このQ5シグナルだけが暦日差で実装されて
+# おり土日を挟むたびに有効期間が実質的に縮む不整合があったため、ユーザー確定
+# 仕様として取引日ベースに統一する)。土日・米国市場休場日を8日にカウント
+# しない。
 Q5_SIGNAL_EXPIRY_DAYS = 8
 
 
 def _days_between(from_date_str, to_date_str):
-    """2つの"YYYY-MM-DD"文字列の間の暦日差(to - from)を返す。"""
+    """2つの"YYYY-MM-DD"文字列の間の暦日差(to - from)を返す。
+    2026-09-22以降、_compute_q5_signalの主経路では使わない(下記
+    _trading_days_betweenに置き換えた)。取引日カレンダーが取得できない
+    起動直後などの縮退時フォールバックとしてのみ残す。"""
     return (date.fromisoformat(to_date_str) - date.fromisoformat(from_date_str)).days
+
+
+def _trading_days_calendar():
+    """quintile:pool_historyに蓄積されている「実際に処理された取引日」の
+    一覧(refresh.run_quintile_refreshが実取引日ベース化(2026-09-22)された
+    ことにより、新しい取引日を検出した時にしか追加されなくなった)を、
+    Q5シグナルの8取引日判定用カレンダーとして再利用する。新規のRedisキーは
+    追加しない(design: 既存のpool_historyだけで正確に取引日を数えられる)。
+    直近252営業日分(POOL_WINDOW_DAYS)しか保持されないが、8取引日の判定には
+    十分な範囲。取得できない場合は空リストを返す(呼び出し側は暦日フォール
+    バックに切り替える)。"""
+    pool_history = store.get_pool_history()
+    if not pool_history:
+        return []
+    return sorted(pool_history.get("dates", []))
+
+
+def _trading_days_between(calendar_dates, from_date_str, to_date_str):
+    """calendar_dates(ソート済み"YYYY-MM-DD"文字列リスト)のうち、
+    from_date_str以上to_date_str以下(両端含む)の件数を返す。
+    「離脱日を1取引日目として数えた、anchor_dateまでの経過取引日数」に使う
+    (from_date_str==to_date_strなら1を返す、旧_days_between+1の取引日版)。"""
+    lo = bisect.bisect_left(calendar_dates, from_date_str)
+    hi = bisect.bisect_right(calendar_dates, to_date_str)
+    return hi - lo
+
+
+def _last_trading_day_before(calendar_dates, date_str):
+    """calendar_dates中でdate_strより前の最後の取引日を返す(表示用の
+    day0_date算出のみに使う、見つからなければNone)。"""
+    idx = bisect.bisect_left(calendar_dates, date_str) - 1
+    return calendar_dates[idx] if idx >= 0 else None
 
 
 def _dedupe_history_by_date(history):
@@ -108,13 +151,18 @@ def _dedupe_history_by_date(history):
     return out
 
 
-def _compute_q5_signal(current_q, history, anchor_date):
+def _compute_q5_signal(current_q, history, anchor_date, trading_calendar=None):
     """Q5シグナル(新規購入シグナル)の状態を計算する(design: 上記
     Q5_SIGNAL_EXPIRY_DAYS参照)。既存のhistory(Qが変化した日だけを記録する
     変化ログ、redis_store/refresh.py無変更)から導出するだけの表示専用ロジック
     であり、Redisへの新規書き込みは行わない。
 
-    仕様(ユーザー確定、2026-09-17):
+    trading_calendar: _trading_days_calendar()が返す、実際に処理された取引日
+    の一覧(ソート済み)。渡された場合、経過日数は暦日差ではなく取引日数で
+    数える(2026-09-22改定)。空/Noneの場合のみ、旧来の暦日差にフォールバック
+    する(起動直後でpool_historyが空、等の縮退時のみを想定)。
+
+    仕様(ユーザー確定、2026-09-17。日数の単位は2026-09-22に暦日→取引日へ改定):
     - 判定の前に、まずhistoryを_dedupe_history_by_dateで正規化する(同一日付に
       複数のQが記録されている場合、その日の最終状態だけを採用する。2026-09-17
       の本番確認で、同日中の複数回バッチ実行により実在しない日付をDay0として
@@ -164,8 +212,15 @@ def _compute_q5_signal(current_q, history, anchor_date):
         # 通常の日次更新フローでは起こらないはずだが、念のため未確定として扱う。
         return None
     depart_date = history[last_q5_idx + 1]["date"]
-    day0_date = (date.fromisoformat(depart_date) - timedelta(days=1)).isoformat()
-    days_elapsed = _days_between(depart_date, anchor_date) + 1
+    if trading_calendar:
+        day0_date = _last_trading_day_before(trading_calendar, depart_date) or (
+            date.fromisoformat(depart_date) - timedelta(days=1)
+        ).isoformat()
+        days_elapsed = _trading_days_between(trading_calendar, depart_date, anchor_date)
+    else:
+        # 取引日カレンダーが取得できない場合のみの縮退フォールバック(暦日差)。
+        day0_date = (date.fromisoformat(depart_date) - timedelta(days=1)).isoformat()
+        days_elapsed = _days_between(depart_date, anchor_date) + 1
     status = "expired" if days_elapsed >= Q5_SIGNAL_EXPIRY_DAYS else "active"
     return {"status": status, "day0_date": day0_date, "days_elapsed": days_elapsed}
 
@@ -261,19 +316,34 @@ def _compute_q5_warning_view(warning):
     }
 
 
-def _build_quintile_view(ticker):
+def _build_quintile_view(ticker, trading_calendar=None):
     """Q1〜Q5表示用データを組み立てる。Redisの`quintile:state:<TICKER>`を
     読むだけで、Twelve Dataへのライブ呼び出しは一切行わない(design 12)。
-    まだ日次バッチで一度も判定されていない銘柄は「判定待ち」として表示する。"""
+    まだ日次バッチで一度も判定されていない銘柄は「判定待ち」として表示する。
+
+    2026-09-22追加: refresh.py側がデータ不足(ma200_devを含む9特徴量が
+    MIN_HISTORY_FOR_FULL_FEATURES件に満たない)銘柄について
+    current_q=None・data_status="insufficient"・data_days/data_days_required
+    を書き込むようになった(SKHYがQ1に固定表示される問題への対応)。この
+    関数自体はcurrent_qが無い場合を元々「pending」として扱っていたため
+    分岐構造は変えず、data_statusがあればメッセージだけをより具体的にする。"""
     state = store.get_quintile_state(ticker)
     if not state or not state.get("current_q"):
+        if state and state.get("data_status") == "insufficient" and state.get("data_days_required"):
+            message = (
+                f"データ不足のためQ判定を保留しています"
+                f"（{state.get('data_days', 0)}/{state['data_days_required']}営業日分のデータ）。"
+                "必要な営業日数が蓄積され次第、通常のQ1〜Q5判定を開始します。"
+            )
+        else:
+            message = "Q判定は次回日次更新後に反映されます。"
         return {
             "status": "pending",
             "current_q": None, "current_q_label": None,
-            "previous_q": None, "last_updated": None,
+            "previous_q": None, "last_updated": state.get("last_updated") if state else None,
             "history": [], "q5_stats": None, "q5_signal": None, "q5_progress": None,
             "q5_warning": None,
-            "message": "Q判定は次回日次更新後に反映されます。",
+            "message": message,
         }
 
     current_q = state.get("current_q")
@@ -292,16 +362,16 @@ def _build_quintile_view(ticker):
             view["q5_stats"] = quintile_logic.load_q5_stats()
         except Exception:
             view["q5_stats"] = None
-    view["q5_signal"] = _compute_q5_signal(current_q, view["history"], view["last_updated"])
+    view["q5_signal"] = _compute_q5_signal(current_q, view["history"], view["last_updated"], trading_calendar)
     view["q5_progress"] = _compute_q5_progress(state.get("q5_price_path", []))
     view["q5_warning"] = _compute_q5_warning_view(state.get("q5_warning"))
     return view
 
 
-def _build_row(ticker):
+def _build_row(ticker, trading_calendar=None):
     record = store.get_ticker_record(ticker)
     freshness = _freshness(record)
-    quintile_view = _build_quintile_view(ticker)
+    quintile_view = _build_quintile_view(ticker, trading_calendar)
 
     if not record or not record.get("last_trade_date"):
         return {
@@ -1035,7 +1105,12 @@ def delete_watchlist(ticker):
 def ranking():
     try:
         tickers = _get_watchlist()
-        rows = [_build_row(t) for t in tickers]
+        # 取引日カレンダー(quintile:pool_history由来)はティッカー間で共通のため
+        # ここで1回だけ取得し、_build_row→_build_quintile_view→_compute_q5_signal
+        # へ使い回す(2026-09-22、Q5シグナル8取引日化に伴う追加、Redis読み込み
+        # 回数を増やさないため)。
+        trading_calendar = _trading_days_calendar()
+        rows = [_build_row(t, trading_calendar) for t in tickers]
         rows = logic.sort_rows(rows)
 
         last_refresh = store.get_last_refresh()

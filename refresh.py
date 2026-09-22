@@ -222,6 +222,29 @@ def _update_quintile_state(ticker, score, bounds, date_key, price=None):
     return new_state
 
 
+def _mark_quintile_state_insufficient(ticker, date_key, data_days, data_days_required):
+    """データ不足(2026-09-22、SKHY調査を受けて追加)。ma200_devを含む9特徴量が
+    全て計算可能になるMIN_HISTORY_FOR_FULL_FEATURES件に満たない銘柄について、
+    quintile_logic.assign_quintileを一切呼ばずに「判定保留」であることだけを
+    Redisに記録する。
+
+    既存のcurrent_q/previous_q/history/q5_price_path/q5_warningはすべて
+    そのまま保持する(読み込んだprev_stateをコピーし、current_q・data_status・
+    data_days・data_days_required・last_updatedだけを上書きする)。これにより、
+    以前正常にQ5だった銘柄の履歴・クール・警告が、このデータ不足処理によって
+    壊れることはない。app.py側の_build_quintile_viewはcurrent_q=Noneを
+    既存のpending判定と同じ経路で扱う(表示層は無変更)。"""
+    prev_state = store.get_quintile_state(ticker) or {}
+    new_state = dict(prev_state)
+    new_state["current_q"] = None
+    new_state["data_status"] = "insufficient"
+    new_state["data_days"] = data_days
+    new_state["data_days_required"] = data_days_required
+    new_state["last_updated"] = date_key
+    store.set_quintile_state(ticker, new_state)
+    return new_state
+
+
 # BACKFILL_DAYS_BACK: 新規銘柄追加時に遡って再計算する日数(今日を含めて
 # BACKFILL_DAYS_BACK+1日分。app.pyの表示が「今日・昨日・2〜5日前」の6列
 # であることに合わせている)。
@@ -379,6 +402,14 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
             continue  # その日の株価データ自体がまだ存在しない(上場間もない等)
         target_date = dates[target_idx]
 
+        # データ不足(2026-09-22、SKHY調査を受けて追加): ma200_devを含む9特徴量が
+        # 全て計算可能になるMIN_HISTORY_FOR_FULL_FEATURES(200件)に満たない日は、
+        # 中央値補完だらけの不正確なQを確定させず、この日のQ判定自体をスキップする
+        # (Q1〜Q5計算ロジック・9特徴量の定義自体は無変更、判定を行うかどうかの
+        # ガードを追加しただけ)。
+        if not quintile_logic.has_min_history_for_quintile(target_idx + 1):
+            continue
+
         try:
             features = quintile_logic.compute_features(
                 dates[: target_idx + 1], closes[: target_idx + 1], volumes[: target_idx + 1],
@@ -413,7 +444,25 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
         computed.append({"date": target_date, "q": q, "score": score})
 
     if not computed:
-        print(f"[Q1-5][WARN] {ticker}: 過去分を1日も再計算できませんでした(データ不足)。")
+        if not quintile_logic.has_min_history_for_quintile(n_dates):
+            # データ不足(2026-09-22、SKHY調査を受けて追加): 中央値補完だらけの
+            # 不正確なQ1〜5を書き込まず、「データ不足」であることだけを記録する。
+            # have_quintile_historyがFalseの場合にのみこの分岐へ来るため
+            # (上のhave_both_already早期returnを参照)、既存の正常なhistory・
+            # q5_price_path・q5_warningを上書きする心配はない。
+            store.set_quintile_state(ticker, {
+                "current_q": None,
+                "data_status": "insufficient",
+                "data_days": n_dates,
+                "data_days_required": quintile_logic.MIN_HISTORY_FOR_FULL_FEATURES,
+                "last_updated": dates[-1],
+            })
+            print(
+                f"[Q1-5][PENDING] {ticker}: データ不足のためQ判定を保留します"
+                f"({n_dates}/{quintile_logic.MIN_HISTORY_FOR_FULL_FEATURES}営業日)。"
+            )
+        else:
+            print(f"[Q1-5][WARN] {ticker}: 過去分を1日も再計算できませんでした(データ不足以外の理由)。")
         return {"ok": have_legacy_record, "error_type": None, "message": None}
 
     # 既存history形式(変化した日だけを記録)に合わせて圧縮する。
@@ -429,7 +478,7 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
         "previous_q": compact_history[-2]["q"] if len(compact_history) > 1 else None,
         "pred_score": last_entry["score"],
         "history": compact_history,
-        "last_updated": date_key,
+        "last_updated": last_entry["date"],
     }
     store.set_quintile_state(ticker, new_state)
     print(
@@ -535,38 +584,87 @@ def run_quintile_refresh(api_key, watchlist):
             "pred_score": score, "last_updated": date_key, "features": features,
         })
 
-    # ⑦ rolling 252日pool更新。REFERENCE_UNIVERSE全49銘柄について、当日取得分は
-    # 新しい値を、それ以外は直近のrefpoolキャッシュ値(前回そのティッカーが
-    # ローテーション/ユーザー監視で取得された時点の値)を使う。
-    scores_by_ticker = {}
-    for sym in quintile_logic.REFERENCE_UNIVERSE:
-        if sym in scores_today:
-            scores_by_ticker[sym] = scores_today[sym]
-        else:
-            cached = store.get_refpool_score(sym)
-            if cached and cached.get("pred_score") is not None:
-                scores_by_ticker[sym] = cached["pred_score"]
+    # 実取引日ベース化(2026-09-22正式仕様、土日・米国市場休場日調査を受けて変更)。
+    # 「今日」はTwelve Dataが実際に返した最新取引日(dates[-1])とし、曜日・祝日の
+    # 個別判定は一切行わない(GitHub Actionsが土日にも起動する設計はそのまま、
+    # Twelve Data側が新しい取引日を返さないことを利用してskipする)。
+    # SPYが取得できていればSPYの最終日を優先し(毎日必ず取得する対象のため最も
+    # 信頼できる)、SPYが取得できなかった日は取得できた他の銘柄の最終日で代用する。
+    # 1件も取得できなかった日(全銘柄失敗・レート制限等)はactual_trading_date=None
+    # となり、以降のpool_history・Q1〜5状態更新を丸ごとskipする(新しい実データが
+    # 何もない以上、古い日付キーで空更新するより安全なため)。
+    actual_trading_date = None
+    if "SPY" in fetched:
+        actual_trading_date = fetched["SPY"][0][-1]
+    else:
+        for _dates, _closes, _volumes in fetched.values():
+            actual_trading_date = _dates[-1]
+            break
 
     pool_history = store.get_pool_history()
-    pool_history = quintile_logic.update_pool_history(pool_history, date_key, scores_by_ticker)
-    store.set_pool_history(pool_history)
+    prev_trading_date = None
+    if pool_history and pool_history.get("dates"):
+        prev_trading_date = pool_history["dates"][-1]
 
-    bounds = quintile_logic.pool_percentile_bounds(pool_history)
+    quintile_updated = False
+    if actual_trading_date is not None and actual_trading_date != prev_trading_date:
+        quintile_updated = True
 
-    # ⑧⑨ ユーザー監視銘柄のQ1〜Q5判定・状態履歴更新 ⑩ Redis保存(set_quintile_state内で実施)
-    if bounds is not None:
-        for ticker in watchlist[: logic.MAX_TICKERS]:
-            score = scores_today.get(ticker)
-            if score is None:
-                cached = store.get_refpool_score(ticker)
-                score = cached.get("pred_score") if cached else None
-            if score is None:
-                continue  # まだ一度もTwelve Dataで取得できていない銘柄は判定待ちのまま
-            # q5_price_path用: 当日実際に取得できた終値があれば渡す(取得できて
-            # いない日=fetched未成功の日は前回値のままpriceを渡さず、記録しない)。
-            price_today = fetched[ticker][1][-1] if ticker in fetched else None
-            state = _update_quintile_state(ticker, score, bounds, date_key, price=price_today)
-            print(f"[Q1-5][OK] {ticker}: {state['current_q']} (pred_score={score:.2f})")
+        # ⑦ rolling 252日pool更新。REFERENCE_UNIVERSE全49銘柄について、当日取得分は
+        # 新しい値を、それ以外は直近のrefpoolキャッシュ値(前回そのティッカーが
+        # ローテーション/ユーザー監視で取得された時点の値)を使う。
+        scores_by_ticker = {}
+        for sym in quintile_logic.REFERENCE_UNIVERSE:
+            if sym in scores_today:
+                scores_by_ticker[sym] = scores_today[sym]
+            else:
+                cached = store.get_refpool_score(sym)
+                if cached and cached.get("pred_score") is not None:
+                    scores_by_ticker[sym] = cached["pred_score"]
+
+        pool_history = quintile_logic.update_pool_history(pool_history, actual_trading_date, scores_by_ticker)
+        store.set_pool_history(pool_history)
+
+        bounds = quintile_logic.pool_percentile_bounds(pool_history)
+
+        # ⑧⑨ ユーザー監視銘柄のQ1〜Q5判定・状態履歴更新 ⑩ Redis保存(set_quintile_state内で実施)
+        if bounds is not None:
+            for ticker in watchlist[: logic.MAX_TICKERS]:
+                score = scores_today.get(ticker)
+                if score is None:
+                    cached = store.get_refpool_score(ticker)
+                    score = cached.get("pred_score") if cached else None
+                if score is None:
+                    continue  # まだ一度もTwelve Dataで取得できていない銘柄は判定待ちのまま
+
+                # データ不足(2026-09-22、SKHY調査を受けて追加): 当日実際に取得できた
+                # 銘柄について、ma200_devを含む9特徴量が全て計算可能になる
+                # MIN_HISTORY_FOR_FULL_FEATURES(200件)に満たない場合は、中央値補完
+                # だらけの不正確なQで確定させず「データ不足」として判定を保留する。
+                # 既存のcurrent_q/history/q5_price_path/q5_warningは一切上書きしない。
+                if ticker in fetched:
+                    ticker_dates = fetched[ticker][0]
+                    if not quintile_logic.has_min_history_for_quintile(len(ticker_dates)):
+                        _mark_quintile_state_insufficient(
+                            ticker, actual_trading_date, len(ticker_dates),
+                            quintile_logic.MIN_HISTORY_FOR_FULL_FEATURES,
+                        )
+                        print(
+                            f"[Q1-5][PENDING] {ticker}: データ不足のためQ判定を保留"
+                            f"({len(ticker_dates)}/{quintile_logic.MIN_HISTORY_FOR_FULL_FEATURES}営業日)"
+                        )
+                        continue
+
+                # q5_price_path用: 当日実際に取得できた終値があれば渡す(取得できて
+                # いない日=fetched未成功の日は前回値のままpriceを渡さず、記録しない)。
+                price_today = fetched[ticker][1][-1] if ticker in fetched else None
+                state = _update_quintile_state(ticker, score, bounds, actual_trading_date, price=price_today)
+                print(f"[Q1-5][OK] {ticker}: {state['current_q']} (pred_score={score:.2f})")
+    else:
+        print(
+            f"[Q1-5][INFO] 取引日が進んでいないため(最新取引日={actual_trading_date}、"
+            f"前回処理済み={prev_trading_date})、Q1〜Q5状態の更新をスキップします。"
+        )
 
     # 旧指標(stock_logic)側が同じ取得結果を再利用できるよう、監視銘柄分の生データ
     # (dates/closes/volumes)を戻り値に追加する(design 2026-09-17: Alpha Vantage撤去
@@ -578,6 +676,7 @@ def run_quintile_refresh(api_key, watchlist):
     return {
         "fetched": list(fetched.keys()), "failed": failed, "rate_limited": rate_limited,
         "raw_watchlist_data": raw_watchlist_data,
+        "quintile_updated": quintile_updated, "trading_date": actual_trading_date,
     }
 
 
@@ -646,7 +745,9 @@ def main():
         if td_result is not None:
             print(
                 f"[Q1-5][DONE] 取得成功 {len(td_result['fetched'])}件 / "
-                f"失敗 {len(td_result['failed'])}件 / RATE_LIMIT={td_result['rate_limited']}"
+                f"失敗 {len(td_result['failed'])}件 / RATE_LIMIT={td_result['rate_limited']} / "
+                f"取引日={td_result.get('trading_date')} / "
+                f"Q1〜5状態更新={'実施' if td_result.get('quintile_updated') else 'スキップ(取引日が進んでいない)'}"
             )
             # 旧指標側は、Q1〜5側が既に取得済みの生データを再利用するだけ
             # (追加のAPI呼び出しは発生しない)。この処理が失敗してもQ1〜5側の

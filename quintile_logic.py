@@ -23,6 +23,30 @@ Q5_STATS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quinti
 
 K_NEIGHBORS = 100
 
+# データ不足銘柄の判定基準(2026-09-22、SKHY調査を受けて追加)。
+# 9特徴量それぞれの必要レコード数(closesの長さ、stock_logic.sma・
+# quintile_logic._trail_ret60/_vol60の実装から算出):
+#   rsi=15, ma20_dev=20, volume_ratio=20, high_gap=常に計算可,
+#   ma50_dev=50, trail_ret60=61, vol60=61, ma200_dev=200,
+#   rel_strength_spy=trail_ret60(61件)に加え、当日分のSPYデータの有無にも依存。
+# 銘柄自身の価格履歴の長さだけで決まる特徴量のうち最大値はma200_dev=200件で、
+# これが実質的なボトルネックになる。rel_strength_spyは対象銘柄の履歴の長さでは
+# なく「その日SPYを取得できたか」にも依存するため、この基準には含めない
+# (backfill_quintile_history_for_new_tickerが元々SPY未取得の日はrel_strength_spy=None
+# のままTRAIN中央値補完に委ねている、design 2026-09-17と同じ扱いを踏襲する)。
+# ma200_dev(200件)を満たせば、rsi/ma20_dev/ma50_dev/volume_ratio/trail_ret60/vol60は
+# 自動的にすべて満たされる(200 > 61 > 50 > 20 > 15のため)。
+MIN_HISTORY_FOR_FULL_FEATURES = 200
+
+
+def has_min_history_for_quintile(n_records):
+    """9特徴量(rel_strength_spyを除く)がすべて計算可能になる最小レコード数
+    (MIN_HISTORY_FOR_FULL_FEATURES=200、ma200_devの要件)を満たしているかを返す。
+    quintile_logic.compute_features自体は変更しない(9特徴量の定義・欠損補完
+    ロジックには一切触れない、判定基準を追加するだけの純粋関数)。"""
+    return n_records >= MIN_HISTORY_FOR_FULL_FEATURES
+
+
 _reference_cache = None
 _q5_stats_cache = None
 
