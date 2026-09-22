@@ -251,6 +251,88 @@ def _mark_quintile_state_insufficient(ticker, date_key, data_days, data_days_req
 BACKFILL_DAYS_BACK = 5
 
 
+def _compute_backfill_day(ticker, dates, closes, volumes, target_idx, pool_history):
+    """1日分のQ1〜Q5を、その日"以前"のデータだけを使ってlook-ahead biasなしで
+    計算する(backfill_quintile_history_for_new_tickerが元々1つのループの中で
+    行っていた計算をそのまま関数化しただけで、計算内容・スキップ条件は一切
+    変更していない)。
+
+    2026-09-22追加: 戻り値に"price"(その日の終値)を加えた。Q5バックフィル
+    (過去のQ5エントリー日からq5_price_pathを復元する機能)がこの値を使う。
+    既存の呼び出し側(dateとqとscoreだけを読む)には影響しない。
+
+    戻り値: {"date":str,"q":"Q1"〜"Q5","score":float,"price":float}。
+    株価データ・pool_history・特徴量/スコア計算のいずれかが不足/失敗した日は
+    Noneを返す(この日のQは推測しない)。"""
+    n_dates = len(dates)
+    if target_idx < 0 or target_idx >= n_dates:
+        return None  # その日の株価データ自体がまだ存在しない(上場間もない等)
+    target_date = dates[target_idx]
+
+    # データ不足(2026-09-22、SKHY調査を受けて追加): ma200_devを含む9特徴量が
+    # 全て計算可能になるMIN_HISTORY_FOR_FULL_FEATURES(200件)に満たない日は、
+    # 中央値補完だらけの不正確なQを確定させず、この日のQ判定自体をスキップする
+    # (Q1〜Q5計算ロジック・9特徴量の定義自体は無変更、判定を行うかどうかの
+    # ガードを追加しただけ)。
+    if not quintile_logic.has_min_history_for_quintile(target_idx + 1):
+        return None
+
+    try:
+        features = quintile_logic.compute_features(
+            dates[: target_idx + 1], closes[: target_idx + 1], volumes[: target_idx + 1],
+        )
+    except Exception as e:
+        print(f"[Q1-5][WARN] {ticker} {target_date}: 特徴量計算に失敗、この日はスキップ: {e}")
+        return None
+
+    # その日"以前"の日付だけにpool_historyを絞り込む(未来のプール更新は
+    # 一切参照しない。dates文字列はYYYY-MM-DD形式のため単純な文字列比較で
+    # 時系列順と一致する、既存コード各所と同じ前提)。
+    filtered_scores_by_date = {
+        d: v for d, v in pool_history["scores_by_date"].items() if d <= target_date
+    }
+    if not filtered_scores_by_date:
+        return None  # その日の時点でプールにまだ何も蓄積されていない
+    filtered_pool_history = {
+        "dates": sorted(filtered_scores_by_date.keys()),
+        "scores_by_date": filtered_scores_by_date,
+    }
+    bounds = quintile_logic.pool_percentile_bounds(filtered_pool_history)
+    if bounds is None:
+        return None
+
+    try:
+        score = quintile_logic.knn_predict_score(features)
+    except Exception as e:
+        print(f"[Q1-5][WARN] {ticker} {target_date}: pred_score計算に失敗、この日はスキップ: {e}")
+        return None
+
+    q = quintile_logic.assign_quintile(score, bounds)
+    return {"date": target_date, "q": q, "score": score, "price": closes[target_idx]}
+
+
+def _find_recent_q5_entry_index(computed, entry_before_window):
+    """computed(古い→新しい順、backfill対象の直近BACKFILL_DAYS_BACK+1日分)の中から、
+    「前日がQ5ではなく、当日Q5になった日」(design 2026-09-22ユーザー確定仕様)を
+    最も新しいものから探して、そのcomputed内のindexを返す(見つからなければNone)。
+
+    computedの最古日(index 0)については、computed自体にその前日の情報が
+    無いため、entry_before_window(computedのさらに1日前を計算した結果、
+    Noneの場合もある)を仮の「前日」として使う。entry_before_windowが
+    Noneの場合、prev_qはNone扱いとなり(=Q5ではない扱い)、これは
+    _update_quintile_stateがprev_q未取得時にNoneをQ5でないものとして扱う
+    既存の慣習(is_new_cool判定等)と同じ考え方。
+
+    複数のQ5エントリーがcomputed内に存在する場合は、最も新しい(直近の)ものを
+    採用する(「新しいQ5エントリーが発生した場合は、その日を新しいDay0として
+    リセットする」というユーザー仕様通り)。"""
+    for i in range(len(computed) - 1, -1, -1):
+        prev_q = computed[i - 1]["q"] if i > 0 else (entry_before_window["q"] if entry_before_window else None)
+        if computed[i]["q"] == "Q5" and prev_q != "Q5":
+            return i
+    return None
+
+
 def backfill_quintile_history_for_new_ticker(ticker, api_key):
     """新規追加銘柄について、過去BACKFILL_DAYS_BACK日分(当日含め最大6日分)の
     Q1〜Q5をlook-ahead biasなしで再計算し、quintile:state:<TICKER>の初期
@@ -309,6 +391,18 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
       鮮度目的で不要に再計算・上書きするべきではないため)。
     結果として、Twelve Data呼び出しは「APIキー未設定/予算切れ/取得失敗」
     以外の全ケースで必ずちょうど1回だけ発生する。
+
+    2026-09-22(4回目の改修、ユーザー確定仕様): Q5バックフィル(過去エントリー
+    復元)を追加。新規銘柄追加日を勝手にQ5 Day0にはしない。過去
+    BACKFILL_DAYS_BACK(5)取引日以内に実際のQ5エントリー(前日Q5でない→
+    当日Q5)があれば、そのエントリー日をDay0としてq5_price_pathを実際の
+    取引日の終値で再構成する(休場日はTwelve Dataのdates自体に存在しない
+    ため自動的にスキップされる、曜日・祝日の個別判定は行わない)。Day5まで
+    データがあれば通常の日次更新と全く同じ条件(Day5<=-7.5%)でq5_warningも
+    復元する。過去5取引日以内にQ5エントリーが無ければq5_price_path/
+    q5_warningは一切作らない(通常の現在Q判定のみ)。9特徴量・Q1〜Q5判定
+    ロジック・既存の5営業日固定クール仕様・警告条件・40取引日失効は無変更。
+    詳細は_compute_backfill_day/_find_recent_q5_entry_index参照。
 
     戻り値: {"ok": bool, "error_type": str|None, "message": str|None}
       ok: 呼び出し後、旧指標・Q1〜5のうち少なくとも一方が(既存データ含め)
@@ -395,53 +489,20 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
         return {"ok": have_legacy_record, "error_type": None, "message": None}
 
     n_dates = len(dates)
-    computed = []  # [{"date":..., "q":...}, ...] 古い→新しい順
+    computed = []  # [{"date":..., "q":..., "score":..., "price":...}, ...] 古い→新しい順
     for k in range(BACKFILL_DAYS_BACK, -1, -1):
-        target_idx = n_dates - 1 - k
-        if target_idx < 0:
-            continue  # その日の株価データ自体がまだ存在しない(上場間もない等)
-        target_date = dates[target_idx]
+        entry = _compute_backfill_day(ticker, dates, closes, volumes, n_dates - 1 - k, pool_history)
+        if entry is not None:
+            computed.append(entry)
 
-        # データ不足(2026-09-22、SKHY調査を受けて追加): ma200_devを含む9特徴量が
-        # 全て計算可能になるMIN_HISTORY_FOR_FULL_FEATURES(200件)に満たない日は、
-        # 中央値補完だらけの不正確なQを確定させず、この日のQ判定自体をスキップする
-        # (Q1〜Q5計算ロジック・9特徴量の定義自体は無変更、判定を行うかどうかの
-        # ガードを追加しただけ)。
-        if not quintile_logic.has_min_history_for_quintile(target_idx + 1):
-            continue
-
-        try:
-            features = quintile_logic.compute_features(
-                dates[: target_idx + 1], closes[: target_idx + 1], volumes[: target_idx + 1],
-            )
-        except Exception as e:
-            print(f"[Q1-5][WARN] {ticker} {target_date}: 特徴量計算に失敗、この日はスキップ: {e}")
-            continue
-
-        # その日"以前"の日付だけにpool_historyを絞り込む(未来のプール更新は
-        # 一切参照しない。dates文字列はYYYY-MM-DD形式のため単純な文字列比較で
-        # 時系列順と一致する、既存コード各所と同じ前提)。
-        filtered_scores_by_date = {
-            d: v for d, v in pool_history["scores_by_date"].items() if d <= target_date
-        }
-        if not filtered_scores_by_date:
-            continue  # その日の時点でプールにまだ何も蓄積されていない
-        filtered_pool_history = {
-            "dates": sorted(filtered_scores_by_date.keys()),
-            "scores_by_date": filtered_scores_by_date,
-        }
-        bounds = quintile_logic.pool_percentile_bounds(filtered_pool_history)
-        if bounds is None:
-            continue
-
-        try:
-            score = quintile_logic.knn_predict_score(features)
-        except Exception as e:
-            print(f"[Q1-5][WARN] {ticker} {target_date}: pred_score計算に失敗、この日はスキップ: {e}")
-            continue
-
-        q = quintile_logic.assign_quintile(score, bounds)
-        computed.append({"date": target_date, "q": q, "score": score})
+    # Q5エントリー探索用に、6日分の探索窓("今日"含め6日、BACKFILL_DAYS_BACK+1件)の
+    # さらに1日前(k=BACKFILL_DAYS_BACK+1)も計算しておく(design 2026-09-22、下記
+    # 「Q5バックフィル(過去エントリー復元)」参照)。computed(表示・history用の
+    # 6日分)には一切混ぜず、あくまで「computedの最古日の前日がQ5だったか」を
+    # 判定するためだけに使う。
+    entry_before_window = _compute_backfill_day(
+        ticker, dates, closes, volumes, n_dates - 1 - (BACKFILL_DAYS_BACK + 1), pool_history,
+    )
 
     if not computed:
         if not quintile_logic.has_min_history_for_quintile(n_dates):
@@ -480,6 +541,33 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
         "history": compact_history,
         "last_updated": last_entry["date"],
     }
+
+    # Q5バックフィル(過去エントリー復元、design 2026-09-22ユーザー確定仕様)。
+    # 新規銘柄追加日を勝手にQ5 Day0にはしない。過去BACKFILL_DAYS_BACK取引日
+    # (=computed全体)以内に実際のQ5エントリー(前日Q5でない→当日Q5)があれば、
+    # そのエントリー日をDay0としてq5_price_pathを実際の取引日の終値で復元する
+    # (休場日はdates自体に存在しないため自動的に読み飛ばされる)。無ければ
+    # q5_price_path/q5_warningは一切作らない(=通常の現在Q判定のみを表示する、
+    # 既存の非Q5新規銘柄と同じ状態)。
+    q5_entry_idx = _find_recent_q5_entry_index(computed, entry_before_window)
+    if q5_entry_idx is not None:
+        price_path = [
+            {"date": e["date"], "price": e["price"]} for e in computed[q5_entry_idx:]
+        ]
+        just_completed_day5 = len(price_path) == MAX_Q5_PRICE_PATH_DAYS
+        warning = None
+        if just_completed_day5:
+            # Day5まで既にデータがある場合のみ、通常の日次更新と全く同じ
+            # _advance_q5_warning(Day5 <= -7.5%の条件・40取引日失効)を適用する。
+            # 新規銘柄のためprev_warning=None(それ以前の警告状態は存在しない)。
+            warning = _advance_q5_warning(None, price_path, True, price_path[-1]["date"])
+        new_state["q5_price_path"] = price_path
+        new_state["q5_warning"] = warning
+        print(
+            f"[Q1-5][OK] {ticker}: 過去のQ5エントリー({price_path[0]['date']})からq5_price_pathを復元"
+            f"(Day0〜Day{len(price_path) - 1}、warning={'あり' if warning else 'なし'})"
+        )
+
     store.set_quintile_state(ticker, new_state)
     print(
         f"[Q1-5][OK] {ticker}: バックフィル完了({len(computed)}/{BACKFILL_DAYS_BACK + 1}日分計算、"
