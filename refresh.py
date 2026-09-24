@@ -27,6 +27,7 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import beta_logic
 import quintile_logic
 import redis_store as store
 import stock_logic as logic
@@ -169,10 +170,16 @@ def _advance_q5_warning(prev_warning, price_path, just_completed_day5, date_key)
     return warning
 
 
-def _update_quintile_state(ticker, score, bounds, date_key, price=None):
+def _update_quintile_state(ticker, score, bounds, date_key, price=None, beta=None):
     """ユーザー監視銘柄1件のQ状態を判定し、状態が変化した場合のみ履歴に追記する。
     「売り」「失敗」等の否定的な意味は一切持たせず、単なる状態記録として保存する
     (design 13の方針)。current_q/previous_q/history/pred_scoreの計算は無変更。
+
+    2026-09-25追加: beta(表示専用、252営業日ローリングβ)。Q1〜Q5判定
+    (score/bounds/assign_quintile)には一切使わない、new_stateへの追記のみ。
+    その日SPYが取得できずbeta計算に失敗した場合はNoneが渡ってくるが、その
+    場合は前回値をそのまま保持する(1日の取得失敗でβ表示が消えないように
+    するため、q5_warning等ほかのフィールドと同じ「前回状態を保つ」方針)。
 
     2026-09-18追加、同日に5営業日固定クール仕様として正式化: q5_price_path
     (Q5「経過状態」表示専用、design参照)。「現在Q5かどうか」と「Q5後5営業日
@@ -216,6 +223,7 @@ def _update_quintile_state(ticker, score, bounds, date_key, price=None):
         "history": history,
         "q5_price_path": price_path,
         "q5_warning": warning,
+        "beta": beta if beta is not None else prev_state.get("beta"),
         "last_updated": date_key,
     }
     store.set_quintile_state(ticker, new_state)
@@ -746,7 +754,23 @@ def run_quintile_refresh(api_key, watchlist):
                 # q5_price_path用: 当日実際に取得できた終値があれば渡す(取得できて
                 # いない日=fetched未成功の日は前回値のままpriceを渡さず、記録しない)。
                 price_today = fetched[ticker][1][-1] if ticker in fetched else None
-                state = _update_quintile_state(ticker, score, bounds, actual_trading_date, price=price_today)
+
+                # β(表示専用、2026-09-25追加): 当日その銘柄・SPYの両方が取得できた
+                # 場合のみ計算する(追加のAPI呼び出しは発生しない、既にfetched済みの
+                # dates/closesを再利用するだけ)。片方でも欠けていればNoneのまま
+                # _update_quintile_stateに渡し、前回値を保持させる。
+                beta_today = None
+                if ticker in fetched and spy_dates is not None and spy_closes is not None:
+                    ticker_dates, ticker_closes, _ticker_volumes = fetched[ticker]
+                    try:
+                        beta_today = beta_logic.compute_beta(ticker_dates, ticker_closes, spy_dates, spy_closes)
+                    except Exception as e:
+                        print(f"[BETA][WARN] {ticker}: β計算に失敗しました: {e}", file=sys.stderr)
+                        beta_today = None
+
+                state = _update_quintile_state(
+                    ticker, score, bounds, actual_trading_date, price=price_today, beta=beta_today,
+                )
                 print(f"[Q1-5][OK] {ticker}: {state['current_q']} (pred_score={score:.2f})")
     else:
         print(

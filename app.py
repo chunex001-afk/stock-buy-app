@@ -5,6 +5,7 @@ from datetime import date, timedelta
 
 from flask import Flask, jsonify, request, render_template_string
 
+import beta_logic
 import quintile_logic
 import redis_store as store
 import stock_logic as logic
@@ -316,6 +317,28 @@ def _compute_q5_warning_view(warning):
     }
 
 
+def _build_beta_view(state):
+    """β(ベータ)の表示専用ビューを組み立てる(純粋関数、Redisアクセスなし)。
+    state["beta"](refresh._update_quintile_stateが書き込む252営業日ローリングβ、
+    quintile:state:<TICKER>の1フィールド)を読むだけで、Q1〜Q5判定
+    (pred_score・percentile境界・assign_quintile)には一切関与しない。
+
+    2026-09-25追加(ユーザー確定仕様): β<0.8低ベータ/0.8-1.3標準ベータ/
+    1.3-2.5高ベータ/2.5以上超高ベータの4区分をbeta_logic.classify_betaで
+    判定するだけの表示専用処理。252営業日分のデータが揃わずbeta=Noneの
+    場合は「β —」「ベータ算出不可」として表示する(推測値は出さない)。
+    超高ベータの場合のみ「Q1〜Q5の段階差は小さめ」という補足を追加する
+    (「差なし」とは表示しない、Q1〜Q5判定の無効化・Q5除外はしない)。"""
+    beta = (state or {}).get("beta")
+    band_key, band_label = beta_logic.classify_beta(beta)
+    return {
+        "beta": round(beta, 2) if beta is not None else None,
+        "beta_band": band_key,
+        "beta_band_label": band_label,
+        "beta_note": beta_logic.EXTREME_BETA_NOTE if band_key == "extreme" else None,
+    }
+
+
 def _build_quintile_view(ticker, trading_calendar=None):
     """Q1〜Q5表示用データを組み立てる。Redisの`quintile:state:<TICKER>`を
     読むだけで、Twelve Dataへのライブ呼び出しは一切行わない(design 12)。
@@ -343,6 +366,7 @@ def _build_quintile_view(ticker, trading_calendar=None):
             "previous_q": None, "last_updated": state.get("last_updated") if state else None,
             "history": [], "q5_stats": None, "q5_signal": None, "q5_progress": None,
             "q5_warning": None,
+            **_build_beta_view(state),
             "message": message,
         }
 
@@ -355,6 +379,7 @@ def _build_quintile_view(ticker, trading_calendar=None):
         "last_updated": state.get("last_updated"),
         "history": state.get("history", []),
         "q5_stats": None,
+        **_build_beta_view(state),
         "message": None,
     }
     if current_q == "Q5":
@@ -514,6 +539,17 @@ details.logicinfo .small{margin-top:10px}
 .q-q1{background:#f2f2f2;color:#98a2b3}.q-q2{background:#eef1f5;color:#758096}
 .q-q3{background:#eaf2ff;color:#175cd3}.q-q4{background:#fff1db;color:#9a6a00}
 .q-q5{background:#087443;color:#fff}.q-pending{background:#f2f2f2;color:#98a2b3;font-style:italic}
+/* β(ベータ)表示(design 2026-09-25、ユーザー確定仕様)。Q1〜Q5判定・
+   購入判定スコアには一切関与しない、表示専用の補足情報。 */
+.betaline{display:flex;align-items:baseline;gap:8px;margin:4px 0 2px;flex-wrap:wrap}
+.betaval{font-weight:800;font-size:13px;color:#172033}
+.betabadge{display:inline-block;padding:3px 10px;border-radius:999px;font-weight:800;font-size:11px;white-space:nowrap}
+.beta-low{background:#eef1f5;color:#758096}
+.beta-normal{background:#eaf2ff;color:#175cd3}
+.beta-high{background:#fff1db;color:#9a6a00}
+.beta-extreme{background:#fdeceb;color:#b42318}
+.beta-na{background:#f2f2f2;color:#98a2b3;font-style:italic}
+.betanote{color:#b42318;font-size:11px;font-weight:700;margin:0 0 6px}
 .q5sig{display:flex;align-items:baseline;gap:8px;margin:4px 0 2px;flex-wrap:wrap}
 .q5sig .q5sigmain{font-weight:800;font-size:13px}
 .q5sig .q5sigsub{font-size:11px;font-weight:600;opacity:.85}
@@ -690,6 +726,24 @@ function qBadgeHtml(q){
     return `<span class="qbadge q-pending">Q判定：次回日次更新後に反映</span>`;
   }
   return `<span class="qbadge ${QBADGE[q.current_q]||"q-pending"}">${esc(q.current_q_label)}</span>`;
+}
+
+// β(ベータ)表示(design 2026-09-25、ユーザー確定仕様)。Q1〜Q5判定ロジック・
+// 購入判定スコアには一切関与しない、表示専用の補足情報。252営業日分のデータが
+// 揃わずbeta===nullの場合は推測値を出さず「β —」「ベータ算出不可」と表示する。
+// 超高ベータ(β>=2.5)の場合のみ「Q1〜Q5の段階差は小さめ」を追加表示する
+// (「差なし」とは表示しない、Q1〜Q5判定の無効化・Q5除外は行わない)。
+function betaHtml(q){
+  q = q || {};
+  const hasBeta = q.beta !== null && q.beta !== undefined;
+  const betaText = hasBeta ? `β ${q.beta.toFixed(2)}` : "β —";
+  const bandCls = q.beta_band ? `beta-${q.beta_band}` : "beta-na";
+  const bandLabel = q.beta_band_label || "ベータ算出不可";
+  let html = `<div class="betaline"><span class="betaval">${esc(betaText)}</span><span class="betabadge ${bandCls}">${esc(bandLabel)}</span></div>`;
+  if(q.beta_note){
+    html += `<div class="betanote">⚠ ${esc(q.beta_note)}</div>`;
+  }
+  return html;
 }
 
 // Q5シグナル(新規購入シグナル)の有効期限表示。Q1〜Q5判定ロジックには一切
@@ -915,6 +969,7 @@ function render(rows){
         <span class="tickerbig">${esc(x.ticker)}</span>
         ${qBadgeHtml(x.quintile)}
       </div>
+      ${betaHtml(x.quintile)}
       ${q5SignalHtml(x.quintile)}
       ${q5ProgressHtml(x.quintile)}
       ${q5WarningHtml(x.quintile)}
