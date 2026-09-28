@@ -35,9 +35,11 @@ OUTPUTSIZE = 300
 ADJUST = "splits"  # 分割のみ調整、配当調整はしない(本番仕様確定・2026-09-16)
 
 # Alpha Vantage側の`stock_logic.MIN_CALL_INTERVAL`とは完全に独立した、
-# Twelve Data専用のスロットル間隔。8 credits/minute制限に対し実績のある
-# 約8秒間隔を初期値とする(環境変数で上書き可能、過剰な待機を避けるため)。
-TWELVEDATA_MIN_CALL_INTERVAL = float(os.environ.get("TWELVEDATA_MIN_CALL_INTERVAL", "8.0"))
+# Twelve Data専用のスロットル間隔。8 credits/minute制限に対し、2026-09-25に
+# 実際に発生した429(「9 API credits were used, with the current limit being 8」)
+# を踏まえ、8秒間隔(理論上限ぎりぎり)から10秒間隔に変更し安全マージンを広げた
+# (環境変数で上書き可能)。
+TWELVEDATA_MIN_CALL_INTERVAL = float(os.environ.get("TWELVEDATA_MIN_CALL_INTERVAL", "10.0"))
 
 # Basicプラン実枠は800 credits/dayだが、日次バッチの想定消費(SPY 1 + ユーザー銘柄
 # 最大15 + ローテーション3〜4 = 19〜20/日)に対して十分な安全マージンを残しつつ、
