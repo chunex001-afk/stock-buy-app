@@ -520,6 +520,50 @@ def _build_row(ticker, trading_calendar=None):
     }
 
 
+def _compute_q5_momentum_ranking(rows):
+    """「Q5勢い上位5」(design 2026-09-30、表示専用の補助ランキング)。
+
+    既存のq5_signal(8取引日で失効する新規購入シグナル、_compute_q5_signal)と
+    three_day_return/week_return(stock_logic.compute_indicators、latest close/
+    3取引日前・5取引日前比較)をそのまま読むだけの純粋関数。Q1〜Q5判定
+    (quintile_logic.py)・pred_score・購入判定・既存のランキング
+    (stock_logic.sort_rows/JS側のqSortPriority)・q5_signal自体の計算には
+    一切影響しない。新規のRedis書き込み・新規の日付計算も行わない。
+
+    対象条件(ユーザー確定仕様、current_qは問わずQ1〜Q5すべて対象):
+    - q5_signalが存在し、statusが"ok"(現在Q5)または"active"
+      (Q5から離脱済みだが取引日8日未満)。"expired"・存在しない(None)は対象外。
+    - three_day_return > 0 かつ week_return > 0(片方でも0以下・欠測なら対象外)。
+
+    順位: momentum_score = three_day_return + week_return の降順。
+    同点はthree_day_returnが高い方を上位。上位5件のみ返す(0件なら空配列、
+    呼び出し側で「Q5勢い上位5」セクション自体を非表示にする)。"""
+    candidates = []
+    for row in rows:
+        q = row.get("quintile") or {}
+        if q.get("status") != "ready":
+            continue
+        signal = q.get("q5_signal")
+        if not signal or signal.get("status") not in ("ok", "active"):
+            continue
+        three_day = row.get("three_day_return")
+        week = row.get("week_return")
+        if three_day is None or week is None:
+            continue
+        if not (three_day > 0 and week > 0):
+            continue
+        candidates.append({
+            "ticker": row.get("ticker"),
+            "current_q": q.get("current_q"),
+            "current_q_label": q.get("current_q_label"),
+            "three_day_return": three_day,
+            "week_return": week,
+            "momentum_score": round(three_day + week, 2),
+        })
+    candidates.sort(key=lambda c: (-c["momentum_score"], -c["three_day_return"]))
+    return candidates[:5]
+
+
 def _get_watchlist():
     tickers = store.get_watchlist()
     if not tickers:
@@ -582,6 +626,17 @@ details.logicinfo .small{margin-top:10px}
 .heroline{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px}
 .heroticker{font-size:26px;font-weight:900;letter-spacing:.01em}
 .herocomment{font-size:14px;line-height:1.75;background:rgba(255,255,255,.16);border-radius:14px;padding:14px 16px}
+
+/* 「Q5勢い上位5」(design 2026-09-30)。既存のq5_signal・3日間/1週間の値を
+   読んで並べ替えるだけの表示専用セクション。current_q・pred_score・購入判定・
+   ランキング・q5_signal自体の計算には一切関与しない。 */
+.q5mom{background:#fff7ed;border:1px solid #fed7aa;border-radius:20px;padding:16px 18px;margin-bottom:18px}
+.q5momtitle{font-size:14px;font-weight:900;color:#9a3412;margin-bottom:10px}
+.q5momrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 0;border-top:1px solid #fed7aa}
+.q5momrow:first-of-type{border-top:none}
+.q5momrank{font-size:15px;font-weight:900;min-width:22px}
+.q5momticker{font-size:15px;font-weight:900;min-width:56px}
+.q5momstat{font-size:12px;font-weight:700;color:#475467}
 
 .list{display:grid;grid-template-columns:1fr;gap:14px}
 @media(min-width:760px){.list{grid-template-columns:repeat(2,1fr)}}
@@ -701,6 +756,7 @@ details.logicinfo .small{margin-top:10px}
   <details class="opinfo"><summary>運用情報</summary><div id="opinfo" class="opbody"></div></details>
 </div>
 
+<div id="q5momentum"></div>
 <div id="hero"></div>
 <div class="list" id="list"></div>
 </div>
@@ -728,10 +784,37 @@ async function updateRanking(extraMsg){
     const j=await r.json();
     if(!j.ok) throw new Error(j.error||"取得失敗");
     render(j.rows);
+    renderQ5Momentum(j.q5_momentum);
     renderOpInfo(j);
     renderTickerCount(j);
     document.getElementById("status").textContent = extraMsg || "";
   }catch(e){document.getElementById("status").textContent="エラー："+e.message}
+}
+
+// 「Q5勢い上位5」(design 2026-09-30)。サーバー側app._compute_q5_momentum_
+// rankingが組み立てた配列(既に条件判定・並べ替え・上位5件絞り込み済み)を
+// そのまま描画するだけの表示専用関数。JS側でのフィルタ・ソートは行わない
+// (current_q・q5_signal・3日間/1週間の判定ロジック自体はPython側の純粋関数
+// に一本化し、テスト可能にするため)。0件の場合はセクション自体を非表示にする。
+const Q5MOM_MEDALS = ["🥇","🥈","🥉"];
+function renderQ5Momentum(list){
+  const el = document.getElementById("q5momentum");
+  if(!el) return;
+  if(!list || !list.length){ el.innerHTML = ""; return; }
+  const rows = list.map((m,i)=>{
+    const rank = Q5MOM_MEDALS[i] || String(i+1);
+    return `<div class="q5momrow">
+      <span class="q5momrank">${rank}</span>
+      <span class="q5momticker">${esc(m.ticker)}</span>
+      <span class="qbadge ${QBADGE[m.current_q]||"q-pending"}">${esc(m.current_q_label||m.current_q||"—")}</span>
+      <span class="q5momstat">3日 ${fmt(m.three_day_return,"%")}</span>
+      <span class="q5momstat">1週間 ${fmt(m.week_return,"%")}</span>
+    </div>`;
+  }).join("");
+  el.innerHTML = `<div class="q5mom">
+    <div class="q5momtitle">🔥 Q5勢い上位5</div>
+    ${rows}
+  </div>`;
 }
 
 // 登録銘柄数の表示(design 2026-09-18)。/api/rankingが返すrows(=現在の
@@ -1230,6 +1313,7 @@ def ranking():
         return jsonify({
             "ok": True,
             "rows": rows,
+            "q5_momentum": _compute_q5_momentum_ranking(rows),
             "last_refresh": last_refresh_view,
             "budget": {"used": used, "limit": td.DAILY_API_BUDGET, "remaining": budget_left},
             "max_tickers": logic.MAX_TICKERS,
