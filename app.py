@@ -443,7 +443,15 @@ def _build_quintile_view(ticker, trading_calendar=None):
         except Exception:
             view["q5_stats"] = None
     view["q5_signal"] = _compute_q5_signal(current_q, view["history"], view["last_updated"], trading_calendar)
-    view["q5_progress"] = _compute_q5_progress(state.get("q5_price_path", []))
+    q5_progress = _compute_q5_progress(state.get("q5_price_path", []))
+    # 2026-09-30監査対応: q5_signalが存在しない(一度もQ5になっていない)、
+    # または失効(expired)している間はq5_progress(「Q5 Day N」表示)を出さない
+    # (表示条件のみの変更。q5_progressの計算ロジック自体・q5_price_path/
+    # history/q5_warningのデータはいずれも無変更。current_q==Q5(status=ok)や
+    # 離脱直後でシグナルがまだactiveな間は従来通り表示する)。
+    if view["q5_signal"] is None or view["q5_signal"]["status"] == "expired":
+        q5_progress = None
+    view["q5_progress"] = q5_progress
     view["q5_warning"] = _compute_q5_warning_view(state.get("q5_warning"))
 
     # 「過去5日」表示・Q5継続日数(2026-09-29修正: 暦日ベースから取引日ベースに
