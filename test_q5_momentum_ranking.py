@@ -104,5 +104,37 @@ class RankingOrderTests(unittest.TestCase):
         self.assertAlmostEqual(result[0]["momentum_score"], 7.5)
 
 
+class DisplayNoLongerShowsCurrentQTests(unittest.TestCase):
+    """2026-09-30(2回目)の表示変更: 「🔥 Q5勢い上位5」から現在Q(Q1〜Q5)
+    バッジを削除し、順位・銘柄・3日間・1週間の4項目のみ表示するようにした
+    ことを確認する。判定ロジック(app._compute_q5_momentum_ranking)自体は
+    無変更で、current_q/current_q_labelは引き続き返り値に含まれる
+    (JS側の描画だけが変更対象)。"""
+
+    def test_ranking_logic_still_returns_current_q_fields(self):
+        rows = [_row("A", "Q5", "ok", 3.0, 4.5)]
+        result = app._compute_q5_momentum_ranking(rows)
+        # 判定ロジック自体は変更していないため、current_q/current_q_labelは
+        # データとしては引き続き返る(表示に使わないだけ)。
+        self.assertEqual(result[0]["current_q"], "Q5")
+        self.assertEqual(result[0]["current_q_label"], "Q5")
+
+    def test_js_render_no_longer_renders_qbadge_for_current_q(self):
+        self.assertNotIn('QBADGE[m.current_q]', app.HTML)
+
+    def test_js_render_still_shows_rank_ticker_three_day_week(self):
+        # renderQ5Momentum関数の描画テンプレート断片が、順位・銘柄・3日間・
+        # 1週間の4項目のみで構成されていることを確認する。
+        start = app.HTML.index("function renderQ5Momentum")
+        end = app.HTML.index("\n}", start)
+        body = app.HTML[start:end]
+        self.assertIn("q5momrank", body)
+        self.assertIn("q5momticker", body)
+        self.assertIn("m.three_day_return", body)
+        self.assertIn("m.week_return", body)
+        self.assertNotIn("qbadge", body)
+        self.assertNotIn("current_q", body)
+
+
 if __name__ == "__main__":
     unittest.main()

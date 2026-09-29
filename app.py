@@ -806,7 +806,6 @@ function renderQ5Momentum(list){
     return `<div class="q5momrow">
       <span class="q5momrank">${rank}</span>
       <span class="q5momticker">${esc(m.ticker)}</span>
-      <span class="qbadge ${QBADGE[m.current_q]||"q-pending"}">${esc(m.current_q_label||m.current_q||"—")}</span>
       <span class="q5momstat">3日 ${fmt(m.three_day_return,"%")}</span>
       <span class="q5momstat">1週間 ${fmt(m.week_return,"%")}</span>
     </div>`;
