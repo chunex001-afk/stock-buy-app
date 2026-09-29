@@ -401,7 +401,8 @@ def _build_row(ticker, trading_calendar=None):
     if not record or not record.get("last_trade_date"):
         return {
             "ticker": ticker,
-            "price": None, "change_pct": None, "month_return": None,
+            "price": None, "change_pct": None,
+            "three_day_return": None, "week_return": None, "month_return": None,
             "rsi14": None, "ma20": None, "ma50": None,
             "high_gap": None, "volume_ratio": None,
             "upside_score": None, "overheat_score": None,
@@ -419,6 +420,8 @@ def _build_row(ticker, trading_calendar=None):
         "ticker": ticker,
         "price": record.get("price"),
         "change_pct": record.get("change_pct"),
+        "three_day_return": record.get("three_day_return"),
+        "week_return": record.get("week_return"),
         "month_return": record.get("month_return"),
         "rsi14": record.get("rsi14"),
         "ma20": record.get("ma20"),
@@ -523,6 +526,12 @@ details.logicinfo .small{margin-top:10px}
 .statval{font-size:16px;font-weight:800;white-space:nowrap}
 .statval.up{color:#087443}.statval.down{color:#b42318}
 .captag{display:block;font-size:10px;color:#98a2b3;font-weight:600;margin-top:1px}
+
+/* 株価・RSI(現在値の補足情報、design 2026-09-29)。値動き比較用のstatrowから
+   分離し、横幅を圧迫しない控えめな1行にまとめて表示する(表示専用、Q1〜Q5
+   判定・購入判定・スコア・ランキングには無関係)。 */
+.pricebar{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px;font-size:12px;color:#758096}
+.pricebar b{color:#172033;font-size:13px;font-weight:800}
 
 .newsblock{font-size:13px;line-height:1.7;margin-bottom:10px}
 .newsblock a{color:#175cd3;text-decoration:none}
@@ -976,11 +985,15 @@ function render(rows){
       ${qDailyBreakdownHtml(x.quintile)}
       ${q5StatsHtml(x.quintile)}
 
+      <div class="pricebar">
+        <span>株価 <b>${fmt(x.price)}</b></span>
+        <span>RSI14 <b>${fmt(x.rsi14)}</b></span>
+      </div>
       <div class="statrow">
-        <div class="stat"><div class="statlabel">株価</div><div class="statval">${fmt(x.price)}</div></div>
         <div class="stat"><div class="statlabel">前日比</div><div class="statval ${x.change_pct>0?'up':x.change_pct<0?'down':''}">${fmt(x.change_pct,"%")}</div></div>
+        <div class="stat"><div class="statlabel">3日間</div><div class="statval ${x.three_day_return>0?'up':x.three_day_return<0?'down':''}">${fmt(x.three_day_return,"%")}</div></div>
+        <div class="stat"><div class="statlabel">1週間</div><div class="statval ${x.week_return>0?'up':x.week_return<0?'down':''}">${fmt(x.week_return,"%")}</div></div>
         <div class="stat"><div class="statlabel">1ヶ月</div><div class="statval ${x.month_return>0?'up':x.month_return<0?'down':''}">${fmt(x.month_return,"%")}</div></div>
-        <div class="stat"><div class="statlabel">RSI14</div><div class="statval">${fmt(x.rsi14)}</div></div>
       </div>
 
       <div class="cardfoot">

@@ -95,10 +95,17 @@ def compute_indicators(dates, closes, volumes):
     avg_vol20 = sma(volumes, 20)
     vol_ratio = (volumes[-1] / avg_vol20) if avg_vol20 else None
 
+    # 3日間・1週間騰落率(design 2026-09-29、表示専用)。Q1〜Q5判定・購入判定
+    # スコア・ランキングには一切使わない、短期の強弱を目視確認するための指標。
+    three_day_ago = closes[-4] if len(closes) >= 4 else None
+    week_ago = closes[-6] if len(closes) >= 6 else None
+
     return {
         "last_trade_date": dates[-1],
         "price": round(latest, 2),
         "change_pct": round((latest / prev - 1) * 100, 2),
+        "three_day_return": round((latest / three_day_ago - 1) * 100, 2) if three_day_ago else None,
+        "week_return": round((latest / week_ago - 1) * 100, 2) if week_ago else None,
         "month_return": round((latest / one_month - 1) * 100, 2),
         "ma20": round(ma20, 2) if ma20 is not None else None,
         "ma50": round(ma50, 2) if ma50 is not None else None,
@@ -638,6 +645,8 @@ def build_result(ticker, dates, closes, volumes, news_items=None,
         "last_trade_date": ind["last_trade_date"],
         "price": ind["price"],
         "change_pct": ind["change_pct"],
+        "three_day_return": ind["three_day_return"],
+        "week_return": ind["week_return"],
         "month_return": ind["month_return"],
         "rsi14": ind["rsi"],
         "ma20": ind["ma20"],

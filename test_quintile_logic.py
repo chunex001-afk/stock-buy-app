@@ -175,7 +175,7 @@ class TestExistingLogicUnchanged(unittest.TestCase):
         dates, closes, volumes = self._synthetic_series()
         ind = stock_logic.compute_indicators(dates, closes, volumes)
         expected_keys = {
-            "last_trade_date", "price", "change_pct", "month_return",
+            "last_trade_date", "price", "change_pct", "three_day_return", "week_return", "month_return",
             "ma20", "ma50", "ma20_slope", "rsi", "high_gap", "low_gap", "volume_ratio",
         }
         self.assertEqual(set(ind.keys()), expected_keys)
