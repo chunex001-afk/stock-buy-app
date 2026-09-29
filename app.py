@@ -133,11 +133,66 @@ def _last_trading_day_before(calendar_dates, date_str):
     return calendar_dates[idx] if idx >= 0 else None
 
 
+def _trading_day_offset(calendar_dates, anchor_date, n):
+    """calendar_dates(ソート済み)の中で、anchor_dateからn取引日前の日付を
+    返す(n=0でanchor_date自身、2026-09-29追加: 「過去5日」表示を暦日ベース
+    から取引日ベースに統一するための土台)。anchor_date自体がcalendar_dates
+    に無い場合は、anchor_date以下の直近の取引日を起点として数える。
+    該当する日がcalendar_dates内に無い(データ不足)場合はNoneを返す
+    (架空の取引日は作らない)。"""
+    idx = bisect.bisect_right(calendar_dates, anchor_date) - 1
+    if idx < 0:
+        return None
+    target_idx = idx - n
+    if target_idx < 0:
+        return None
+    return calendar_dates[target_idx]
+
+
+def _resolve_q_for_date(history, target_date):
+    """historyから、target_date以前の最新のQを前方補完(carry-forward)で
+    返す(2026-09-29追加: 従来JS側にあったresolveQForDateと同じロジックを
+    Python側へ移設。過去のデータそのものを書き換えたり推測で作ったりはせず、
+    表示上の補完のみを行う)。historyはdate昇順(_dedupe_history_by_date適用後)
+    である前提。target_date以前に一件もエントリが無ければNoneを返す。"""
+    result = None
+    for h in history:
+        if h["date"] <= target_date:
+            result = h["q"]
+        else:
+            break
+    return result
+
+
+def _build_daily_breakdown(history, current_q, anchor_date, trading_calendar):
+    """「今日・昨日・2〜5日前(計6日分)」のQ状態を、実際の取引日ベースで
+    組み立てる(2026-09-29修正: 従来は暦日ベースの日付計算〈土日祝日も
+    1日として数えてしまう〉だった不整合の修正、design: BEの監査で確認)。
+    trading_calendarが空/取得できない場合、「今日」以外は算出できないため
+    date/qともNoneを返す(暦日への安易なフォールバックはしない、architecture
+    上「実際に存在した取引日」以外を推測で作らないため)。"""
+    history = _dedupe_history_by_date(history or [])
+    labels = ["今日", "昨日", "2日前", "3日前", "4日前", "5日前"]
+    result = []
+    for i, label in enumerate(labels):
+        if i == 0:
+            result.append({"label": label, "date": anchor_date, "q": current_q})
+            continue
+        if not trading_calendar:
+            result.append({"label": label, "date": None, "q": None})
+            continue
+        target_date = _trading_day_offset(trading_calendar, anchor_date, i)
+        q = _resolve_q_for_date(history, target_date) if target_date else None
+        result.append({"label": label, "date": target_date, "q": q})
+    return result
+
+
 def _dedupe_history_by_date(history):
-    """同じ日付のエントリが連続する場合、その日の最終状態だけを残す。
-    JS側のdedupeHistoryByDate(今日〜5日前テーブルの表示に使用)と全く同じ
-    正規化をPython側でも行う(design: 2026-09-17本番確認で発覚した不整合の
-    修正)。同日中にQ1〜5バッチが複数回実行され、その都度プール境界が変わって
+    """同じ日付のエントリが連続する場合、その日の最終状態だけを残す
+    (design: 2026-09-17本番確認で発覚した不整合の修正。2026-09-29に、
+    今日〜5日前テーブルの計算をJS側からPython側〈_build_daily_breakdown〉へ
+    移設したことに伴い、この正規化も含めて完全にPython側へ一本化した)。
+    同日中にQ1〜5バッチが複数回実行され、その都度プール境界が変わって
     Q値が複数回変化した場合でも(例: 同日中にQ5→Q2→Q3のように記録された場合)、
     「その日に実際にQ5だったこと」にはならない(最終的にQ5でなかった以上、
     その日をQ5として扱うと架空の実績になってしまうため)。既存のhistory保存
@@ -365,7 +420,7 @@ def _build_quintile_view(ticker, trading_calendar=None):
             "current_q": None, "current_q_label": None,
             "previous_q": None, "last_updated": state.get("last_updated") if state else None,
             "history": [], "q5_stats": None, "q5_signal": None, "q5_progress": None,
-            "q5_warning": None,
+            "q5_warning": None, "daily_breakdown": [], "q5_continuation_days": None,
             **_build_beta_view(state),
             "message": message,
         }
@@ -390,6 +445,20 @@ def _build_quintile_view(ticker, trading_calendar=None):
     view["q5_signal"] = _compute_q5_signal(current_q, view["history"], view["last_updated"], trading_calendar)
     view["q5_progress"] = _compute_q5_progress(state.get("q5_price_path", []))
     view["q5_warning"] = _compute_q5_warning_view(state.get("q5_warning"))
+
+    # 「過去5日」表示・Q5継続日数(2026-09-29修正: 暦日ベースから取引日ベースに
+    # 統一)。trading_calendarが無い場合はdaily_breakdownの「今日」以外・
+    # q5_continuation_daysともNoneのままとなり、フロント側は「—」として表示する
+    # (暦日への安易なフォールバックはしない)。
+    view["daily_breakdown"] = _build_daily_breakdown(
+        view["history"], current_q, view["last_updated"], trading_calendar,
+    )
+    view["q5_continuation_days"] = None
+    if current_q == "Q5" and view["history"] and trading_calendar:
+        last_entry_date = _dedupe_history_by_date(view["history"])[-1]["date"]
+        view["q5_continuation_days"] = _trading_days_between(
+            trading_calendar, last_entry_date, view["last_updated"],
+        )
     return view
 
 
@@ -759,11 +828,17 @@ function betaHtml(q){
 // 関与しない、状態管理・表示専用(design: 2026-09-17のバックテスト検証に基づき
 // 最後にQ5になった日から8日間を新規購入シグナルの有効期間とする)。
 // Q5からの低下は売却シグナルではない(既存保有分の判断には使わない)。
+// 2026-09-29修正: 「ok」時に固定文言「Q5 Day 0」を表示していたのを廃止した
+// (このバッジのsig.days_elapsedは元々「現在Q5なら常に0」という固定値であり、
+// 実際の継続日数ではない。実際の継続日数はq5_progress側(q5ProgressHtml、
+// 「Q5 Day N」)が正しく数えているため、CIFR等のようにこのバッジと
+// q5_progressバッジで異なる「Day」の値が同時表示される不整合があった。
+// design: CIFR/AEHR/AXTI/MXL/NBISの監査で確認)。
 function q5SignalHtml(q){
   if(!q || q.status !== "ready" || !q.q5_signal) return "";
   const sig = q.q5_signal;
   if(sig.status === "ok"){
-    return `<div class="q5sig q5sig-ok"><span class="q5sigmain">🟢 購入OK</span><span class="q5sigsub">Q5 Day 0</span></div>`;
+    return `<div class="q5sig q5sig-ok"><span class="q5sigmain">🟢 購入OK</span><span class="q5sigsub">Q5シグナル有効</span></div>`;
   }
   if(sig.status === "active"){
     return `<div class="q5sig q5sig-active"><span class="q5sigmain">前回Q5から${sig.days_elapsed}日</span><span class="q5sigsub">Q5シグナル有効</span></div>`;
@@ -832,73 +907,24 @@ function q5WarningHtml(q){
   </div>`;
 }
 
-// 同じ日付のエントリが連続する場合(同日に複数回バッチが走った場合など)、
-// その日の最新の状態だけを残す。日付をまたいだ本来の状態推移(例: 9/15 Q5 →
-// 9/16 Q2)はそのまま表示する(2026-09-16のUI修正で追加、表示層のみの対応)。
-function dedupeHistoryByDate(history){
-  const out = [];
-  for(const h of history){
-    if(out.length && out[out.length-1].date === h.date){
-      out[out.length-1] = h;
-    }else{
-      out.push(h);
-    }
-  }
-  return out;
-}
-
-// dateStr("YYYY-MM-DD")にnDays日を加算した日付文字列を返す(負数で過去方向)。
-function addDaysToDateStr(dateStr, nDays){
-  const d = new Date(dateStr + "T00:00:00Z");
-  d.setUTCDate(d.getUTCDate() + nDays);
-  return d.toISOString().slice(0, 10);
-}
-
-function daysBetweenDateStr(fromStr, toStr){
-  const a = new Date(fromStr + "T00:00:00Z");
-  const b = new Date(toStr + "T00:00:00Z");
-  return Math.round((b - a) / 86400000);
-}
-
-// historyの保存方式(Qが変化した日だけ記録)はそのまま前提とし、表示層だけで
-// 「直近の確定した状態」を前方補完(carry-forward)する。historyはdate昇順
-// (dedupeHistoryByDate適用後)である前提で、targetDate以前の最新エントリを
-// 探す。それより前に一件もエントリがない日は「未確定」として「—」を返す
-// (過去のデータそのものを書き換えたり推測で作ったりはしない、表示上の補完のみ)。
-function resolveQForDate(history, targetDate){
-  let result = null;
-  for(const h of history){
-    if(h.date <= targetDate) result = h.q;
-    else break;
-  }
-  return result;
-}
-
 // 今日・昨日・2〜5日前(計6日分)のQ状態と、Q5継続日数を横長の表で表示する。
-// バックエンド(history保存方式・refresh.py・quintile_logic.py・Q1〜Q5判定
-// ロジック)は一切変更しない、表示層のみの対応。2026-09-17のUI修正で
-// 5日分→6日分・縦並びの補完なし表示→横長テーブル+前方補完表示に変更。
+// 2026-09-29修正: 日付計算(取引日オフセット・前方補完)は全てバックエンド
+// (app.py: _build_daily_breakdown/_resolve_q_for_date、実取引日カレンダー
+// ベース)側で行うようになり、ここは受け取ったq.daily_breakdown/
+// q.q5_continuation_daysをそのまま描画するだけになった(従来JS側にあった
+// 暦日ベースのaddDaysToDateStr/daysBetweenDateStrは、土日を挟むと「N日前」
+// が実際のN取引日前とズレる不整合があったため廃止、design: BEの監査で確認)。
+// バックエンド側のhistory保存方式・refresh.py・quintile_logic.py・Q1〜Q5
+// 判定ロジックは一切変更していない。
 function qDailyBreakdownHtml(q){
-  if(!q || q.status !== "ready" || !q.last_updated) return "";
-  const history = dedupeHistoryByDate(q.history || []);
-  const anchor = q.last_updated;
-  const labels = ["今日", "昨日", "2日前", "3日前", "4日前", "5日前"];
+  if(!q || q.status !== "ready" || !q.daily_breakdown || !q.daily_breakdown.length) return "";
 
-  const values = labels.map((label, i) => {
-    // 今日は必ずcurrent_q(最新の実際の判定結果)を使う。
-    if(i === 0) return q.current_q;
-    const targetDate = addDaysToDateStr(anchor, -i);
-    return resolveQForDate(history, targetDate);
-  });
-
-  const headCells = labels.map(l => `<th>${esc(l)}</th>`).join("");
-  const valCells = values.map(v => `<td>${v ? esc(v) : "—"}</td>`).join("");
+  const headCells = q.daily_breakdown.map(d => `<th>${esc(d.label)}</th>`).join("");
+  const valCells = q.daily_breakdown.map(d => `<td>${d.q ? esc(d.q) : "—"}</td>`).join("");
 
   let cont = "";
-  if(q.current_q === "Q5" && history.length){
-    const lastEntry = history[history.length - 1];
-    const days = daysBetweenDateStr(lastEntry.date, anchor) + 1;
-    cont = `<div class="qcont">Q5継続：${days}日</div>`;
+  if(q.current_q === "Q5" && q.q5_continuation_days != null){
+    cont = `<div class="qcont">Q5継続：${q.q5_continuation_days}日</div>`;
   }
 
   return `<div class="qdaily-wrap"><table class="qdaily-table"><thead><tr>${headCells}</tr></thead>`

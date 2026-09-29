@@ -23,6 +23,7 @@ twelvedata_client経由になり、旧指標(stock_logic.build_result、株価�
   撤去作業で一切変更していない
 """
 
+import bisect
 import os
 import sys
 from datetime import datetime, timezone
@@ -170,7 +171,73 @@ def _advance_q5_warning(prev_warning, price_path, just_completed_day5, date_key)
     return warning
 
 
-def _update_quintile_state(ticker, score, bounds, date_key, price=None, beta=None):
+def _true_q5_day0(history):
+    """historyから見て「現在のQ5クールが起点とすべき正しいDay0」を返す
+    (=最後にQ5になった日)。app.pyの_compute_q5_signalが行っている
+    「historyの末尾から最初に見つかるQ5エントリ」と全く同じ考え方を使い、
+    q5_price_path側の起点をそれと同期させるための基準にする
+    (2026-09-29追加、design: BE/MXL/AXTI/AEHRで確認された不整合の修正)。
+    一度もQ5になっていなければNone。"""
+    for h in reversed(history):
+        if h.get("q") == "Q5":
+            return h["date"]
+    return None
+
+
+def _reconcile_price_path(price_path, true_day0, trading_calendar, date_key, dates, closes):
+    """q5_price_pathをtrue_day0(_true_q5_day0の結果)基準で整合させる
+    (2026-09-29追加、design: BE/MXL/AXTI/AEHRで確認された不整合の修正)。
+
+    - price_pathの先頭がtrue_day0と食い違っている場合(古いQ5クールの
+      残骸をq5_price_pathだけが引きずっている、またはDay0自体の取得が
+      その日失敗して記録されなかった場合)、price_pathを空にしてtrue_day0
+      から作り直す。これにより、Q5再発時は必ず新しいDay0になり
+      (q5_signalと起点ルールが揃う)、過去に生じた不整合データも次回の
+      日次更新で自動的に復旧する。
+    - true_day0からdate_key未満までの実取引日(trading_calendar基準)の
+      うち、price_pathにまだ無い日を、dates/closes(当日取得できた銘柄の
+      全期間終値、outputsize=full)から実際の終値を引いて補完する。ある
+      銘柄の取得が特定の日だけ失敗しても、翌日以降にoutputsize=fullで
+      再取得できれば、その抜けていた日の実際の終値からDay経過を復元できる
+      (架空の値は作らない。dates内に見つからない日は補完せずそのまま
+      スキップする)。
+    - MAX_Q5_PRICE_PATH_DAYSを超えては補完しない(先頭=Day0は保持する)。
+    - trading_calendar/dates/closesが利用できない場合(pool_history未初期化
+      直後・当日の取得自体が失敗した等)は、起点の食い違いチェックだけを
+      行い(架空の値を作れないため)、欠測補完は行わない。
+    - historyは一切参照・変更しない(引数として読むだけ)。既存の
+      current_q/previous_q/history/pred_scoreの計算・quintile_logic.py
+      (Q1〜Q5判定ロジック本体)には一切影響しない、q5_price_path専用の
+      整合処理。"""
+    if true_day0 is None:
+        return []
+    if price_path and price_path[0]["date"] != true_day0:
+        price_path = []
+    if not trading_calendar or dates is None or closes is None:
+        return price_path
+
+    lo = bisect.bisect_left(trading_calendar, true_day0)
+    hi = bisect.bisect_left(trading_calendar, date_key)  # 当日分はこの後の通常追記処理に任せる
+    window = trading_calendar[lo:hi]
+    have_dates = {e["date"] for e in price_path}
+    date_to_close = dict(zip(dates, closes))
+
+    filled = list(price_path)
+    for d in window:
+        if len(filled) >= MAX_Q5_PRICE_PATH_DAYS:
+            break
+        if d in have_dates:
+            continue
+        close = date_to_close.get(d)
+        if close is None:
+            continue  # この日の終値が無ければ復元しない(架空値は作らない)
+        filled.append({"date": d, "price": close})
+    filled.sort(key=lambda e: e["date"])
+    return filled
+
+
+def _update_quintile_state(ticker, score, bounds, date_key, price=None, beta=None,
+                            trading_calendar=None, dates=None, closes=None):
     """ユーザー監視銘柄1件のQ状態を判定し、状態が変化した場合のみ履歴に追記する。
     「売り」「失敗」等の否定的な意味は一切持たせず、単なる状態記録として保存する
     (design 13の方針)。current_q/previous_q/history/pred_scoreの計算は無変更。
@@ -183,17 +250,26 @@ def _update_quintile_state(ticker, score, bounds, date_key, price=None, beta=Non
 
     2026-09-18追加、同日に5営業日固定クール仕様として正式化: q5_price_path
     (Q5「経過状態」表示専用、design参照)。「現在Q5かどうか」と「Q5後5営業日
-    のクール」は別管理: 新規にQ5へ突入した日(前日Q5でない→当日Q5)で、かつ
-    直前のクールが既にDay5まで終了している(またはそもそもクールが無い)場合
-    にのみ空にリセットして新Day0を開始する。クールの途中でQ4以下に戻っても・
-    途中で再びQ5になっても、そのクールの観測(Day0〜Day5)は継続してリセット
-    しない。Day0〜Day5(MAX_Q5_PRICE_PATH_DAYS件)に達したらクールは終了し、
-    それ以上は追記しない(先頭=Day0は上書き・切り捨てしない)。
+    のクール」は別管理: Day0〜Day5(MAX_Q5_PRICE_PATH_DAYS件)に達したら
+    クールは終了し、それ以上は追記しない(先頭=Day0は上書き・切り捨てしない)。
     Day5に到達した回だけ、_advance_q5_warningでその時点のQ5起点騰落率を見て
     注意喚起(q5_warning)の発生を判定する。q5_warningはクールの状態とは独立に
     保持・失効する(design参照)。
+
+    2026-09-29改定(design: BE/MXL/AXTI/AEHRで確認された不整合の修正):
+    「Q4以下に戻ってもクールは継続」という点は変更しないが、「途中で再び
+    Q5になった場合」は、app.py側のQ5シグナル(_compute_q5_signal)と方針を
+    統一し、常に新しいDay0としてリセットするように改めた(以前は、直前の
+    クールが未完了〈Day5未到達〉ならリセットしない仕様だったが、これが
+    「Q5状態管理(q5_price_path)」と「Q5シグナル(q5_signal)」とで再発時の
+    起点が食い違う原因になっていたため)。また、取得失敗で特定の日だけ
+    q5_price_pathへの追記が抜けた場合に、翌日以降のoutputsize=full取得
+    (dates/closes)を使って実際の終値からその日を復元できるようにした
+    (_reconcile_price_path参照)。trading_calendar/dates/closesが渡されない
+    場合(pool_history未初期化時・単体呼び出し等)は、起点の食い違いだけを
+    修正し、欠測補完は行わない従来同等の縮退動作にフォールバックする。
     いずれもapp.py側の表示専用ロジックが読むだけで、quintile_logic.py・
-    history・pred_score・既存のQ5シグナルには一切影響しない。"""
+    history・pred_score・既存のQ5シグナル・Q5警告ロジックには一切影響しない。"""
     q = quintile_logic.assign_quintile(score, bounds)
     prev_state = store.get_quintile_state(ticker) or {}
     prev_q = prev_state.get("current_q")
@@ -203,17 +279,17 @@ def _update_quintile_state(ticker, score, bounds, date_key, price=None, beta=Non
         history.append({"date": date_key, "q": q})
         history = history[-MAX_QUINTILE_STATE_HISTORY:]
 
-    price_path = list(prev_state.get("q5_price_path", []))
-    cool_already_ended = len(price_path) >= MAX_Q5_PRICE_PATH_DAYS
-    is_new_cool = q == "Q5" and prev_q != "Q5" and (not price_path or cool_already_ended)
-    if is_new_cool:
-        price_path = []
-    just_completed_day5 = False
+    prev_price_path = list(prev_state.get("q5_price_path", []))
+    was_complete_before = len(prev_price_path) >= MAX_Q5_PRICE_PATH_DAYS
+
+    true_day0 = _true_q5_day0(history)
+    price_path = _reconcile_price_path(prev_price_path, true_day0, trading_calendar, date_key, dates, closes)
+
     if price and (q == "Q5" or price_path) and len(price_path) < MAX_Q5_PRICE_PATH_DAYS:
         if not price_path or price_path[-1]["date"] != date_key:
             price_path.append({"date": date_key, "price": price})
-            just_completed_day5 = len(price_path) == MAX_Q5_PRICE_PATH_DAYS
 
+    just_completed_day5 = (not was_complete_before) and len(price_path) == MAX_Q5_PRICE_PATH_DAYS
     warning = _advance_q5_warning(prev_state.get("q5_warning"), price_path, just_completed_day5, date_key)
 
     new_state = {
@@ -723,6 +799,12 @@ def run_quintile_refresh(api_key, watchlist):
 
         bounds = quintile_logic.pool_percentile_bounds(pool_history)
 
+        # q5_price_pathの欠測補完・起点整合(2026-09-29追加)に使う実取引日
+        # カレンダー。pool_historyは直上でその日の分まで更新済みのため、
+        # ここで1回だけソートして全ティッカーの_update_quintile_state呼び出しに
+        # 使い回す(app.py側の_trading_days_calendar()と同じデータソース)。
+        trading_calendar_dates = sorted(pool_history.get("dates", []))
+
         # ⑧⑨ ユーザー監視銘柄のQ1〜Q5判定・状態履歴更新 ⑩ Redis保存(set_quintile_state内で実施)
         if bounds is not None:
             for ticker in watchlist[: logic.MAX_TICKERS]:
@@ -754,6 +836,12 @@ def run_quintile_refresh(api_key, watchlist):
                 # q5_price_path用: 当日実際に取得できた終値があれば渡す(取得できて
                 # いない日=fetched未成功の日は前回値のままpriceを渡さず、記録しない)。
                 price_today = fetched[ticker][1][-1] if ticker in fetched else None
+                # q5_price_pathの欠測補完(2026-09-29追加)用: 当日取得できた銘柄の
+                # 全期間分dates/closes(outputsize=full)。取得できていない日はNoneの
+                # まま渡し、_update_quintile_state側で起点の食い違いチェックのみ行う
+                # (欠測補完はできないが、架空の値は作らない)。
+                dates_today = fetched[ticker][0] if ticker in fetched else None
+                closes_today = fetched[ticker][1] if ticker in fetched else None
 
                 # β(表示専用、2026-09-25追加): 当日その銘柄・SPYの両方が取得できた
                 # 場合のみ計算する(追加のAPI呼び出しは発生しない、既にfetched済みの
@@ -770,6 +858,7 @@ def run_quintile_refresh(api_key, watchlist):
 
                 state = _update_quintile_state(
                     ticker, score, bounds, actual_trading_date, price=price_today, beta=beta_today,
+                    trading_calendar=trading_calendar_dates, dates=dates_today, closes=closes_today,
                 )
                 print(f"[Q1-5][OK] {ticker}: {state['current_q']} (pred_score={score:.2f})")
     else:

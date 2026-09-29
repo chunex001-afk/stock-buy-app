@@ -2,7 +2,8 @@
 """Q5「経過状態」表示機能のテスト(2026-09-18追加)。
 
 - refresh._update_quintile_state の q5_price_path 積み上げロジック
-  (新規Q5突入でリセット、Q5から外れても記録継続、再Q5突入で再リセット)
+  (新規Q5突入でリセット、Q5から外れても記録継続、再Q5突入で必ず再リセット
+  〈2026-09-29改定、design: q5_signalとの起点統一〉)
 - app._compute_q5_progress / _progress_bucket の表示用ロジック(純粋関数)
 
 既存のQ1〜Q5判定(current_q/previous_q/history/pred_score)への影響が
@@ -143,17 +144,19 @@ class UpdateQuintileStatePricePathTests(unittest.TestCase):
         self.assertEqual(len(state["q5_price_path"]), 3)
         self.assertEqual(state["q5_price_path"][-1], {"date": "2026-09-03", "price": 85.0})
 
-    def test_reentering_q5_mid_cool_does_not_reset(self):
-        """Q5後5営業日固定クール仕様(2026-09-18正式化): クールがまだDay5に
-        達していない間にQ4→Q5と再突入しても、Day0はリセットされず継続する。"""
+    def test_reentering_q5_mid_cool_resets_to_new_day0(self):
+        """2026-09-29改定: クールがまだDay5に達していない間にQ4→Q5と
+        再突入した場合も、app.py側のQ5シグナル(_compute_q5_signal)と
+        起点ルールを統一し、常に新しいDay0としてリセットするように改めた
+        (design: BE/MXL/AXTI/AEHRで確認された不整合の修正)。"""
         existing = {
             "current_q": "Q4", "previous_q": "Q5",
             "history": [{"date": "2026-09-01", "q": "Q5"}, {"date": "2026-09-04", "q": "Q4"}],
             "q5_price_path": [
-                {"date": "2026-09-01", "price": 100.0},  # Day0
-                {"date": "2026-09-02", "price": 90.0},   # Day1
-                {"date": "2026-09-03", "price": 88.0},   # Day2
-                {"date": "2026-09-04", "price": 85.0},   # Day3(Q4に降格した日)
+                {"date": "2026-09-01", "price": 100.0},  # 旧クールDay0
+                {"date": "2026-09-02", "price": 90.0},   # 旧クールDay1
+                {"date": "2026-09-03", "price": 88.0},   # 旧クールDay2
+                {"date": "2026-09-04", "price": 85.0},   # 旧クールDay3(Q4に降格した日)
             ],
             "last_updated": "2026-09-04",
         }
@@ -161,9 +164,7 @@ class UpdateQuintileStatePricePathTests(unittest.TestCase):
         bounds = [1, 2, 3, 4]  # scoreがこれ以上ならQ5
         state = refresh._update_quintile_state("TST", score=10.0, bounds=bounds, date_key="2026-09-05", price=120.0)
         self.assertEqual(state["current_q"], "Q5")
-        self.assertEqual(state["q5_price_path"][0], {"date": "2026-09-01", "price": 100.0})  # Day0は不変
-        self.assertEqual(len(state["q5_price_path"]), 5)  # Day4が追記された
-        self.assertEqual(state["q5_price_path"][-1], {"date": "2026-09-05", "price": 120.0})
+        self.assertEqual(state["q5_price_path"], [{"date": "2026-09-05", "price": 120.0}])  # 新Day0
 
     def test_reentering_q5_after_cool_ended_resets(self):
         """クールが既にDay5まで終了した後にQ4→Q5と再突入した場合のみ、

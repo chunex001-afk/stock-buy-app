@@ -6,9 +6,10 @@
 end-to-endで検証する(日次バッチの複数回呼び出しを再現する)。
 
 - 「現在Q5かどうか」と「Q5後5営業日のクール」は別管理: クールの途中で
-  Q4以下に戻っても、途中で再びQ5になってもクールはリセットされず、Day5で
-  終了する。クール終了後に前日Q5でない→当日Q5となる genuine な再突入が
-  起きた場合のみ、新しいクールDay0を開始する。
+  Q4以下に戻ってもクールはリセットされず、Day5で終了する。
+- 2026-09-29改定: 前日Q5でない→当日Q5となる再突入が起きた場合は、クールが
+  Day5まで終了しているかどうかに関わらず、常に新しいクールDay0を開始する
+  (app.py側のQ5シグナルと起点ルールを統一するための改定、design参照)。
 - 注意喚起はクールのDay5時点のQ5起点騰落率が-7.5%以下の場合にのみ発生する
   (Day1・Day3等の中間値やその経路は使わない)。
 - 注意喚起は現在のQ5クールの状態とは別管理で、発生から最大40営業日保持し、
@@ -85,20 +86,27 @@ class Q5CoolTests(unittest.TestCase):
         self.assertEqual(len(state["q5_price_path"]), 6)
         self.assertEqual(state["q5_price_path"][0], {"date": "2026-01-05", "price": 100.0})
 
-    def test_c_reentering_q5_mid_cool_does_not_reset_day0(self):
+    def test_c_reentering_q5_mid_cool_resets_to_new_day0(self):
+        """2026-09-29改定: 「Q4以下に戻ってもクールは継続」は変わらないが、
+        「再びQ5になった場合」は、app.py側のQ5シグナル(_compute_q5_signal、
+        historyの最後のQ5エントリを常に起点とする)と方針を統一し、常に
+        新しいDay0としてリセットするように改めた(design: BE/MXL/AXTI/AEHR
+        で確認された、q5_price_pathとq5_signalの起点不一致の修正)。"""
         store = FakeStore()
         days = [
-            ("2026-01-05", SCORE_Q5, 100.0),  # Day0
-            ("2026-01-06", SCORE_Q5, 98.0),   # Day1
-            ("2026-01-07", SCORE_Q4, 97.0),   # Day2: Q4に降格
-            ("2026-01-08", SCORE_Q4, 96.0),   # Day3
-            ("2026-01-09", SCORE_Q5, 95.0),   # Day4: 再びQ5になっても新Day0にしない
-            ("2026-01-12", SCORE_Q5, 94.0),   # Day5
+            ("2026-01-05", SCORE_Q5, 100.0),  # 旧クールDay0
+            ("2026-01-06", SCORE_Q5, 98.0),   # 旧クールDay1
+            ("2026-01-07", SCORE_Q4, 97.0),   # Q4に降格(旧クールは継続)
+            ("2026-01-08", SCORE_Q4, 96.0),   # 旧クールDay3
+            ("2026-01-09", SCORE_Q5, 95.0),   # 再びQ5 → 新しいDay0にリセット
+            ("2026-01-12", SCORE_Q5, 94.0),   # 新クールDay1
         ]
         state = run_days(store, "TST", days)
-        self.assertEqual(len(state["q5_price_path"]), 6)
-        self.assertEqual(state["q5_price_path"][0], {"date": "2026-01-05", "price": 100.0})
         self.assertEqual(state["current_q"], "Q5")
+        self.assertEqual(state["q5_price_path"], [
+            {"date": "2026-01-09", "price": 95.0},
+            {"date": "2026-01-12", "price": 94.0},
+        ])
 
 
 class Q5WarningTriggerTests(unittest.TestCase):
