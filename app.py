@@ -907,34 +907,35 @@ function q5WarningHtml(q){
   </div>`;
 }
 
-// 今日・昨日・2〜5日前(計6日分)のQ状態と、Q5継続日数を横長の表で表示する。
+// 今日・昨日・2〜5日前(計6日分)のQ状態を横長の表で表示する。
 // 2026-09-29修正: 日付計算(取引日オフセット・前方補完)は全てバックエンド
 // (app.py: _build_daily_breakdown/_resolve_q_for_date、実取引日カレンダー
-// ベース)側で行うようになり、ここは受け取ったq.daily_breakdown/
-// q.q5_continuation_daysをそのまま描画するだけになった(従来JS側にあった
-// 暦日ベースのaddDaysToDateStr/daysBetweenDateStrは、土日を挟むと「N日前」
-// が実際のN取引日前とズレる不整合があったため廃止、design: BEの監査で確認)。
+// ベース)側で行うようになり、ここは受け取ったq.daily_breakdownをそのまま
+// 描画するだけになった(従来JS側にあった暦日ベースのaddDaysToDateStr/
+// daysBetweenDateStrは、土日を挟むと「N日前」が実際のN取引日前とズレる
+// 不整合があったため廃止、design: BEの監査で確認)。
 // バックエンド側のhistory保存方式・refresh.py・quintile_logic.py・Q1〜Q5
 // 判定ロジックは一切変更していない。
+// 2026-09-29(2回目): UI整理の依頼により「Q5継続：N日」の表示行を非表示に
+// した(バックエンド側のq.q5_continuation_days計算・API応答は削除していない、
+// このJS側の描画だけを取りやめる表示専用の変更)。
 function qDailyBreakdownHtml(q){
   if(!q || q.status !== "ready" || !q.daily_breakdown || !q.daily_breakdown.length) return "";
 
   const headCells = q.daily_breakdown.map(d => `<th>${esc(d.label)}</th>`).join("");
   const valCells = q.daily_breakdown.map(d => `<td>${d.q ? esc(d.q) : "—"}</td>`).join("");
 
-  let cont = "";
-  if(q.current_q === "Q5" && q.q5_continuation_days != null){
-    cont = `<div class="qcont">Q5継続：${q.q5_continuation_days}日</div>`;
-  }
-
   return `<div class="qdaily-wrap"><table class="qdaily-table"><thead><tr>${headCells}</tr></thead>`
-    + `<tbody><tr>${valCells}</tr></tbody></table></div>${cont}`;
+    + `<tbody><tr>${valCells}</tr></tbody></table></div>`;
 }
 
 // Q5の過去実績統計。あくまで「過去の類似状態における統計」であり、
 // 将来この銘柄が同じように上がると予測するものではないことを明記する(design 14)。
 // 2026-09-17のUI整理で、常時表示から「📊 過去実績」ボタン(details/summary)
 // クリックで展開する形式に変更。中身(数値・注意書き)は一切変更していない。
+// 2026-09-29: UI整理の依頼により、render()側の呼び出しを外して非表示にした
+// (この関数自体・バックエンド側のq5_stats計算〈quintile_logic.load_q5_stats〉・
+// APIレスポンスは削除していない、カードへの描画を取りやめる表示専用の変更)。
 function q5StatsHtml(q){
   if(!q || q.status !== "ready" || q.current_q !== "Q5" || !q.q5_stats) return "";
   const s = q.q5_stats;
@@ -1009,7 +1010,6 @@ function render(rows){
       ${q5ProgressHtml(x.quintile)}
       ${q5WarningHtml(x.quintile)}
       ${qDailyBreakdownHtml(x.quintile)}
-      ${q5StatsHtml(x.quintile)}
 
       <div class="pricebar">
         <span>株価 <b>${fmt(x.price)}</b></span>
