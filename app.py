@@ -372,6 +372,27 @@ def _compute_q5_warning_view(warning):
     }
 
 
+def _build_midline_halt_view(halt):
+    """refresh.pyのq5_midline_halt(design 2026-10-02ユーザー確定仕様: Q5
+    Day0〜Day7以内の中線〈SMA20〉割れによる「購入中断」補助表示)を表示用に
+    整形するだけの純粋関数(Redisアクセスなし)。発生(Day0〜Day7以内の初回
+    割れ)・解除(終値がSMA20以上を3取引日連続維持)の判定はすべてrefresh.py
+    側で完結しており、ここでは値の解釈・判定は一切行わない。
+
+    既存の購入判定・upside_score・ランキング・Q1〜Q5判定・Q5シグナル・
+    「Q5勢い上位5」には一切関与しない、補助的な注意表示専用(該当銘柄を
+    一覧やランキングから除外することはしない、状態が分かるように表示する
+    だけ)。activeでない(=中断表示なし、または一度も割れていない)場合は
+    Noneを返し、呼び出し側のJSは何も表示しない。"""
+    if not halt or not halt.get("active"):
+        return None
+    return {
+        "break_date": halt.get("break_date"),
+        "recover_streak": halt.get("recover_streak", 0),
+        "unlock_streak_required": halt.get("unlock_streak_required", 3),
+    }
+
+
 def _build_beta_view(state):
     """β(ベータ)の表示専用ビューを組み立てる(純粋関数、Redisアクセスなし)。
     state["beta"](refresh._update_quintile_stateが書き込む252営業日ローリングβ、
@@ -420,7 +441,8 @@ def _build_quintile_view(ticker, trading_calendar=None):
             "current_q": None, "current_q_label": None,
             "previous_q": None, "last_updated": state.get("last_updated") if state else None,
             "history": [], "q5_stats": None, "q5_signal": None, "q5_progress": None,
-            "q5_warning": None, "daily_breakdown": [], "q5_continuation_days": None,
+            "q5_warning": None, "q5_midline_halt": None,
+            "daily_breakdown": [], "q5_continuation_days": None,
             **_build_beta_view(state),
             "message": message,
         }
@@ -453,6 +475,7 @@ def _build_quintile_view(ticker, trading_calendar=None):
         q5_progress = None
     view["q5_progress"] = q5_progress
     view["q5_warning"] = _compute_q5_warning_view(state.get("q5_warning"))
+    view["q5_midline_halt"] = _build_midline_halt_view(state.get("q5_midline_halt"))
 
     # 「過去5日」表示・Q5継続日数(2026-09-29修正: 暦日ベースから取引日ベースに
     # 統一)。trading_calendarが無い場合はdaily_breakdownの「今日」以外・
@@ -738,6 +761,14 @@ details.logicinfo .small{margin-top:10px}
 .q5warntop{font-weight:800;color:#b42318;font-size:13px}
 .q5warnnote{color:#8a3a30;font-size:11px;margin-top:4px;line-height:1.6}
 
+/* Q5中線割れ:購入中断 補助表示(design 2026-10-02ユーザー確定仕様)。
+   購入不可・売却・除外等の判定には一切関与しない、状態表示専用(一覧からは
+   除外しない)。Q5 Day5注意喚起(.q5warn)と同系統の配色にしているが、
+   別フィールド(q5_midline_halt)・別ロジックであり、互いに独立している。 */
+.q5halt{background:#fdeceb;border-radius:13px;padding:10px 14px;margin-top:6px}
+.q5halttop{font-weight:800;color:#b42318;font-size:13px}
+.q5haltsub{color:#8a3a30;font-size:11px;margin-top:4px;line-height:1.6}
+
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}}
 </style>
 </head>
@@ -997,6 +1028,24 @@ function q5WarningHtml(q){
   </div>`;
 }
 
+// Q5中線割れ:購入中断 補助表示(design 2026-10-02ユーザー確定仕様)。
+// バックエンド(_build_midline_halt_view、app.py)が組み立てたq5_midline_haltを
+// そのまま表示するだけ。発生(Q5 Day0〜Day7以内の初回中線割れ)・解除(終値が
+// SMA20以上を3取引日連続維持)の判定はrefresh.py側で完結済み、ここでは値の
+// 解釈・判定は一切行わない。購入不可・売却・除外の判定ではなく、保有継続・
+// 買い増しを再検討する材料としての補助表示(一覧・ランキングからは除外しない)。
+function q5MidlineHaltHtml(q){
+  if(!q || q.status !== "ready" || !q.q5_midline_halt) return "";
+  const h = q.q5_midline_halt;
+  const streakLine = h.recover_streak > 0
+    ? `中線回復中（${h.recover_streak}/${h.unlock_streak_required}日）`
+    : `中線割れ中`;
+  return `<div class="q5halt">
+    <div class="q5halttop">🛑 Q5中線割れ：購入中断</div>
+    <div class="q5haltsub">中線割れ発生日：${esc(fmtDate(h.break_date))}　${esc(streakLine)}</div>
+  </div>`;
+}
+
 // 今日・昨日・2〜5日前(計6日分)のQ状態を横長の表で表示する。
 // 2026-09-29修正: 日付計算(取引日オフセット・前方補完)は全てバックエンド
 // (app.py: _build_daily_breakdown/_resolve_q_for_date、実取引日カレンダー
@@ -1099,6 +1148,7 @@ function render(rows){
       ${q5SignalHtml(x.quintile)}
       ${q5ProgressHtml(x.quintile)}
       ${q5WarningHtml(x.quintile)}
+      ${q5MidlineHaltHtml(x.quintile)}
       ${qDailyBreakdownHtml(x.quintile)}
 
       <div class="pricebar">

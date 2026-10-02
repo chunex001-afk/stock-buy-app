@@ -114,6 +114,18 @@ Q5_WARNING_TRIGGER_PCT = -7.5
 # 判断したため、固定日数での失効とした)。
 Q5_WARNING_MAX_BUSINESS_DAYS = 40
 
+# Q5中線割れ:購入中断 補助表示(design 2026-10-02ユーザー確定仕様)。
+# Q1〜Q5判定ロジック・pred_score・history・Q5シグナル有効期限・q5_price_path・
+# q5_warning・既存の購入判定/スコア/ランキングには一切関与しない、
+# quintile:state:<TICKER>への追加フィールド(q5_midline_halt)のみ。
+# 対象: Q5 Day0(_true_q5_day0と同じ起点)から8取引日(Day0〜Day7)以内に、
+# 終値がSMA20(stock_logic.sma(closes, 20)、既存実装と同一の計算方法)を
+# 初めて下回った場合にのみ有効化する(Day8以降の初回割れは対象外)。
+Q5_MIDLINE_WATCH_DAYS = 7
+# 解除条件: 終値がSMA20以上を何取引日連続で維持したら解除するか
+# (回復当日を1日目として数える、ユーザー確定仕様2026-10-02)。
+Q5_MIDLINE_UNLOCK_STREAK = 3
+
 
 def remaining_td_budget():
     """(Twelve Dataの残りcredits, 本日の使用済みcredits) を返す。"""
@@ -236,6 +248,85 @@ def _reconcile_price_path(price_path, true_day0, trading_calendar, date_key, dat
     return filled
 
 
+def _q5_midline_days_elapsed(trading_calendar, day0_date, date_key):
+    """day0_dateからdate_keyまでの取引日経過数を返す(Day0自身=0)。
+    _reconcile_price_pathと同じbisectベースの数え方(trading_calendarに
+    実際に存在する取引日だけを数える)。trading_calendarが空、または
+    day0_date/date_keyがその範囲に無い場合はNoneを返す(架空の日数は
+    作らない、呼び出し側は「判定不能」として扱う)。"""
+    if not trading_calendar:
+        return None
+    lo = bisect.bisect_left(trading_calendar, day0_date)
+    hi = bisect.bisect_right(trading_calendar, date_key)
+    if hi <= lo:
+        return None
+    return (hi - lo) - 1
+
+
+def _update_q5_midline_halt(prev_halt, day0_date, date_key, price, sma20, trading_calendar):
+    """「Q5中線割れ：購入中断」補助表示の状態を更新する(design 2026-10-02
+    ユーザー確定仕様、Redisアクセスなしの純粋関数)。Q1〜Q5判定ロジック・
+    pred_score・history・q5_signal・q5_price_path・q5_warning・既存の
+    購入判定/スコア/ランキングには一切影響しない、quintile:state:<TICKER>
+    への追加フィールド(q5_midline_halt)の計算のみ。
+
+    仕様(ユーザー確定、2026-10-02):
+    - 対象: day0_date(_true_q5_day0と同じ、「最後にQ5になった日」)から
+      Q5_MIDLINE_WATCH_DAYS(7)取引日以内、すなわちDay0〜Day7の計8取引日
+      以内に、終値がSMA20を初めて下回った場合にのみ"active"になる
+      (Day8以降に初めて割れた場合は対象外、新規に購入中断にしない)。
+    - 一度activeになったら、終値がSMA20以上をQ5_MIDLINE_UNLOCK_STREAK
+      (3)取引日連続で維持するまでactiveのまま維持する。現在のQ(Q4以下
+      への降格)・q5_signalの有効期限(失効)・新しいQ5サイクルの開始の
+      いずれにも影響されない(ここでは一切参照しない。activeである間は
+      Day0〜Day7の判定自体を行わないため、新しいサイクルが始まっても
+      既存のactive状態を勝手にリセットしない)。
+    - 連続維持日数(recover_streak)は、解除前に終値が再びSMA20を下回ると
+      0にリセットし、次に終値がSMA20以上に戻った日を1日目として数え直す。
+    - 解除(active=False)した後は、新たにDay0〜Day7以内の初回割れが
+      発生するまで再度activeにはならない。
+    - price/sma20のいずれかが欠測(当日の取得失敗・SMA20算出に必要な
+      20日分の価格履歴が無い等のデータ不足)の場合は、状態を一切変更
+      せず前回の状態をそのまま返す(誤って解除・リセットしない、
+      beta/q5_warning等ほかのフィールドと同じ「前回状態を保つ」方針)。
+    """
+    halt = dict(prev_halt) if prev_halt else {
+        "active": False, "break_date": None,
+        "recover_streak": 0, "recovered_since": None,
+        "unlock_streak_required": Q5_MIDLINE_UNLOCK_STREAK,
+    }
+
+    if price is None or sma20 is None:
+        return halt
+
+    above = price >= sma20
+
+    if halt.get("active"):
+        if above:
+            halt["recover_streak"] = halt.get("recover_streak", 0) + 1
+            if halt["recover_streak"] == 1:
+                halt["recovered_since"] = date_key
+        else:
+            halt["recover_streak"] = 0
+            halt["recovered_since"] = None
+
+        if halt["recover_streak"] >= Q5_MIDLINE_UNLOCK_STREAK:
+            halt["active"] = False
+            halt["break_date"] = None
+            halt["recover_streak"] = 0
+            halt["recovered_since"] = None
+    elif not above and day0_date is not None and trading_calendar:
+        days_elapsed = _q5_midline_days_elapsed(trading_calendar, day0_date, date_key)
+        if days_elapsed is not None and 0 <= days_elapsed <= Q5_MIDLINE_WATCH_DAYS:
+            halt["active"] = True
+            halt["break_date"] = date_key
+            halt["recover_streak"] = 0
+            halt["recovered_since"] = None
+
+    halt["last_updated"] = date_key
+    return halt
+
+
 def _update_quintile_state(ticker, score, bounds, date_key, price=None, beta=None,
                             trading_calendar=None, dates=None, closes=None):
     """ユーザー監視銘柄1件のQ状態を判定し、状態が変化した場合のみ履歴に追記する。
@@ -285,6 +376,16 @@ def _update_quintile_state(ticker, score, bounds, date_key, price=None, beta=Non
     true_day0 = _true_q5_day0(history)
     price_path = _reconcile_price_path(prev_price_path, true_day0, trading_calendar, date_key, dates, closes)
 
+    # Q5中線割れ:購入中断 補助表示(design 2026-10-02)。true_day0はq5_price_path
+    # と同一の起点(_true_q5_day0)を再利用し、起点のずれが生じないようにする。
+    # SMA20はquintile_logic.compute_features/stock_logic.smaと同一の計算方法
+    # (closesの末尾20件の単純平均)。closesが無い(当日未取得)日はsma20=Noneと
+    # なり、_update_q5_midline_halt側で「データ不足」として状態を変更しない。
+    sma20_today = logic.sma(closes, 20) if closes else None
+    midline_halt = _update_q5_midline_halt(
+        prev_state.get("q5_midline_halt"), true_day0, date_key, price, sma20_today, trading_calendar,
+    )
+
     if price and (q == "Q5" or price_path) and len(price_path) < MAX_Q5_PRICE_PATH_DAYS:
         if not price_path or price_path[-1]["date"] != date_key:
             price_path.append({"date": date_key, "price": price})
@@ -299,6 +400,7 @@ def _update_quintile_state(ticker, score, bounds, date_key, price=None, beta=Non
         "history": history,
         "q5_price_path": price_path,
         "q5_warning": warning,
+        "q5_midline_halt": midline_halt,
         "beta": beta if beta is not None else prev_state.get("beta"),
         "last_updated": date_key,
     }
@@ -312,8 +414,8 @@ def _mark_quintile_state_insufficient(ticker, date_key, data_days, data_days_req
     quintile_logic.assign_quintileを一切呼ばずに「判定保留」であることだけを
     Redisに記録する。
 
-    既存のcurrent_q/previous_q/history/q5_price_path/q5_warningはすべて
-    そのまま保持する(読み込んだprev_stateをコピーし、current_q・data_status・
+    既存のcurrent_q/previous_q/history/q5_price_path/q5_warning/q5_midline_halt
+    はすべてそのまま保持する(読み込んだprev_stateをコピーし、current_q・data_status・
     data_days・data_days_required・last_updatedだけを上書きする)。これにより、
     以前正常にQ5だった銘柄の履歴・クール・警告が、このデータ不足処理によって
     壊れることはない。app.py側の_build_quintile_viewはcurrent_q=Noneを
