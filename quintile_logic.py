@@ -1,8 +1,8 @@
 """Q1〜Q5状態判定ロジック(IMPLEMENTATION_DESIGN_quintile_q1q5.md参照)。
 
 既存のstock_logic.py(app.py/refresh.pyが使う購入判定)とは完全に独立したモジュール。
-既存の`compute_upside_score`等のロジックには一切触れない。DAILY_API_BUDGET=22・
-MAX_TICKERS=15はstock_logic.py側の値のままで、このモジュールは変更しない。
+既存の`compute_upside_score`等のロジックには一切触れない。DAILY_API_BUDGET・
+MAX_TICKERS(2026-10-05時点で20)はstock_logic.py側の値のままで、このモジュールは変更しない。
 """
 import heapq
 import json

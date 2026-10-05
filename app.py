@@ -380,7 +380,7 @@ def _build_midline_halt_view(halt):
     側で完結しており、ここでは値の解釈・判定は一切行わない。
 
     既存の購入判定・upside_score・ランキング・Q1〜Q5判定・Q5シグナル・
-    「Q5勢い上位5」には一切関与しない、補助的な注意表示専用(該当銘柄を
+    「Q5勢い上位8」には一切関与しない、補助的な注意表示専用(該当銘柄を
     一覧やランキングから除外することはしない、状態が分かるように表示する
     だけ)。activeでない(=中断表示なし、または一度も割れていない)場合は
     Noneを返し、呼び出し側のJSは何も表示しない。"""
@@ -544,7 +544,8 @@ def _build_row(ticker, trading_calendar=None):
 
 
 def _compute_q5_momentum_ranking(rows):
-    """「Q5勢い上位5」(design 2026-09-30、表示専用の補助ランキング)。
+    """「Q5勢い上位8」(design 2026-09-30、表示専用の補助ランキング。
+    2026-10-05に表示件数を上位5件→上位8件に変更、判定ロジック自体は無変更)。
 
     既存のq5_signal(8取引日で失効する新規購入シグナル、_compute_q5_signal)と
     three_day_return/week_return(stock_logic.compute_indicators、latest close/
@@ -559,8 +560,8 @@ def _compute_q5_momentum_ranking(rows):
     - three_day_return > 0 かつ week_return > 0(片方でも0以下・欠測なら対象外)。
 
     順位: momentum_score = three_day_return + week_return の降順。
-    同点はthree_day_returnが高い方を上位。上位5件のみ返す(0件なら空配列、
-    呼び出し側で「Q5勢い上位5」セクション自体を非表示にする)。"""
+    同点はthree_day_returnが高い方を上位。上位8件のみ返す(0件なら空配列、
+    呼び出し側で「Q5勢い上位8」セクション自体を非表示にする)。"""
     candidates = []
     for row in rows:
         q = row.get("quintile") or {}
@@ -584,7 +585,7 @@ def _compute_q5_momentum_ranking(rows):
             "momentum_score": round(three_day + week, 2),
         })
     candidates.sort(key=lambda c: (-c["momentum_score"], -c["three_day_return"]))
-    return candidates[:5]
+    return candidates[:8]
 
 
 def _get_watchlist():
@@ -650,7 +651,7 @@ details.logicinfo .small{margin-top:10px}
 .heroticker{font-size:26px;font-weight:900;letter-spacing:.01em}
 .herocomment{font-size:14px;line-height:1.75;background:rgba(255,255,255,.16);border-radius:14px;padding:14px 16px}
 
-/* 「Q5勢い上位5」(design 2026-09-30)。既存のq5_signal・3日間/1週間の値を
+/* 「Q5勢い上位8」(design 2026-09-30)。既存のq5_signal・3日間/1週間の値を
    読んで並べ替えるだけの表示専用セクション。current_q・pred_score・購入判定・
    ランキング・q5_signal自体の計算には一切関与しない。 */
 .q5mom{background:#fff7ed;border:1px solid #fed7aa;border-radius:20px;padding:16px 18px;margin-bottom:18px}
@@ -776,7 +777,7 @@ details.logicinfo .small{margin-top:10px}
 <div class="wrap">
 <div class="title">📊 保有銘柄のQ1〜Q5状態</div>
 <div id="tickerCount" class="tickercount"></div>
-<div class="sub">実データ版｜最大15銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
+<div class="sub">実データ版｜最大20銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
 
 <div class="card">
   <div class="controls">
@@ -822,8 +823,8 @@ async function updateRanking(extraMsg){
   }catch(e){document.getElementById("status").textContent="エラー："+e.message}
 }
 
-// 「Q5勢い上位5」(design 2026-09-30)。サーバー側app._compute_q5_momentum_
-// rankingが組み立てた配列(既に条件判定・並べ替え・上位5件絞り込み済み)を
+// 「Q5勢い上位8」(design 2026-09-30)。サーバー側app._compute_q5_momentum_
+// rankingが組み立てた配列(既に条件判定・並べ替え・上位8件絞り込み済み)を
 // そのまま描画するだけの表示専用関数。JS側でのフィルタ・ソートは行わない
 // (current_q・q5_signal・3日間/1週間の判定ロジック自体はPython側の純粋関数
 // に一本化し、テスト可能にするため)。0件の場合はセクション自体を非表示にする。
@@ -842,7 +843,7 @@ function renderQ5Momentum(list){
     </div>`;
   }).join("");
   el.innerHTML = `<div class="q5mom">
-    <div class="q5momtitle">🔥 Q5勢い上位5</div>
+    <div class="q5momtitle">🔥 Q5勢い上位8</div>
     ${rows}
   </div>`;
 }
@@ -855,7 +856,7 @@ function renderTickerCount(j){
   const el = document.getElementById("tickerCount");
   if(!el) return;
   const n = (j.rows||[]).length;
-  const max = j.max_tickers ?? 15;
+  const max = j.max_tickers ?? 20;
   el.textContent = `登録銘柄：${n}/${max}`;
 }
 

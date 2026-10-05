@@ -811,7 +811,7 @@ def run_quintile_refresh(api_key, watchlist):
                 failed.append(ticker)
                 rate_limited = rate_limited or hit_rate_limit
 
-    # ③ ユーザー監視銘柄取得(最大15、毎日)
+    # ③ ユーザー監視銘柄取得(最大20、毎日)
     if not rate_limited:
         for ticker in watchlist[: logic.MAX_TICKERS]:
             if rate_limited:

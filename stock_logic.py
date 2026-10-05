@@ -15,7 +15,7 @@ build_result()はnews_items/market_cap等を渡さない(=Noneのまま)呼び�
 """
 
 DEFAULT_TICKERS = ["AXTI", "NBIS", "AEHR", "MU", "SNDK", "BE", "IONQ", "CRDO"]
-MAX_TICKERS = 15
+MAX_TICKERS = 20
 
 
 def aggregate_sentiment(ticker, news_items):

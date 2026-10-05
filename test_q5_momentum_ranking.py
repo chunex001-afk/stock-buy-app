@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""「Q5勢い上位5」(app._compute_q5_momentum_ranking、2026-09-30追加)のテスト。
+"""「Q5勢い上位8」(app._compute_q5_momentum_ranking、2026-09-30追加、
+2026-10-05に表示件数を上位5件→上位8件に変更)のテスト。
 
 既存のq5_signal(8取引日有効期限)とthree_day_return/week_return
 (stock_logic.compute_indicators)をそのまま読むだけの表示専用の純粋関数
@@ -87,12 +88,15 @@ class RankingOrderTests(unittest.TestCase):
         result = app._compute_q5_momentum_ranking(rows)
         self.assertEqual([r["ticker"] for r in result], ["B", "A"])
 
-    def test_truncates_to_top_5(self):
-        rows = [_row(f"T{i}", "Q4", "active", float(i), float(i)) for i in range(1, 8)]
+    def test_truncates_to_top_8(self):
+        rows = [_row(f"T{i}", "Q4", "active", float(i), float(i)) for i in range(1, 11)]
         result = app._compute_q5_momentum_ranking(rows)
-        self.assertEqual(len(result), 5)
-        # 最もmomentumが高い上位5件(T7..T3)が残っていること
-        self.assertEqual([r["ticker"] for r in result], ["T7", "T6", "T5", "T4", "T3"])
+        self.assertEqual(len(result), 8)
+        # 最もmomentumが高い上位8件(T10..T3)が残っていること
+        self.assertEqual(
+            [r["ticker"] for r in result],
+            ["T10", "T9", "T8", "T7", "T6", "T5", "T4", "T3"],
+        )
 
     def test_empty_when_no_candidates(self):
         rows = [_row("A", "Q3", "expired", 5.0, 5.0), _row("B", "Q2", None, 3.0, 3.0)]
@@ -105,7 +109,7 @@ class RankingOrderTests(unittest.TestCase):
 
 
 class DisplayNoLongerShowsCurrentQTests(unittest.TestCase):
-    """2026-09-30(2回目)の表示変更: 「🔥 Q5勢い上位5」から現在Q(Q1〜Q5)
+    """2026-09-30(2回目)の表示変更: 「🔥 Q5勢い上位8」から現在Q(Q1〜Q5)
     バッジを削除し、順位・銘柄・3日間・1週間の4項目のみ表示するようにした
     ことを確認する。判定ロジック(app._compute_q5_momentum_ranking)自体は
     無変更で、current_q/current_q_labelは引き続き返り値に含まれる

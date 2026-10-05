@@ -196,11 +196,12 @@ class TestExistingLogicUnchanged(unittest.TestCase):
         )
 
     def test_max_tickers_and_budget_unchanged(self):
-        """ユーザー指示: MAX_TICKERS=15は変更しない。
+        """ユーザー指示(2026-10-05): MAX_TICKERSを15から20に変更。
         2026-09-17のAlpha Vantage完全撤去により、stock_logic.DAILY_API_BUDGET
         (Alpha Vantage専用の自己申告予算)は意図的に削除された。以後はTwelve Data
-        の予算(twelvedata_client.DAILY_API_BUDGET)が唯一の予算管理となる。"""
-        self.assertEqual(stock_logic.MAX_TICKERS, 15)
+        の予算(twelvedata_client.DAILY_API_BUDGET)が唯一の予算管理となる
+        (700/日に対し、監視銘柄20+ローテーション3〜4+SPY1+ニュース1で十分な余裕がある)。"""
+        self.assertEqual(stock_logic.MAX_TICKERS, 20)
         self.assertFalse(hasattr(stock_logic, "DAILY_API_BUDGET"),
                           "DAILY_API_BUDGETはAlpha Vantage撤去により削除されているはず")
         import twelvedata_client
