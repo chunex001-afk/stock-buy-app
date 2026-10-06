@@ -108,6 +108,28 @@ class RankingOrderTests(unittest.TestCase):
         self.assertAlmostEqual(result[0]["momentum_score"], 7.5)
 
 
+class Q5SignalElapsedFieldTests(unittest.TestCase):
+    """「Q5からN日」バッジ表示用(2026-10-06追加)のq5_signal_status/
+    q5_signal_days_elapsedが、既存のq5_signal(status/days_elapsed)をそのまま
+    コピーしただけであることを確認する。選定条件・順位付け・momentum_score
+    には一切影響しない(既存テスト群がそれを別途検証済み)。"""
+
+    def test_ok_status_copied(self):
+        rows = [_row("CUR5", "Q5", "ok", 3.0, 4.0)]
+        result = app._compute_q5_momentum_ranking(rows)
+        self.assertEqual(result[0]["q5_signal_status"], "ok")
+
+    def test_active_status_and_days_elapsed_copied(self):
+        quintile = {
+            "status": "ready", "current_q": "Q4", "current_q_label": "Q4",
+            "q5_signal": {"status": "active", "day0_date": "2026-08-10", "days_elapsed": 3},
+        }
+        rows = [{"ticker": "MID", "quintile": quintile, "three_day_return": 2.0, "week_return": 3.0}]
+        result = app._compute_q5_momentum_ranking(rows)
+        self.assertEqual(result[0]["q5_signal_status"], "active")
+        self.assertEqual(result[0]["q5_signal_days_elapsed"], 3)
+
+
 class DisplayNoLongerShowsCurrentQTests(unittest.TestCase):
     """2026-09-30(2回目)の表示変更: 「🔥 Q5勢い上位8」から現在Q(Q1〜Q5)
     バッジを削除し、順位・銘柄・3日間・1週間の4項目のみ表示するようにした

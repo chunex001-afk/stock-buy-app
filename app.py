@@ -545,7 +545,9 @@ def _build_row(ticker, trading_calendar=None):
 
 def _compute_q5_momentum_ranking(rows):
     """「Q5勢い上位8」(design 2026-09-30、表示専用の補助ランキング。
-    2026-10-05に表示件数を上位5件→上位8件に変更、判定ロジック自体は無変更)。
+    2026-10-05に表示件数を上位5件→上位8件に変更、判定ロジック自体は無変更。
+    2026-10-06にq5_signal_status/q5_signal_days_elapsedを返り値に追加
+    〈「Q5から経過日数」バッジ表示用〉、選定条件・順位付けは無変更)。
 
     既存のq5_signal(8取引日で失効する新規購入シグナル、_compute_q5_signal)と
     three_day_return/week_return(stock_logic.compute_indicators、latest close/
@@ -583,6 +585,8 @@ def _compute_q5_momentum_ranking(rows):
             "three_day_return": three_day,
             "week_return": week,
             "momentum_score": round(three_day + week, 2),
+            "q5_signal_status": signal.get("status"),
+            "q5_signal_days_elapsed": signal.get("days_elapsed"),
         })
     candidates.sort(key=lambda c: (-c["momentum_score"], -c["three_day_return"]))
     return candidates[:8]
@@ -661,6 +665,8 @@ details.logicinfo .small{margin-top:10px}
 .q5momrank{font-size:15px;font-weight:900;min-width:22px}
 .q5momticker{font-size:15px;font-weight:900;min-width:56px}
 .q5momstat{font-size:12px;font-weight:700;color:#475467}
+.q5momq5{font-size:12px;font-weight:800}
+.q5momq5-green{color:#087443}.q5momq5-yellow{color:#9a6a00}.q5momq5-red{color:#b42318}
 
 .list{display:grid;grid-template-columns:1fr;gap:14px}
 @media(min-width:760px){.list{grid-template-columns:repeat(2,1fr)}}
@@ -829,15 +835,27 @@ async function updateRanking(extraMsg){
 // (current_q・q5_signal・3日間/1週間の判定ロジック自体はPython側の純粋関数
 // に一本化し、テスト可能にするため)。0件の場合はセクション自体を非表示にする。
 const Q5MOM_MEDALS = ["🥇","🥈","🥉"];
+// Q5経過日数バッジ(design 2026-10-06)。既存のq5_signal.status/days_elapsed
+// (app._compute_q5_momentum_rankingがそのままコピーしたq5_signal_status/
+// q5_signal_days_elapsed)を見て表示を分けるだけの表示専用ロジック。
+// 選定条件・順位付け・momentum_scoreには一切関与しない。
+function q5MomBadge(status, daysElapsed){
+  if(status === "ok") return {label:"Q5継続中", cls:"q5momq5-green"};
+  if(daysElapsed <= 2) return {label:`Q5から${daysElapsed}日`, cls:"q5momq5-green"};
+  if(daysElapsed <= 6) return {label:`Q5から${daysElapsed}日`, cls:"q5momq5-yellow"};
+  return {label:`Q5から${daysElapsed}日`, cls:"q5momq5-red"};
+}
 function renderQ5Momentum(list){
   const el = document.getElementById("q5momentum");
   if(!el) return;
   if(!list || !list.length){ el.innerHTML = ""; return; }
   const rows = list.map((m,i)=>{
     const rank = Q5MOM_MEDALS[i] || String(i+1);
+    const badge = q5MomBadge(m.q5_signal_status, m.q5_signal_days_elapsed);
     return `<div class="q5momrow">
       <span class="q5momrank">${rank}</span>
       <span class="q5momticker">${esc(m.ticker)}</span>
+      <span class="q5momq5 ${badge.cls}">${badge.label}</span>
       <span class="q5momstat">3日 ${fmt(m.three_day_return,"%")}</span>
       <span class="q5momstat">1週間 ${fmt(m.week_return,"%")}</span>
     </div>`;
