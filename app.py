@@ -660,13 +660,23 @@ details.logicinfo .small{margin-top:10px}
    ランキング・q5_signal自体の計算には一切関与しない。 */
 .q5mom{background:#fff7ed;border:1px solid #fed7aa;border-radius:20px;padding:16px 18px;margin-bottom:18px}
 .q5momtitle{font-size:14px;font-weight:900;color:#9a3412;margin-bottom:10px}
-.q5momrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 0;border-top:1px solid #fed7aa}
+/* 各行を必ず1行に収める(design 2026-10-06追加)。flex-wrap:nowrap+
+   white-space:nowrapで折り返しを禁止し、幅が足りない列はtext-overflow:
+   ellipsisで省略する(選定ロジック・順位・スコアには無関係、表示専用)。 */
+.q5momrow{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;white-space:nowrap;padding:7px 0;border-top:1px solid #fed7aa;overflow:hidden}
 .q5momrow:first-of-type{border-top:none}
-.q5momrank{font-size:15px;font-weight:900;min-width:22px}
-.q5momticker{font-size:15px;font-weight:900;min-width:56px}
-.q5momstat{font-size:12px;font-weight:700;color:#475467}
-.q5momq5{font-size:12px;font-weight:800}
+.q5momrank{font-size:14px;font-weight:900;flex:0 0 auto}
+.q5momticker{font-size:14px;font-weight:900;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.q5momstat{font-size:11px;font-weight:700;color:#475467;flex:0 0 auto}
+.q5momq5{font-size:11px;font-weight:800;flex:0 0 auto}
 .q5momq5-green{color:#087443}.q5momq5-yellow{color:#9a6a00}.q5momq5-red{color:#b42318}
+@media(max-width:480px){
+  .q5mom{padding:14px 12px}
+  .q5momrow{gap:4px}
+  .q5momrank{font-size:12px}
+  .q5momticker{font-size:12px}
+  .q5momstat,.q5momq5{font-size:10px}
+}
 
 .list{display:grid;grid-template-columns:1fr;gap:14px}
 @media(min-width:760px){.list{grid-template-columns:repeat(2,1fr)}}
@@ -856,8 +866,8 @@ function renderQ5Momentum(list){
       <span class="q5momrank">${rank}</span>
       <span class="q5momticker">${esc(m.ticker)}</span>
       <span class="q5momq5 ${badge.cls}">${badge.label}</span>
-      <span class="q5momstat">3日 ${fmt(m.three_day_return,"%")}</span>
-      <span class="q5momstat">1週間 ${fmt(m.week_return,"%")}</span>
+      <span class="q5momstat">3日${fmt(m.three_day_return,"%")}</span>
+      <span class="q5momstat">1週${fmt(m.week_return,"%")}</span>
     </div>`;
   }).join("");
   el.innerHTML = `<div class="q5mom">
