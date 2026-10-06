@@ -615,7 +615,7 @@ HTML = r"""
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="Q1〜Q5状態">
 <style>
-*{box-sizing:border-box} body{margin:0;background:#f4f6f8;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif}
+*{box-sizing:border-box} body{margin:0;background:#f4f6f8;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif;overflow-x:hidden}
 .wrap{max-width:880px;margin:auto;padding:18px}
 @media(min-width:760px){.wrap{max-width:1120px}}
 .title{font-size:24px;font-weight:800;margin-bottom:5px}
@@ -657,28 +657,39 @@ details.logicinfo .small{margin-top:10px}
 
 /* 「Q5勢い上位8」(design 2026-09-30)。既存のq5_signal・3日間/1週間の値を
    読んで並べ替えるだけの表示専用セクション。current_q・pred_score・購入判定・
-   ランキング・q5_signal自体の計算には一切関与しない。 */
-.q5mom{background:#fff7ed;border:1px solid #fed7aa;border-radius:16px;padding:12px 10px;margin-bottom:18px}
-.q5momtitle{font-size:14px;font-weight:900;color:#9a3412;margin-bottom:6px}
-/* 各行を必ず1行に収める(design 2026-10-06追加、2026-10-06再調整で拡大)。
-   flex-wrap:nowrap+white-space:nowrapで折り返しを禁止し、まず余白/gapを
-   切り詰めて文字を大きく保ち、それでも収まらない場合だけticker側を
-   text-overflow:ellipsisで省略する(選定ロジック・順位・スコアには無関係、
-   表示専用)。 */
-.q5momrow{display:flex;align-items:center;gap:5px;flex-wrap:nowrap;white-space:nowrap;padding:5px 2px;border-top:1px solid #fed7aa;overflow:hidden}
+   ランキング・q5_signal自体の計算には一切関与しない。
+
+   2026-10-06: 親の.wrap(max-width:880/1120px、margin:auto)がこのセクション
+   にも適用され、PC幅で右側に大きな余白が生じていた問題への対応として、
+   #q5momentumラッパーだけを.wrapの幅制約から外し、ビューポート幅いっぱいに
+   広げるfull-bleed(left:50%+margin-left:-50vw)にした。他セクション(検索
+   カード・銘柄一覧)の幅・.wrap自体は無変更。 */
+#q5momentum{width:100vw;position:relative;left:50%;margin-left:-50vw}
+.q5mom{background:#fff7ed;border:1px solid #fed7aa;border-radius:16px;padding:12px 18px;margin-bottom:18px}
+.q5momtitle{font-size:15px;font-weight:900;color:#9a3412;margin-bottom:6px}
+/* 各行を必ず1行に収める(design 2026-10-06追加、同日に2回再調整: 文字拡大→
+   full-bleedで広がった横幅を使い切るレイアウトに変更)。flex-wrap:nowrap+
+   white-space:nowrapで折り返しを禁止。左側(順位・銘柄名・鮮度バッジ)は
+   詰めて配置し、右側(3日/1週の数値)は.q5momnumsのmargin-left:autoで
+   行の右端に寄せることで、広がった横幅を意味のある形で使う。幅が足りない
+   場合だけticker側をtext-overflow:ellipsisで省略する(選定ロジック・順位・
+   スコアには無関係、表示専用)。 */
+.q5momrow{display:flex;align-items:center;gap:10px;flex-wrap:nowrap;white-space:nowrap;padding:8px 0;border-top:1px solid #fed7aa;overflow:hidden}
 .q5momrow:first-of-type{border-top:none}
-.q5momrank{font-size:16px;font-weight:900;flex:0 0 auto}
-.q5momticker{font-size:16px;font-weight:900;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
-.q5momstat{font-size:12px;font-weight:700;color:#475467;flex:0 0 auto}
-.q5momq5{font-size:13px;font-weight:800;flex:0 0 auto}
+.q5momrank{font-size:19px;font-weight:900;flex:0 0 auto}
+.q5momticker{font-size:19px;font-weight:900;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.q5momq5{font-size:14px;font-weight:800;flex:0 0 auto}
+.q5momnums{display:flex;gap:10px;flex:0 0 auto;margin-left:auto;padding-left:8px}
+.q5momstat{font-size:13px;font-weight:700;color:#475467;flex:0 0 auto}
 .q5momq5-green{color:#087443}.q5momq5-yellow{color:#9a6a00}.q5momq5-red{color:#b42318}
 @media(max-width:480px){
-  .q5mom{padding:10px 7px}
-  .q5momrow{gap:3px;padding:5px 1px}
+  .q5mom{padding:10px 12px}
+  .q5momrow{gap:6px;padding:7px 0}
+  .q5momnums{gap:8px;padding-left:4px}
 }
 @media(max-width:360px){
-  .q5momrank{font-size:15px}
-  .q5momticker{font-size:15px}
+  .q5momrank{font-size:16px}
+  .q5momticker{font-size:16px}
   .q5momq5{font-size:12px}
   .q5momstat{font-size:11px}
 }
@@ -871,8 +882,10 @@ function renderQ5Momentum(list){
       <span class="q5momrank">${rank}</span>
       <span class="q5momticker">${esc(m.ticker)}</span>
       <span class="q5momq5 ${badge.cls}">${badge.label}</span>
-      <span class="q5momstat">3日${fmt(m.three_day_return,"%")}</span>
-      <span class="q5momstat">1週${fmt(m.week_return,"%")}</span>
+      <span class="q5momnums">
+        <span class="q5momstat">3日${fmt(m.three_day_return,"%")}</span>
+        <span class="q5momstat">1週${fmt(m.week_return,"%")}</span>
+      </span>
     </div>`;
   }).join("");
   el.innerHTML = `<div class="q5mom">
