@@ -2,9 +2,17 @@ name: Daily stock data refresh
 
 on:
   schedule:
-    # UTC 22:00 = JST 翌7:00頃（米国市場クローズ後、データ確定を待つ余裕を見た時刻）
+    # UTC 22:00(前日) = JST 7:00(米国市場クローズ後、データ確定を待つ余裕を見た時刻)
     - cron: "0 22 * * *"
+    # UTC 1:00 = JST 10:00(cron起動遅延・取りこぼし対策のリトライ枠)
+    - cron: "0 1 * * *"
+    # UTC 4:00 = JST 13:00(同上)
+    - cron: "0 4 * * *"
   workflow_dispatch: {}
+
+concurrency:
+  group: daily-refresh
+  cancel-in-progress: false
 
 jobs:
   refresh:
