@@ -145,10 +145,15 @@ def api_get(params, api_key, retry_network=True):
 
 
 def fetch_daily_series(ticker, api_key, outputsize=OUTPUTSIZE):
-    """日足の終値・出来高を古い順に取得する(adjust=splits、配当調整なし)。
-    戻り値: (dates, closes, volumes, attempts)。attemptsは実際のAPI呼び出し回数。
+    """日足の終値・出来高・安値を古い順に取得する(adjust=splits、配当調整なし)。
+    戻り値: (dates, closes, volumes, lows, attempts)。attemptsは実際のAPI呼び出し回数。
     stock_logic.fetch_daily_seriesと同じ戻り値の形にして、quintile_logic側の
-    利用コードをAlpha Vantage/Twelve Dataで共通化できるようにしている。"""
+    利用コードをAlpha Vantage/Twelve Dataで共通化できるようにしている。
+
+    2026-10-14追加: lowsはAPIレスポンスに元々含まれていたが未使用だった`low`を
+    追加で返すだけ(新規API呼び出しは発生しない、既存のclose/volume抽出・
+    Q1〜Q5判定ロジックには一切影響しない、AI一斉調整パネル表示専用の追加)。
+    値が欠けている日はNoneのまま返す(架空の値は作らない)。"""
     data, attempts = api_get(
         {"symbol": ticker, "interval": "1day", "outputsize": outputsize, "adjust": ADJUST},
         api_key,
@@ -165,7 +170,12 @@ def fetch_daily_series(ticker, api_key, outputsize=OUTPUTSIZE):
             volume = int(float(v.get("volume", 0)))
         except (KeyError, TypeError, ValueError):
             continue
-        rows.append((d, close, volume))
+        low = None
+        try:
+            low = float(v["low"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        rows.append((d, close, volume, low))
     rows.sort(key=lambda x: x[0])  # 古い順
 
     if len(rows) < 20:
@@ -174,4 +184,5 @@ def fetch_daily_series(ticker, api_key, outputsize=OUTPUTSIZE):
     dates = [r[0] for r in rows]
     closes = [r[1] for r in rows]
     volumes = [r[2] for r in rows]
-    return dates, closes, volumes, attempts
+    lows = [r[3] for r in rows]
+    return dates, closes, volumes, lows, attempts

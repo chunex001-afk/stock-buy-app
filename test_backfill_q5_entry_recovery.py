@@ -66,7 +66,7 @@ class BackfillQ5EntryRecoveryTests(unittest.TestCase):
     def _patch_fetch_success(self):
         return mock.patch.object(
             refresh, "_td_fetch_one",
-            return_value=((self.dates, self.closes, self.volumes), False, None, None),
+            return_value=((self.dates, self.closes, self.volumes), False, None, None, None),
         )
 
     def _patch_backfill_days(self, fixture_by_k):

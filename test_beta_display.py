@@ -147,10 +147,10 @@ class RunQuintileRefreshBetaWiringTests(unittest.TestCase):
 
         def fake_td_fetch_one(ticker, api_key, date_key):
             if ticker == "SPY":
-                return (spy_dates, spy_closes, spy_volumes), False, None, None
+                return (spy_dates, spy_closes, spy_volumes), False, None, None, None
             if ticker == "AAA":
-                return (ticker_dates, ticker_closes, ticker_volumes), False, None, None
-            return None, False, None, None  # ローテーション銘柄は今回取得しない体で簡略化
+                return (ticker_dates, ticker_closes, ticker_volumes), False, None, None, None
+            return None, False, None, None, None  # ローテーション銘柄は今回取得しない体で簡略化
 
         with mock.patch.object(refresh, "_td_fetch_one", side_effect=fake_td_fetch_one), \
              mock.patch.object(refresh, "remaining_td_budget", return_value=(700, 0)), \

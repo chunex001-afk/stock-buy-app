@@ -126,6 +126,99 @@ Q5_MIDLINE_WATCH_DAYS = 7
 # (回復当日を1日目として数える、ユーザー確定仕様2026-10-02)。
 Q5_MIDLINE_UNLOCK_STREAK = 3
 
+# AI関連一斉調整パネル(design 2026-10-14、過去セッションでのバックテスト検証
+# 済み: 48銘柄・PRE2023/DISCOVERY/OOS区分・独立イベント方式で検証)。
+# Q1〜Q5判定ロジック(quintile_logic.py)・既存の購入/売却判定・Q5シグナル・
+# q5_price_path・q5_warning・q5_midline_haltには一切接続しない、完全に独立
+# した表示専用の追加計算(ai_market_env:stateという別キーにのみ保存)。
+# 「一斉調整を検知したら売却する」等の判定には絶対に使用しない(注意情報の
+# 表示のみ)。AI_UNIVERSEはROTATION_UNIVERSE(48銘柄)からJNJ/PG/WMT/XOM/
+# JPM/CAT/DELL(大型ディフェンシブ、参照母集団の多様性確保のためだけに
+# 含めている銘柄)を除いた41銘柄。
+AI_UNIVERSE = [
+    "AAOI", "AEHR", "ALAB", "AMD", "ARM", "ASML", "AVGO", "AXTI", "CIEN",
+    "COHR", "CRDO", "LITE", "LSCC", "MCHP", "MPWR", "MRVL", "MU", "NVDA",
+    "ON", "QCOM", "SMCI", "SNDK", "TSM",
+    "AI", "CRWD", "CRWV", "NOW", "PATH", "PLTR", "SNOW", "NBIS",
+    "APLD", "IREN", "DLR", "EQIX", "VRT", "GEV", "CEG", "NRG", "VST", "BE",
+]
+# バックテスト時と同じ最小母集団サイズ・一斉調整判定閾値(SMA20/25安値割れ率)。
+# 恣意的な後付け調整はしていない。
+AI_MARKET_ENV_MIN_POP = 5
+AI_MARKET_ENV_ADJUSTMENT_THRESHOLD = 50.0
+
+
+def _update_ai_market_env(states_today, fetched, fetched_lows, date_key):
+    """AI_UNIVERSEのうち当日Q5判定された銘柄を母集団に、SMA20/25安値割れ率・
+    -7.5%警告率(既存のq5_warningフィールドをそのまま読むだけ)・Q5起点
+    リターン(既存のq5_price_path[0]を起点に当日終値で再計算、Day5以降の
+    凍結バグの影響を受けない)からFスコア(0〜100、バックテスト時と同じ
+    等重み平均の式)を計算し、「一斉調整」の継続状態をRedisに保存する。
+
+    母集団がAI_MARKET_ENV_MIN_POP未満の日は判定不能として前回状態を
+    そのまま返す(架空の値は作らない)。一斉調整が非アクティブになったら
+    履歴をリセットする(次回発生時に新しい開始日から数え直す)。
+
+    既存のQ1〜Q5判定・購入判定・売却判定・他の補助表示(q5_warning等)には
+    一切書き込まない、読み取り専用の参照のみ(states_today/fetched/
+    fetched_lowsはこの関数の外で計算済みのものをそのまま使うだけ)。"""
+    pct_low20_list, pct_low25_list, warn_list, origin_rets = [], [], [], []
+    for ticker in AI_UNIVERSE:
+        state = states_today.get(ticker)
+        if state is None or state.get("current_q") != "Q5":
+            continue
+        if ticker not in fetched:
+            continue  # 当日の安値が取得できていない銘柄は母集団に含めない
+        lows_today = fetched_lows.get(ticker)
+        if not lows_today or lows_today[-1] is None:
+            continue
+        low_today = lows_today[-1]
+        closes_today = fetched[ticker][1]
+        sma20 = logic.sma(closes_today, 20)
+        sma25 = logic.sma(closes_today, 25)
+        if sma20 is None or sma25 is None:
+            continue
+        pct_low20_list.append(1.0 if low_today < sma20 else 0.0)
+        pct_low25_list.append(1.0 if low_today < sma25 else 0.0)
+        warn_list.append(1.0 if state.get("q5_warning") else 0.0)
+        price_path = state.get("q5_price_path") or []
+        if price_path and price_path[0].get("price"):
+            origin_rets.append((closes_today[-1] / price_path[0]["price"] - 1) * 100)
+
+    prev = store.get_ai_market_env_state()
+    n_pop = len(pct_low20_list)
+    if n_pop < AI_MARKET_ENV_MIN_POP:
+        return prev
+
+    pct_low20 = sum(pct_low20_list) / n_pop * 100
+    pct_low25 = sum(pct_low25_list) / n_pop * 100
+    pct_warn = sum(warn_list) / n_pop * 100
+    mean_origin_ret = sum(origin_rets) / len(origin_rets) if origin_rets else 0.0
+    neg_ret_component = min(max(-mean_origin_ret, 0), 50) / 50 * 100
+    f_score = round((pct_low20 + pct_low25 + pct_warn + neg_ret_component) / 4, 1)
+
+    is_active = (pct_low20 >= AI_MARKET_ENV_ADJUSTMENT_THRESHOLD
+                 or pct_low25 >= AI_MARKET_ENV_ADJUSTMENT_THRESHOLD)
+
+    if not is_active:
+        new_state = {"active": False, "last_updated": date_key}
+    else:
+        was_active = bool(prev and prev.get("active"))
+        if was_active:
+            f_history = list(prev.get("f_history", []))
+            start_date = prev.get("start_date", date_key)
+        else:
+            f_history = []
+            start_date = date_key
+        if not f_history or f_history[-1]["date"] != date_key:
+            f_history.append({"date": date_key, "f_score": f_score})
+        new_state = {
+            "active": True, "start_date": start_date, "f_history": f_history,
+            "n_pop": n_pop, "last_updated": date_key,
+        }
+    store.set_ai_market_env_state(new_state)
+    return new_state
+
 
 def remaining_td_budget():
     """(Twelve Dataの残りcredits, 本日の使用済みcredits) を返す。"""
@@ -141,18 +234,22 @@ def _td_fetch_one(ticker, api_key, date_key):
     成功時や予期しない例外時はNone/"UNKNOWN")。第4戻り値は失敗時の詳細
     メッセージ(成功時はNone)、_mark_staleへそのまま渡してRedisに記録し、
     「原因不明」状態をなくすために使う(2026-09-17、SKHY/AXT障害調査を受けて
-    追加)。使用credits(attempts)は必ずtd_api_budgetへ加算する。"""
+    追加)。使用credits(attempts)は必ずtd_api_budgetへ加算する。
+
+    2026-10-14追加: 第5戻り値lowsを追加した(AI一斉調整パネル表示専用、
+    既存のQ1〜Q5判定が使う第1戻り値(dates, closes, volumes)の形は無変更)。
+    失敗時はNone。"""
     try:
-        dates, closes, volumes, attempts = td.fetch_daily_series(ticker, api_key)
+        dates, closes, volumes, lows, attempts = td.fetch_daily_series(ticker, api_key)
         store.incr_td_api_budget(date_key, attempts)
-        return (dates, closes, volumes), False, None, None
+        return (dates, closes, volumes), False, None, None, lows
     except td.TdApiError as e:
         store.incr_td_api_budget(date_key, e.attempts)
         print(f"[Q1-5][NG] {ticker}: {e.error_type} - {e.message}")
-        return None, e.error_type == "RATE_LIMIT", e.error_type, e.message
+        return None, e.error_type == "RATE_LIMIT", e.error_type, e.message, None
     except Exception as e:
         print(f"[Q1-5][NG] {ticker}: 予期しないエラー: {e}", file=sys.stderr)
-        return None, False, "UNKNOWN", str(e)
+        return None, False, "UNKNOWN", str(e), None
 
 
 def _advance_q5_warning(prev_warning, price_path, just_completed_day5, date_key):
@@ -624,7 +721,7 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
             "message": "本日のTwelve Data利用上限に達しました。次回の自動更新をお待ちください。",
         }
 
-    result, _hit_rate_limit, error_type, _message = _td_fetch_one(ticker, api_key, date_key)
+    result, _hit_rate_limit, error_type, _message, _lows = _td_fetch_one(ticker, api_key, date_key)
     if result is None:
         if have_both_already:
             return {
@@ -779,15 +876,20 @@ def run_quintile_refresh(api_key, watchlist):
         return None
 
     fetched = {}
+    # 2026-10-14追加: 当日取得できた安値(low)をticker別に保持する(AI一斉調整
+    # パネル表示専用、既存のfetched[ticker](dates, closes, volumes)の形・
+    # Q1〜Q5判定ロジックには一切影響しない追加の保持のみ)。
+    fetched_lows = {}
     failed = []
     rate_limited = False
 
     # ① SPY取得(rel_strength_spy特徴量の鮮度を保つため、ローテーションと無関係に毎日取得)
     budget_left, _ = remaining_td_budget()
     if budget_left > 0:
-        result, hit_rate_limit, _error_type, _message = _td_fetch_one("SPY", api_key, date_key)
+        result, hit_rate_limit, _error_type, _message, lows = _td_fetch_one("SPY", api_key, date_key)
         if result:
             fetched["SPY"] = result
+            fetched_lows["SPY"] = lows
         else:
             failed.append("SPY")
             rate_limited = rate_limited or hit_rate_limit
@@ -804,9 +906,10 @@ def run_quintile_refresh(api_key, watchlist):
             if budget_left <= 0:
                 print("[Q1-5][WARN] Twelve Data予算切れのため、ローテーション取得を中断します。")
                 break
-            result, hit_rate_limit, _error_type, _message = _td_fetch_one(ticker, api_key, date_key)
+            result, hit_rate_limit, _error_type, _message, lows = _td_fetch_one(ticker, api_key, date_key)
             if result:
                 fetched[ticker] = result
+                fetched_lows[ticker] = lows
             else:
                 failed.append(ticker)
                 rate_limited = rate_limited or hit_rate_limit
@@ -822,9 +925,10 @@ def run_quintile_refresh(api_key, watchlist):
                 break
             if ticker in fetched:
                 continue  # 参照母集団のローテーションと重複している場合は再取得しない
-            result, hit_rate_limit, error_type, message = _td_fetch_one(ticker, api_key, date_key)
+            result, hit_rate_limit, error_type, message, lows = _td_fetch_one(ticker, api_key, date_key)
             if result:
                 fetched[ticker] = result
+                fetched_lows[ticker] = lows
             else:
                 failed.append(ticker)
                 rate_limited = rate_limited or hit_rate_limit
@@ -908,6 +1012,7 @@ def run_quintile_refresh(api_key, watchlist):
         trading_calendar_dates = sorted(pool_history.get("dates", []))
 
         # ⑧⑨ ユーザー監視銘柄のQ1〜Q5判定・状態履歴更新 ⑩ Redis保存(set_quintile_state内で実施)
+        states_today = {}
         if bounds is not None:
             for ticker in watchlist[: logic.MAX_TICKERS]:
                 score = scores_today.get(ticker)
@@ -962,7 +1067,12 @@ def run_quintile_refresh(api_key, watchlist):
                     ticker, score, bounds, actual_trading_date, price=price_today, beta=beta_today,
                     trading_calendar=trading_calendar_dates, dates=dates_today, closes=closes_today,
                 )
+                states_today[ticker] = state
                 print(f"[Q1-5][OK] {ticker}: {state['current_q']} (pred_score={score:.2f})")
+
+            # AI関連一斉調整パネル(design 2026-10-14)。既存のQ1〜Q5判定・
+            # 購入/売却判定には一切書き込まない、表示専用の追加計算。
+            _update_ai_market_env(states_today, fetched, fetched_lows, actual_trading_date)
     else:
         print(
             f"[Q1-5][INFO] 取引日が進んでいないため(最新取引日={actual_trading_date}、"

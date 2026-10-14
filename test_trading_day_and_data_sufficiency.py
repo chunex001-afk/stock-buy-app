@@ -55,6 +55,7 @@ class FakeStore:
         self.quintile_states = {}
         self.pool_history = None
         self.refpool = {}
+        self.ai_market_env = None
 
     def get_quintile_state(self, ticker):
         return self.quintile_states.get(ticker.upper())
@@ -83,6 +84,13 @@ class FakeStore:
     def set_ticker_record(self, ticker, data):
         return True
 
+    def get_ai_market_env_state(self):
+        return self.ai_market_env
+
+    def set_ai_market_env_state(self, data):
+        self.ai_market_env = data
+        return True
+
 
 def _fetch_side_effect(fixture_lengths, end_date, default_n=260):
     """refresh._td_fetch_one の代わりに使うside_effect。ticker毎に長さを
@@ -91,7 +99,7 @@ def _fetch_side_effect(fixture_lengths, end_date, default_n=260):
     def _side_effect(ticker, api_key, date_key):
         n = fixture_lengths.get(ticker.upper(), default_n)
         dates, closes, volumes = _fake_series(n, end=end_date)
-        return (dates, closes, volumes), False, None, None
+        return (dates, closes, volumes), False, None, None, None
     return _side_effect
 
 

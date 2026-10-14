@@ -615,6 +615,29 @@ def _compute_q5_momentum_ranking(rows):
     return candidates[:8]
 
 
+def _build_ai_market_env_view():
+    """AI関連一斉調整パネル(design 2026-10-14)の表示専用ビューを組み立てる。
+    refresh.py側が書き込むai_market_env:state(Redis)を読むだけの純粋関数。
+
+    「売買シグナル」ではなく注意情報の表示に限定する(ユーザー確定仕様)。
+    Q1〜Q5判定・購入判定・売却判定には一切関与せず、ここで組み立てた値を
+    他のロジックが参照することもない。一斉調整が非アクティブ、または
+    一度も計算されていない場合はNoneを返し、呼び出し側のJSはパネル自体を
+    表示しない。"""
+    state = store.get_ai_market_env_state()
+    if not state or not state.get("active"):
+        return None
+    f_history = state.get("f_history") or []
+    if not f_history:
+        return None
+    return {
+        "f_score": round(f_history[-1]["f_score"]),
+        "continuation_days": len(f_history),
+        "f_history": [round(e["f_score"]) for e in f_history],
+        "start_date": state.get("start_date"),
+    }
+
+
 def _get_watchlist():
     tickers = store.get_watchlist()
     if not tickers:
@@ -843,6 +866,7 @@ details.logicinfo .small{margin-top:10px}
   <details class="opinfo"><summary>運用情報</summary><div id="opinfo" class="opbody"></div></details>
 </div>
 
+<div id="aimarketenv"></div>
 <div id="q5momentum"></div>
 <div id="hero"></div>
 <div class="list" id="list"></div>
@@ -863,6 +887,28 @@ function fmtDate(s){
   if(!s) return "—";
   return s.replaceAll("-","/");
 }
+// 「M/D」形式(先頭ゼロなし)。AI一斉調整パネルの「初回確認」表示専用。
+function fmtMD(s){
+  if(!s) return "—";
+  const p = s.split("-");
+  if(p.length !== 3) return s;
+  return `${parseInt(p[1],10)}/${parseInt(p[2],10)}`;
+}
+
+// AI関連一斉調整パネル(design 2026-10-14)。app._build_ai_market_env_viewが
+// 組み立てた値をそのまま描画するだけの表示専用関数(売買シグナルではない、
+// 既存のQ1〜Q5判定・購入/売却判定には一切関与しない注意情報)。非アクティブ
+// ならセクション自体を非表示にする。既存の.q5warnスタイルを再利用する。
+function renderAiMarketEnv(d){
+  const el = document.getElementById("aimarketenv");
+  if(!el) return;
+  if(!d){ el.innerHTML = ""; return; }
+  const fPath = (d.f_history||[]).join(" → ");
+  el.innerHTML = `<div class="q5warn">
+    <div class="q5warntop">⚠️ AI関連 一斉調整（Q5売却否定）</div>
+    <div class="q5warnnote">調整度：${esc(d.f_score)}/100<br>継続${esc(d.continuation_days)}日目<br>F値推移：${esc(fPath)}<br>初回確認：${esc(fmtMD(d.start_date))}</div>
+  </div>`;
+}
 
 async function updateRanking(extraMsg){
   document.getElementById("status").textContent = extraMsg || "読み込み中…";
@@ -871,6 +917,7 @@ async function updateRanking(extraMsg){
     const j=await r.json();
     if(!j.ok) throw new Error(j.error||"取得失敗");
     render(j.rows);
+    renderAiMarketEnv(j.ai_market_env);
     renderQ5Momentum(j.q5_momentum);
     renderOpInfo(j);
     renderTickerCount(j);
@@ -1433,6 +1480,7 @@ def ranking():
             "ok": True,
             "rows": rows,
             "q5_momentum": _compute_q5_momentum_ranking(rows),
+            "ai_market_env": _build_ai_market_env_view(),
             "last_refresh": last_refresh_view,
             "budget": {"used": used, "limit": td.DAILY_API_BUDGET, "remaining": budget_left},
             "max_tickers": logic.MAX_TICKERS,

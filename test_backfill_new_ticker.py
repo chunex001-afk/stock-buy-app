@@ -67,12 +67,12 @@ class BackfillNewTickerTests(unittest.TestCase):
     def _patch_fetch_success(self):
         return mock.patch.object(
             refresh, "_td_fetch_one",
-            return_value=((self.dates, self.closes, self.volumes), False, None, None),
+            return_value=((self.dates, self.closes, self.volumes), False, None, None, None),
         )
 
     def _patch_fetch_failure(self, error_type="INVALID_SYMBOL", message="not found"):
         return mock.patch.object(
-            refresh, "_td_fetch_one", return_value=(None, False, error_type, message),
+            refresh, "_td_fetch_one", return_value=(None, False, error_type, message, None),
         )
 
     # ------------------------------------------------------------------
