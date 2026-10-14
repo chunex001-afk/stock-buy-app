@@ -615,6 +615,36 @@ def _compute_q5_momentum_ranking(rows):
     return candidates[:8]
 
 
+def _ai_market_env_longterm_note(continuation_days):
+    """継続日数(既存のcontinuation_days、無改変)から「長期化傾向」の
+    参考情報(表示専用)を組み立てる純粋関数(design 2026-10-14、追加検証の
+    バックテスト結果に基づく)。AI一斉調整の開始/終了判定・Fスコア計算・
+    Q1〜Q5判定・購入/利確/売却判定には一切関与しない。
+
+    バックテスト結果(356件の完了済み一斉調整イベント、ブートストラップ
+    95%信頼区間で確認済み):
+    - Day8時点で最終的に15営業日以上継続した割合は63.2%(95%CI [51.5,75.0])。
+      Day9時点でも66.2%だが、Day8→9の差(+2.9pt)はペアブートストラップで
+      95%CIが0を含み統計的に有意でないため、Day9も63%のまま更新しない。
+    - Day10時点では74.1%(95%CI [62.3,85.1])。Day9→10の差(+8.0pt)は
+      95%CIが0を含まず統計的に有意なため、Day10でのみ数字を更新する。
+    - Day11以降は、サンプル数が減少し続ける(n=54→29)ことと、「15営業日
+      以上」という固定閾値にNが近づくほど定義上100%に収束していく
+      (Day15時点で必然的に100%になる)影響が強くなるため、具体的な
+      パーセンテージは表示せず「長期化傾向が継続中」のみとする。
+
+    戻り値: Day1-7はNone。Day8以降は{"suffix": ..., "note": ... or None}。"""
+    if continuation_days < 8:
+        return None
+    if continuation_days <= 9:
+        return {"suffix": "⚠️ 長期化傾向",
+                "note": "過去データでは、8日目まで継続した調整の約63%が15営業日以上継続"}
+    if continuation_days == 10:
+        return {"suffix": "⚠️ 長期化傾向",
+                "note": "過去データでは、10日目まで継続した調整の約74%が15営業日以上継続"}
+    return {"suffix": "⚠️ 長期化傾向が継続中", "note": None}
+
+
 def _build_ai_market_env_view():
     """AI関連一斉調整パネル(design 2026-10-14)の表示専用ビューを組み立てる。
     refresh.py側が書き込むai_market_env:state(Redis)を読むだけの純粋関数。
@@ -630,11 +660,13 @@ def _build_ai_market_env_view():
     f_history = state.get("f_history") or []
     if not f_history:
         return None
+    continuation_days = len(f_history)
     return {
         "f_score": round(f_history[-1]["f_score"]),
-        "continuation_days": len(f_history),
+        "continuation_days": continuation_days,
         "f_history": [round(e["f_score"]) for e in f_history],
         "start_date": state.get("start_date"),
+        "longterm": _ai_market_env_longterm_note(continuation_days),
     }
 
 
@@ -904,9 +936,18 @@ function renderAiMarketEnv(d){
   if(!el) return;
   if(!d){ el.innerHTML = ""; return; }
   const fPath = (d.f_history||[]).join(" → ");
+  // 継続日数に応じた「長期化傾向」参考情報(design 2026-10-14追加検証)。
+  // d.longtermはapp._ai_market_env_longterm_noteが組み立てた値をそのまま
+  // 描画するだけ(Day1-7はnull=表示なし)。AI一斉調整の開始/終了判定・
+  // Fスコア計算には一切関与しない、表示専用の追加行。
+  const lt = d.longterm;
+  const continuationLine = lt
+    ? `継続${esc(d.continuation_days)}日目 ${esc(lt.suffix)}`
+    : `継続${esc(d.continuation_days)}日目`;
+  const noteLine = (lt && lt.note) ? `<br>${esc(lt.note)}` : "";
   el.innerHTML = `<div class="q5warn">
-    <div class="q5warntop">⚠️ AI関連 一斉調整（Q5売却否定）</div>
-    <div class="q5warnnote">調整度：${esc(d.f_score)}/100<br>継続${esc(d.continuation_days)}日目<br>F値推移：${esc(fPath)}<br>初回確認：${esc(fmtMD(d.start_date))}</div>
+    <div class="q5warntop">⚠️ AI関連 一斉調整</div>
+    <div class="q5warnnote">調整度：${esc(d.f_score)}/100<br>${continuationLine}<br>F値推移：${esc(fPath)}<br>初回確認：${esc(fmtMD(d.start_date))}${noteLine}</div>
   </div>`;
 }
 
