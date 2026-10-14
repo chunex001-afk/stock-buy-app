@@ -856,15 +856,6 @@ details.logicinfo .small{margin-top:10px}
 .q5progstate-plunge{background:#fde8e6;color:#b42318}
 .q5progret{font-weight:700;font-size:12px}
 .q5progret.up{color:#087443}.q5progret.down{color:#b42318}
-.q5progpath{margin-top:4px;font-size:12px}
-.q5progpath summary{cursor:pointer;color:#175cd3;font-weight:700;font-size:12px;list-style:none}
-.q5progpath summary::-webkit-details-marker{display:none}
-.q5progpath summary::before{content:"▸ "}
-.q5progpath[open] summary::before{content:"▾ "}
-.q5progpathbody{margin-top:6px;line-height:1.8;color:#344054}
-.q5progcp{margin-top:2px;color:#344054}
-.q5progroute{margin-top:2px;word-break:break-word}
-.q5prognote{color:#758096;font-size:11px;margin-top:6px}
 
 /* Q5 Day5注意喚起(design 2026-09-18正式実装)。購入不可等の判定には一切
    影響しない、補助的な警告表示のみ。将来の下落を断定する表現にはしない。 */
@@ -1147,28 +1138,12 @@ function q5ProgressHtml(q){
   const stateCls = Q5PROG_STATE_CLASS[p.current_state_key] || "";
   const retCls = p.current_return_pct >= 0 ? "up" : "down";
 
-  const cpParts = [1, 3, 5].filter(k => p.checkpoints && Object.prototype.hasOwnProperty.call(p.checkpoints, k))
-    .map(k => `Day${k}: ${fmtSignedPct(p.checkpoints[k])}`);
-  const cpLine = cpParts.length ? `<div class="q5progcp">${cpParts.join("　")}</div>` : "";
-
-  const routeParts = (p.path || []).map(s => `${s.state_emoji}${esc(s.state_label)}`);
-  const routeLine = routeParts.length ? routeParts.join(" → ") : "—";
-
   return `<div class="q5prog">
     <div class="q5progtop">
       <span class="q5progday">Q5 Day ${p.days_elapsed}</span>
       <span class="q5progstate ${stateCls}">${p.current_state_emoji} ${esc(p.current_state_label)}</span>
       <span class="q5progret ${retCls}">Q5起点 ${fmtSignedPct(p.current_return_pct)}</span>
     </div>
-    <details class="q5progpath">
-      <summary>経過を見る</summary>
-      <div class="q5progpathbody">
-        <div>Q5 Day0（${esc(fmtDate(p.day0_date))}）</div>
-        ${cpLine}
-        <div class="q5progroute">経過：${routeLine}</div>
-        <div class="q5prognote">※これは購入・売却・除外・乗り換えの判定ではありません。Q5後の値動きの経過を確認するための表示です。</div>
-      </div>
-    </details>
   </div>`;
 }
 
