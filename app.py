@@ -300,14 +300,24 @@ def _progress_bucket(return_pct):
     return "flat", "⚪", "停滞"
 
 
-def _compute_q5_progress(price_path):
+def _compute_q5_progress(price_path, current_price=None):
     """refresh.py が積み上げるq5_price_path([{"date","price"}, ...]、
     Day0=price_path[0])から、表示用の"経過状態"を組み立てる(純粋関数、
     Redisアクセス・書き込みなし)。price_pathが空(=一度もQ5になっていない、
     または未デプロイ時点のデータ)ならNoneを返す。
 
     「上昇」「停滞」「下落」「続落」は、購入・売却・除外・乗り換えの判定では
-    なく、Q5 Day0を基準にした累積騰落率を色分けしただけの状態表示である。"""
+    なく、Q5 Day0を基準にした累積騰落率を色分けしただけの状態表示である。
+
+    2026-10-14追加(design: AXTI等で確認されたQ5起点騰落率の凍結バグ修正)。
+    q5_price_pathはDay0〜Day5(MAX_Q5_PRICE_PATH_DAYS件)に達すると
+    refresh.py側でそれ以上追記されなくなる(Day5固定クール仕様、本関数の
+    days_elapsed/checkpoints/pathの算出ロジックはこの仕様を前提に無変更)。
+    しかし「Q5起点 +○%」(current_return_pct)はDay5以降も現在値で動き続ける
+    べき表示のため、current_priceが渡された場合はprice_path[-1]の凍結値では
+    なくcurrent_priceとday0_priceから常に再計算する(current_state_key/
+    emoji/labelも同じ値から再判定し、数値と色の食い違いを防ぐ)。
+    current_price未指定時は従来と完全に同じ結果を返す(後方互換)。"""
     if not price_path:
         return None
     day0_price = price_path[0].get("price")
@@ -341,13 +351,21 @@ def _compute_q5_progress(price_path):
         if k < len(daily):
             checkpoints[k] = daily[k]["return_pct"]
 
+    live_return_pct = current["return_pct"]
+    live_state_key = current["state_key"]
+    live_state_emoji = current["state_emoji"]
+    live_state_label = current["state_label"]
+    if current_price:
+        live_return_pct = round((current_price / day0_price - 1) * 100, 2)
+        live_state_key, live_state_emoji, live_state_label = _progress_bucket(live_return_pct)
+
     return {
         "day0_date": day0_date,
         "days_elapsed": current["day"],
-        "current_return_pct": current["return_pct"],
-        "current_state_key": current["state_key"],
-        "current_state_emoji": current["state_emoji"],
-        "current_state_label": current["state_label"],
+        "current_return_pct": live_return_pct,
+        "current_state_key": live_state_key,
+        "current_state_emoji": live_state_emoji,
+        "current_state_label": live_state_label,
         "checkpoints": checkpoints,
         "path": [
             {"day": p["day"], "date": p["date"], "return_pct": p["return_pct"],
@@ -415,10 +433,15 @@ def _build_beta_view(state):
     }
 
 
-def _build_quintile_view(ticker, trading_calendar=None):
+def _build_quintile_view(ticker, trading_calendar=None, current_price=None):
     """Q1〜Q5表示用データを組み立てる。Redisの`quintile:state:<TICKER>`を
     読むだけで、Twelve Dataへのライブ呼び出しは一切行わない(design 12)。
     まだ日次バッチで一度も判定されていない銘柄は「判定待ち」として表示する。
+
+    2026-10-14追加: current_priceは呼び出し元(_build_row)がすでに取得済みの
+    record["price"](Redis上の最新終値、Twelve Dataへの新規呼び出しはしない)
+    をそのまま渡すだけで、_compute_q5_progressの「Q5起点 +○%」ライブ再計算に
+    使う。渡されない場合は従来通り(q5_price_pathの凍結値)。
 
     2026-09-22追加: refresh.py側がデータ不足(ma200_devを含む9特徴量が
     MIN_HISTORY_FOR_FULL_FEATURES件に満たない)銘柄について
@@ -465,7 +488,7 @@ def _build_quintile_view(ticker, trading_calendar=None):
         except Exception:
             view["q5_stats"] = None
     view["q5_signal"] = _compute_q5_signal(current_q, view["history"], view["last_updated"], trading_calendar)
-    q5_progress = _compute_q5_progress(state.get("q5_price_path", []))
+    q5_progress = _compute_q5_progress(state.get("q5_price_path", []), current_price=current_price)
     # 2026-09-30監査対応: q5_signalが存在しない(一度もQ5になっていない)、
     # または失効(expired)している間はq5_progress(「Q5 Day N」表示)を出さない
     # (表示条件のみの変更。q5_progressの計算ロジック自体・q5_price_path/
@@ -496,7 +519,7 @@ def _build_quintile_view(ticker, trading_calendar=None):
 def _build_row(ticker, trading_calendar=None):
     record = store.get_ticker_record(ticker)
     freshness = _freshness(record)
-    quintile_view = _build_quintile_view(ticker, trading_calendar)
+    quintile_view = _build_quintile_view(ticker, trading_calendar, current_price=(record or {}).get("price"))
 
     if not record or not record.get("last_trade_date"):
         return {
