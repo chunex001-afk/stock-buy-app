@@ -871,7 +871,23 @@ details.logicinfo .small{margin-top:10px}
 .q5halttop{font-weight:800;color:#b42318;font-size:13px}
 .q5haltsub{color:#8a3a30;font-size:11px;margin-top:4px;line-height:1.6}
 
-@media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}}
+/* AI関連一斉調整パネル(design 2026-10-14、表示リニューアル2026-10-15)。
+   .q5warn系(他のQ5警告表示と共用)とは別クラスにして、このパネルだけ
+   サイズ・優先順位を調整できるようにした。優先順位: タイトル>開始日・
+   継続日数>F値推移>長期化傾向>説明文(ユーザー確定仕様)。購入不可・売却・
+   Q1〜Q5判定には一切関与しない、表示専用。 */
+.aimarketenv{background:#fdeceb;border-radius:14px;padding:14px 16px;margin-top:6px}
+.aimarketenv-title{font-weight:800;color:#b42318;font-size:17px;line-height:1.3}
+.aimarketenv-headline{font-weight:700;color:#8a3a30;font-size:15px;margin-top:8px;line-height:1.4}
+.aimarketenv-fhistory{margin-top:10px}
+.aimarketenv-fhistory-label{color:#8a3a30;font-size:12px;font-weight:600}
+.aimarketenv-fhistory-value{font-weight:700;color:#172033;font-size:16px;margin-top:2px;line-height:1.5;letter-spacing:0.02em}
+.aimarketenv-longterm{font-weight:700;color:#9a6a00;font-size:13.5px;margin-top:10px;line-height:1.4}
+.aimarketenv-longtermnote{font-weight:400;color:#8a3a30;font-size:12px;margin-top:2px;line-height:1.5}
+.aimarketenv-desc{color:#a3827c;font-size:10.5px;margin-top:10px;line-height:1.6}
+
+@media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}
+  .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}}
 </style>
 </head>
 <body>
@@ -918,10 +934,19 @@ function fmtMD(s){
   return `${parseInt(p[1],10)}/${parseInt(p[2],10)}`;
 }
 
-// AI関連一斉調整パネル(design 2026-10-14)。app._build_ai_market_env_viewが
-// 組み立てた値をそのまま描画するだけの表示専用関数(売買シグナルではない、
-// 既存のQ1〜Q5判定・購入/売却判定には一切関与しない注意情報)。非アクティブ
-// ならセクション自体を非表示にする。既存の.q5warnスタイルを再利用する。
+// AI関連一斉調整パネル(design 2026-10-14、表示リニューアル2026-10-15)。
+// app._build_ai_market_env_viewが組み立てた値をそのまま描画するだけの
+// 表示専用関数(売買シグナルではない、既存のQ1〜Q5判定・購入/売却判定には
+// 一切関与しない注意情報)。非アクティブならセクション自体を非表示にする。
+// 専用の.aimarketenv*スタイルを使う(.q5warn系は他のQ5警告表示と共用の
+// ため、このパネルだけサイズ調整するために分離した)。
+//
+// 2026-10-15変更: 「調整度:NN/100」という表示は、底打ち確率や進捗率と
+// 誤解されやすいため削除した(ユーザー確定仕様)。Fスコア自体の計算式・
+// 一斉調整の判定ロジックは変更していない、表示からの削除のみ。
+// start_dateは「アプリが最初にactiveを確認した日」ではなく「一斉調整が
+// 実際に始まった日」(refresh._find_ai_market_env_backfillが既存データから
+// 遡って特定した値)。
 function renderAiMarketEnv(d){
   const el = document.getElementById("aimarketenv");
   if(!el) return;
@@ -932,13 +957,18 @@ function renderAiMarketEnv(d){
   // 描画するだけ(Day1-7はnull=表示なし)。AI一斉調整の開始/終了判定・
   // Fスコア計算には一切関与しない、表示専用の追加行。
   const lt = d.longterm;
-  const continuationLine = lt
-    ? `継続${esc(d.continuation_days)}日目 ${esc(lt.suffix)}`
-    : `継続${esc(d.continuation_days)}日目`;
-  const noteLine = (lt && lt.note) ? `<br>${esc(lt.note)}` : "";
-  el.innerHTML = `<div class="q5warn">
-    <div class="q5warntop">⚠️ AI関連 一斉調整</div>
-    <div class="q5warnnote">調整度：${esc(d.f_score)}/100<br>${continuationLine}<br>F値推移：${esc(fPath)}<br>初回確認：${esc(fmtMD(d.start_date))}${noteLine}</div>
+  const longtermBlock = lt
+    ? `<div class="aimarketenv-longterm">${esc(lt.suffix)}${lt.note ? `<div class="aimarketenv-longtermnote">${esc(lt.note)}</div>` : ""}</div>`
+    : "";
+  el.innerHTML = `<div class="aimarketenv">
+    <div class="aimarketenv-title">⚠️ AI関連 一斉調整</div>
+    <div class="aimarketenv-headline">${esc(fmtMD(d.start_date))}から継続中（${esc(d.continuation_days)}営業日目）</div>
+    <div class="aimarketenv-fhistory">
+      <div class="aimarketenv-fhistory-label">F値の推移：</div>
+      <div class="aimarketenv-fhistory-value">${esc(fPath)}</div>
+    </div>
+    ${longtermBlock}
+    <div class="aimarketenv-desc">AI関連銘柄の調整の広がり・強さを示す指標です。<br>※底打ちを示す指標ではありません</div>
   </div>`;
 }
 

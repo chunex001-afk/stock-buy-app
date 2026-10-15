@@ -148,7 +148,125 @@ AI_MARKET_ENV_MIN_POP = 5
 AI_MARKET_ENV_ADJUSTMENT_THRESHOLD = 50.0
 
 
-def _update_ai_market_env(states_today, fetched, fetched_lows, date_key):
+def _q_on_date(history, date_key):
+    """quintile:state の history(Qが変化した日だけを記録したコンパクト形式)
+    から、date_key時点で有効だったQを返す(design 2026-10-15、
+    _find_ai_market_env_backfill専用の読み取りのみの参照関数)。historyは
+    日付昇順で記録されている前提(_update_quintile_stateが常に末尾に
+    追記しているため)。date_key以前の記録が一件も無ければNone。
+    既存のhistory自体は一切変更しない。"""
+    result = None
+    for h in history:
+        if h["date"] > date_key:
+            break
+        result = h["q"]
+    return result
+
+
+def _find_ai_market_env_backfill(states_today, fetched, fetched_lows, trading_calendar, date_key):
+    """「一斉調整」がinactive→activeになったことを当日初めて検知した時に呼ばれる。
+    「アプリが最初にactiveを確認した日」ではなく「現在の一斉調整が実際に
+    始まった日」をstart_dateとして表示したい(2026-10-15ユーザー要望)ため、
+    新しいAPI取得は追加せず、既に保存・取得済みのデータだけを使って
+    本当の開始日を遡って特定する。
+
+    使うデータ:
+    - states_today[ticker]["history"]: 各監視銘柄のQ変化点履歴(既存、
+      quintile:state内)。_q_on_dateで「その日のQ」を再現する。
+    - fetched[ticker] / fetched_lows[ticker]: 当日Twelve Dataから取得した
+      outputsize=full の終値・安値の全期間配列(既存、Q1〜Q5判定が使う
+      ものと同じ取得結果をそのまま再利用するだけで追加取得はしない)。
+
+    判定条件は_update_ai_market_envの本処理(is_active判定: pct_low20/
+    pct_low25どちらかが50%以上、母集団AI_MARKET_ENV_MIN_POP件以上)と
+    全く同じものを、当日から1営業日ずつ過去に遡って適用する。この条件が
+    連続して成立する最も古い日をstart_dateとする(母集団不足・データ不足・
+    条件不成立のいずれかに当たった時点で遡及を止める)。
+
+    Fスコアの4要素のうちpct_low20/pct_low25/neg_ret_component(Q5起点
+    リターン)はその日ごとの実データからその都度厳密に再計算する。
+    pct_warn(-7.5%警告率)だけは当日時点のq5_warningの値を遡及日にも
+    そのまま使う近似とする(警告は発生すると最大Q5_WARNING_MAX_BUSINESS_DAYS
+    =40営業日持続し、通常の遡及範囲(数営業日〜数週間程度)でその間に
+    発生/失効が切り替わる可能性は低いため)。Fスコアの計算式・閾値・
+    一斉調整の判定ロジック自体は変更していない(遡及適用のみ)。
+
+    どの銘柄についても遡及に使えるデータが無ければ、(date_key, [])を
+    返す(=現状と同じ、今日を開始日とする挙動にフォールバックする)。
+    既存のQ1〜Q5判定・購入判定・売却判定・history・q5_price_path・
+    q5_warningは一切変更しない(読み取り専用の参照のみ)。
+
+    戻り値: (start_date, f_history_before_today)。f_history_before_todayは
+    開始日から前営業日までを古い順に並べた[{"date":...,"f_score":...}, ...]
+    (date_key当日分は含まない。呼び出し元が通常の処理でその日分を追記する)。"""
+    candidates = []
+    for ticker in AI_UNIVERSE:
+        state = states_today.get(ticker)
+        if not state or ticker not in fetched or ticker not in fetched_lows:
+            continue
+        dates, closes, _vol = fetched[ticker]
+        lows = fetched_lows[ticker]
+        if not dates or not lows or len(lows) != len(dates) or dates[-1] != date_key:
+            continue
+        price_path = state.get("q5_price_path") or []
+        candidates.append({
+            "date_to_idx": {d: i for i, d in enumerate(dates)},
+            "closes": closes,
+            "lows": lows,
+            "history": state.get("history") or [],
+            "origin_price": price_path[0].get("price") if price_path else None,
+            "origin_date": price_path[0].get("date") if price_path else None,
+            "warn_now": bool(state.get("q5_warning")),
+        })
+
+    if not candidates or not trading_calendar or date_key not in trading_calendar:
+        return date_key, []
+
+    today_pos = trading_calendar.index(date_key)
+    start_date = date_key
+    backfilled = []  # 古い日から追加していく(最後にreverseする)
+    for cal_idx in range(today_pos - 1, -1, -1):
+        day = trading_calendar[cal_idx]
+        pct_low20_list, pct_low25_list, warn_list, origin_rets = [], [], [], []
+        for c in candidates:
+            i = c["date_to_idx"].get(day)
+            if i is None or i < 24:
+                continue  # SMA25に必要な最低日数が無ければその銘柄はその日判定不能
+            if _q_on_date(c["history"], day) != "Q5":
+                continue
+            closes_up_to = c["closes"][: i + 1]
+            sma20 = logic.sma(closes_up_to, 20)
+            sma25 = logic.sma(closes_up_to, 25)
+            low_day = c["lows"][i]
+            if sma20 is None or sma25 is None or low_day is None:
+                continue
+            pct_low20_list.append(1.0 if low_day < sma20 else 0.0)
+            pct_low25_list.append(1.0 if low_day < sma25 else 0.0)
+            warn_list.append(1.0 if c["warn_now"] else 0.0)
+            if c["origin_price"] and c["origin_date"] and c["origin_date"] <= day:
+                origin_rets.append((closes_up_to[-1] / c["origin_price"] - 1) * 100)
+
+        n_pop = len(pct_low20_list)
+        if n_pop < AI_MARKET_ENV_MIN_POP:
+            break
+        pct_low20 = sum(pct_low20_list) / n_pop * 100
+        pct_low25 = sum(pct_low25_list) / n_pop * 100
+        if not (pct_low20 >= AI_MARKET_ENV_ADJUSTMENT_THRESHOLD
+                or pct_low25 >= AI_MARKET_ENV_ADJUSTMENT_THRESHOLD):
+            break
+
+        pct_warn = sum(warn_list) / n_pop * 100
+        mean_origin_ret = sum(origin_rets) / len(origin_rets) if origin_rets else 0.0
+        neg_ret_component = min(max(-mean_origin_ret, 0), 50) / 50 * 100
+        f_score = round((pct_low20 + pct_low25 + pct_warn + neg_ret_component) / 4, 1)
+        backfilled.append({"date": day, "f_score": f_score})
+        start_date = day
+
+    backfilled.reverse()
+    return start_date, backfilled
+
+
+def _update_ai_market_env(states_today, fetched, fetched_lows, trading_calendar, date_key):
     """AI_UNIVERSEのうち当日Q5判定された銘柄を母集団に、SMA20/25安値割れ率・
     -7.5%警告率(既存のq5_warningフィールドをそのまま読むだけ)・Q5起点
     リターン(既存のq5_price_path[0]を起点に当日終値で再計算、Day5以降の
@@ -158,6 +276,12 @@ def _update_ai_market_env(states_today, fetched, fetched_lows, date_key):
     母集団がAI_MARKET_ENV_MIN_POP未満の日は判定不能として前回状態を
     そのまま返す(架空の値は作らない)。一斉調整が非アクティブになったら
     履歴をリセットする(次回発生時に新しい開始日から数え直す)。
+
+    非アクティブ→アクティブに切り替わった当日は、_find_ai_market_env_backfill
+    (2026-10-15追加)で「本当の開始日」を既存データから遡って特定する
+    (アプリが最初にactiveを確認した日ではなく、一斉調整が実際に始まった日を
+    start_dateにする、ユーザー要望)。すでにアクティブが継続している日は
+    この遡及処理を行わない(既存のstart_date/f_historyをそのまま使う)。
 
     既存のQ1〜Q5判定・購入判定・売却判定・他の補助表示(q5_warning等)には
     一切書き込まない、読み取り専用の参照のみ(states_today/fetched/
@@ -208,8 +332,8 @@ def _update_ai_market_env(states_today, fetched, fetched_lows, date_key):
             f_history = list(prev.get("f_history", []))
             start_date = prev.get("start_date", date_key)
         else:
-            f_history = []
-            start_date = date_key
+            start_date, f_history = _find_ai_market_env_backfill(
+                states_today, fetched, fetched_lows, trading_calendar, date_key)
         if not f_history or f_history[-1]["date"] != date_key:
             f_history.append({"date": date_key, "f_score": f_score})
         new_state = {
@@ -1072,7 +1196,9 @@ def run_quintile_refresh(api_key, watchlist):
 
             # AI関連一斉調整パネル(design 2026-10-14)。既存のQ1〜Q5判定・
             # 購入/売却判定には一切書き込まない、表示専用の追加計算。
-            _update_ai_market_env(states_today, fetched, fetched_lows, actual_trading_date)
+            _update_ai_market_env(
+                states_today, fetched, fetched_lows, trading_calendar_dates, actual_trading_date,
+            )
     else:
         print(
             f"[Q1-5][INFO] 取引日が進んでいないため(最新取引日={actual_trading_date}、"
