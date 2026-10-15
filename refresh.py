@@ -277,11 +277,18 @@ def _update_ai_market_env(states_today, fetched, fetched_lows, trading_calendar,
     そのまま返す(架空の値は作らない)。一斉調整が非アクティブになったら
     履歴をリセットする(次回発生時に新しい開始日から数え直す)。
 
-    非アクティブ→アクティブに切り替わった当日は、_find_ai_market_env_backfill
-    (2026-10-15追加)で「本当の開始日」を既存データから遡って特定する
-    (アプリが最初にactiveを確認した日ではなく、一斉調整が実際に始まった日を
-    start_dateにする、ユーザー要望)。すでにアクティブが継続している日は
-    この遡及処理を行わない(既存のstart_date/f_historyをそのまま使う)。
+    「本当の開始日」をstart_dateに使う仕組み(_find_ai_market_env_backfill、
+    2026-10-15追加)。以下の2パターンのどちらでも、まだ遡及が済んでいない
+    (保存済み状態に"backfill_applied": Trueが無い)場合は遡及を実行し、
+    start_dateとf_historyを「必ずセットで」古い方の値に置き換える
+    (start_dateだけ更新してf_historyが古いまま、という不整合は作らない):
+    - 非アクティブ→アクティブに切り替わった当日
+    - すでにactive=Trueとして保存されているが、この機能の追加より前の
+      旧実装で保存されたなどの理由でbackfill_applied未設定のまま残っている状態
+      (2026-10-15ユーザー報告: 本番で「10/14から継続中」のまま10/8へ
+      遡及されなかったケースへの対応)
+    一度backfill_applied: Trueになった後は、通常の日次更新(f_historyへの
+    1日分の追記のみ)に戻り、毎日の遡及計算は行わない。
 
     既存のQ1〜Q5判定・購入判定・売却判定・他の補助表示(q5_warning等)には
     一切書き込まない、読み取り専用の参照のみ(states_today/fetched/
@@ -328,17 +335,23 @@ def _update_ai_market_env(states_today, fetched, fetched_lows, trading_calendar,
         new_state = {"active": False, "last_updated": date_key}
     else:
         was_active = bool(prev and prev.get("active"))
-        if was_active:
+        backfill_applied = bool(prev and prev.get("backfill_applied"))
+        if was_active and backfill_applied:
             f_history = list(prev.get("f_history", []))
             start_date = prev.get("start_date", date_key)
         else:
+            # 新規activeへの切り替わり、またはbackfill未適用のまま残っている
+            # 既存active状態(2026-10-15ユーザー報告のケース)。いずれも
+            # start_date/f_historyを「本当の開始日」基準で丸ごと作り直す
+            # (古いstart_dateだけを使い回して不整合を作らないため、prevの
+            # f_historyは引き継がない)。
             start_date, f_history = _find_ai_market_env_backfill(
                 states_today, fetched, fetched_lows, trading_calendar, date_key)
         if not f_history or f_history[-1]["date"] != date_key:
             f_history.append({"date": date_key, "f_score": f_score})
         new_state = {
             "active": True, "start_date": start_date, "f_history": f_history,
-            "n_pop": n_pop, "last_updated": date_key,
+            "n_pop": n_pop, "last_updated": date_key, "backfill_applied": True,
         }
     store.set_ai_market_env_state(new_state)
     return new_state

@@ -189,6 +189,88 @@ class UpdateAiMarketEnvStartDateTests(unittest.TestCase):
         self.assertEqual(state_after_day2["start_date"], expected_start)
         self.assertEqual(len(state_after_day2["f_history"]), len(state_after_day1["f_history"]) + 1)
         self.assertEqual(state_after_day2["f_history"][-1]["date"], day2)
+        self.assertTrue(state_after_day2.get("backfill_applied"))
+
+
+class ExistingActiveStateBackfillRepairTests(unittest.TestCase):
+    """2026-10-15ユーザー報告: 本番でactive=True・start_date=初回確認日のまま
+    保存されていた既存状態(=今回の機能追加より前にinactive→activeの遷移が
+    確定していたケース)が、「backfill未適用」のまま残っていても、次回の
+    通常更新でstart_date/f_historyがセットで正しく復元されることの検証。"""
+
+    def setUp(self):
+        self.fake_store = mock.Mock()
+        store_patcher = mock.patch.object(refresh, "store", self.fake_store)
+        store_patcher.start()
+        self.addCleanup(store_patcher.stop)
+
+    def _legacy_prev(self, today, confirmed_f_score=56.0):
+        """旧実装(今回の遡及機能より前)が保存していたと想定される状態:
+        「アプリが最初にactiveを確認した日」だけがstart_dateになっており、
+        f_historyもその1日分しか無い。backfill_appliedフィールドは存在しない
+        (旧実装はこのフィールドを書いていなかった)。"""
+        return {
+            "active": True,
+            "start_date": today,
+            "f_history": [{"date": today, "f_score": confirmed_f_score}],
+            "n_pop": 5,
+            "last_updated": today,
+        }
+
+    def test_legacy_active_state_is_repaired_with_matching_start_date_and_history(self):
+        calendar, states_today, fetched, fetched_lows, today = _build_scenario(drop_idx=28)
+        true_start = calendar[28]
+        self.fake_store.get_ai_market_env_state.return_value = self._legacy_prev(today)
+
+        new_state = refresh._update_ai_market_env(states_today, fetched, fetched_lows, calendar, today)
+
+        self.assertTrue(new_state["active"])
+        self.assertTrue(new_state["backfill_applied"])
+        self.assertEqual(new_state["start_date"], true_start)
+        self.assertNotEqual(new_state["start_date"], today)
+        # start_dateとf_historyが必ずセットで復元される(先頭日付が完全一致、
+        # 「start_dateだけ更新してf_historyが古いまま」という不整合が無い)。
+        self.assertEqual(new_state["f_history"][0]["date"], new_state["start_date"])
+        self.assertEqual(new_state["f_history"][-1]["date"], today)
+        self.assertGreater(len(new_state["f_history"]), 1)
+
+    def test_repair_moves_with_the_data_for_different_start_dates(self):
+        """開始日が異なる複数パターンでも、ハードコードではなく実データに
+        追従して正しくstart_date/f_historyが復元されることの確認。"""
+        for drop_idx in (24, 28, 33):
+            with self.subTest(drop_idx=drop_idx):
+                calendar, states_today, fetched, fetched_lows, today = _build_scenario(drop_idx=drop_idx)
+                true_start = calendar[drop_idx]
+                self.fake_store.get_ai_market_env_state.return_value = self._legacy_prev(today)
+
+                new_state = refresh._update_ai_market_env(states_today, fetched, fetched_lows, calendar, today)
+
+                self.assertEqual(new_state["start_date"], true_start)
+                self.assertEqual(new_state["f_history"][0]["date"], true_start)
+                self.assertEqual(new_state["f_history"][0]["date"], new_state["start_date"])
+
+    def test_already_backfilled_state_is_not_recomputed(self):
+        """backfill_applied: Trueが既についている状態は、遡及処理を
+        再実行しない(毎日の不要な再計算をしないことの確認)。"""
+        calendar, states_today, fetched, fetched_lows, today = _build_scenario(drop_idx=30)
+        prev = {
+            "active": True,
+            "start_date": calendar[30],
+            "f_history": [{"date": calendar[30], "f_score": 46.0}, {"date": calendar[31], "f_score": 52.0}],
+            "backfill_applied": True,
+            "n_pop": 5,
+            "last_updated": calendar[31],
+        }
+        self.fake_store.get_ai_market_env_state.return_value = prev
+
+        with mock.patch.object(refresh, "_find_ai_market_env_backfill") as backfill_mock:
+            new_state = refresh._update_ai_market_env(states_today, fetched, fetched_lows, calendar, today)
+
+        backfill_mock.assert_not_called()
+        self.assertEqual(new_state["start_date"], calendar[30])
+        self.assertEqual(len(new_state["f_history"]), 3)
+        self.assertEqual(new_state["f_history"][-1]["date"], today)
+        self.assertEqual(new_state["f_history"][0]["date"], new_state["start_date"])
 
 
 if __name__ == "__main__":
