@@ -670,6 +670,35 @@ def _build_ai_market_env_view():
     }
 
 
+def _build_riskoff_view():
+    """Risk-off判定(design 2026-10-16)の表示専用ビューを組み立てる。
+    refresh.py側が書き込むriskoff:state(Redis)を読むだけの純粋関数。
+
+    既存のQ1〜Q5判定・購入判定・売却判定・AI一斉調整判定には一切関与せず、
+    ここで組み立てた値を他のロジックが参照することもない。本番には実際の
+    購入・ポジション管理機能自体が存在しないため、ここでの「投資比率」は
+    ユーザーへの推奨表示であり、アプリが自動的に売買・比率変更を行うことは
+    ない。未計算(初回デプロイ直後等)の場合はactive=Falseの通常状態として
+    表示する(非表示にはしない、常に画面最上部に状態を示す仕様のため)。"""
+    state = store.get_riskoff_state()
+    if not state:
+        return {
+            "active": False, "ratio": 1.0, "below_streak": 0, "above_streak": 0,
+            "entry_days": refresh.RISKOFF_ENTRY_DAYS, "exit_days": refresh.RISKOFF_EXIT_DAYS,
+            "spy_close": None, "sma200": None,
+        }
+    return {
+        "active": bool(state.get("active")),
+        "ratio": state.get("ratio", 1.0),
+        "below_streak": state.get("below_streak", 0),
+        "above_streak": state.get("above_streak", 0),
+        "entry_days": refresh.RISKOFF_ENTRY_DAYS,
+        "exit_days": refresh.RISKOFF_EXIT_DAYS,
+        "spy_close": state.get("spy_close"),
+        "sma200": state.get("sma200"),
+    }
+
+
 def _get_watchlist():
     tickers = store.get_watchlist()
     if not tickers:
@@ -886,12 +915,33 @@ details.logicinfo .small{margin-top:10px}
 .aimarketenv-longtermnote{font-weight:400;color:#8a3a30;font-size:12px;margin-top:2px;line-height:1.5}
 .aimarketenv-desc{color:#a3827c;font-size:10.5px;margin-top:10px;line-height:1.6}
 
+/* Risk-off表示(design 2026-10-16)。アプリを開いた瞬間に「今は通常運用か
+   Risk-offか」「投資比率をどうすべきか」が一目で分かることを最優先する、
+   画面最上部固定の最重要アラート。既存のQ1〜Q5判定・購入/売却判定・
+   AI一斉調整パネルには一切関与しない、表示専用。常に表示する(非アクティブ
+   でも非表示にしない)。 */
+#riskoff{margin-bottom:18px}
+.riskoff-normal{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#e6f6ee;border-radius:14px;padding:12px 16px;font-size:14px;color:#0a5c38}
+.riskoff-normal b{font-weight:800}
+.riskoff-normal .riskoff-dot{font-size:16px}
+.riskoff-alert{background:#fdeceb;border:3px solid #b42318;border-radius:18px;padding:18px 20px;box-shadow:0 4px 20px #0000001a}
+.riskoff-alert-title{font-size:22px;font-weight:900;color:#b42318;letter-spacing:.02em}
+.riskoff-alert-desc{font-size:14px;font-weight:700;color:#8a3a30;margin-top:8px}
+.riskoff-alert-cond{font-size:14px;font-weight:700;color:#172033;margin-top:10px;background:#fff;border-radius:10px;padding:8px 12px;display:inline-block}
+.riskoff-ratio-label{font-size:12px;font-weight:700;color:#8a3a30;margin-top:14px}
+.riskoff-ratio-value{font-size:34px;font-weight:900;color:#b42318;line-height:1.2}
+.riskoff-ratio-change{font-size:13px;font-weight:700;color:#8a3a30;margin-top:2px}
+.riskoff-exit{font-size:13px;font-weight:700;color:#172033;margin-top:14px;background:#fff;border-radius:10px;padding:10px 12px;line-height:1.6}
+.riskoff-exit b{color:#b42318}
+
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}
-  .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}}
+  .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}
+  .riskoff-alert{padding:14px 16px}.riskoff-alert-title{font-size:19px}.riskoff-ratio-value{font-size:28px}}
 </style>
 </head>
 <body>
 <div class="wrap">
+<div id="riskoff"></div>
 <div class="title">📊 保有銘柄のQ1〜Q5状態</div>
 <div id="tickerCount" class="tickercount"></div>
 <div class="sub">実データ版｜最大20銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
@@ -947,6 +997,38 @@ function fmtMD(s){
 // start_dateは「アプリが最初にactiveを確認した日」ではなく「一斉調整が
 // 実際に始まった日」(refresh._find_ai_market_env_backfillが既存データから
 // 遡って特定した値)。
+// Risk-off表示(design 2026-10-16)。app._build_riskoff_viewが組み立てた値を
+// そのまま描画するだけの表示専用関数(既存のQ1〜Q5判定・購入/売却判定・
+// AI一斉調整判定には一切関与しない)。常に表示する(AI一斉調整パネルと違い、
+// 非アクティブでもセクション自体を消さない。「今は通常運用かRisk-offか」を
+// 常に一目で分かるようにする仕様のため)。本番には実際の購入・ポジション
+// 管理機能が存在しないため、「投資比率」はユーザーへの推奨表示。
+function renderRiskOff(d){
+  const el = document.getElementById("riskoff");
+  if(!el) return;
+  if(!d){ el.innerHTML = ""; return; }
+  if(!d.active){
+    el.innerHTML = `<div class="riskoff-normal">
+      <span class="riskoff-dot">🟢</span><b>通常運用</b>　Risk-off：OFF　投資比率：<b>100%</b>
+    </div>`;
+    return;
+  }
+  const ratioPct = Math.round((d.ratio ?? 1.0) * 100);
+  const remain = Math.max(0, d.exit_days - d.above_streak);
+  el.innerHTML = `<div class="riskoff-alert">
+    <div class="riskoff-alert-title">🔴 RISK-OFF</div>
+    <div class="riskoff-alert-desc">市場環境がRisk-offです</div>
+    <div class="riskoff-alert-cond">SPY ＜ SMA200　${esc(d.entry_days)}営業日連続</div>
+    <div class="riskoff-ratio-label">推奨投資比率</div>
+    <div class="riskoff-ratio-value">${esc(ratioPct)}%</div>
+    <div class="riskoff-ratio-change">通常：100% → 現在：${esc(ratioPct)}%</div>
+    <div class="riskoff-exit">
+      🔴 Risk-off継続中　解除進捗：<b>${esc(d.above_streak)} / ${esc(d.exit_days)}営業日</b>
+      ${remain > 0 ? `<br>→ あと${esc(remain)}営業日で通常運用へ` : ""}
+    </div>
+  </div>`;
+}
+
 function renderAiMarketEnv(d){
   const el = document.getElementById("aimarketenv");
   if(!el) return;
@@ -979,6 +1061,7 @@ async function updateRanking(extraMsg){
     const j=await r.json();
     if(!j.ok) throw new Error(j.error||"取得失敗");
     render(j.rows);
+    renderRiskOff(j.risk_off);
     renderAiMarketEnv(j.ai_market_env);
     renderQ5Momentum(j.q5_momentum);
     renderOpInfo(j);
@@ -1527,6 +1610,7 @@ def ranking():
             "rows": rows,
             "q5_momentum": _compute_q5_momentum_ranking(rows),
             "ai_market_env": _build_ai_market_env_view(),
+            "risk_off": _build_riskoff_view(),
             "last_refresh": last_refresh_view,
             "budget": {"used": used, "limit": td.DAILY_API_BUDGET, "remaining": budget_left},
             "max_tickers": logic.MAX_TICKERS,

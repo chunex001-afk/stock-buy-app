@@ -147,6 +147,75 @@ AI_UNIVERSE = [
 AI_MARKET_ENV_MIN_POP = 5
 AI_MARKET_ENV_ADJUSTMENT_THRESHOLD = 50.0
 
+# Risk-off判定(design 2026-10-16、別セッションでのバックテスト・頑健性検証
+# 済み: SPY<SMA200の開始/解除を10営業日連続で統一した方法Aが、5/7/10/15/20日・
+# 50/60/70/80%のグリッド検証で最も滑らかで頑健だった)。
+# 既存のQ1〜Q5判定(quintile_logic.py)・購入判定・Q5 Day0検出・AI一斉調整判定
+# (_update_ai_market_env)には一切接続しない、完全に独立した表示専用の追加計算
+# (riskoff:stateという別キーにのみ保存)。「Risk-off中は新規Q5購入を停止する」
+# 等の判定には絶対に使用しない(本番にはそもそもQ5の自動購入・ポジション管理
+# 機能が存在しないため、これは「推奨投資比率」の表示情報としてのみ使う)。
+RISKOFF_ENTRY_DAYS = 10   # SPY終値がSMA200を連続でこの日数下回ったらRisk-off開始
+RISKOFF_EXIT_DAYS = 10    # Risk-off中にSPY終値がSMA200を連続でこの日数上回ったら解除
+RISKOFF_RATIO = 0.70      # Risk-off時の推奨投資比率(表示専用、方法A=PF全体を均等縮小)
+
+
+def _update_riskoff_state(spy_dates, spy_closes, date_key):
+    """SPY終値がSMA200をRISKOFF_ENTRY_DAYS営業日連続で下回ったらRisk-off開始、
+    Risk-off中にRISKOFF_EXIT_DAYS営業日連続で上回ったら解除する、causalな状態
+    判定。spy_dates/spy_closesは当日実際に取得できたSPYの確定済み終値のみ
+    (Twelve Dataの日次バッチ取得、outputsize=full。既存のSPY取得をそのまま
+    再利用し、追加のAPI呼び出しは発生しない)。date_key=spy_dates[-1]
+    (当日の確定済み終値の取引日)。終値確定前のデータは一切使わない。
+
+    この関数はRedisの状態(prev)だけに依存し、未来の価格・未来のQ5状態・
+    未来のAI一斉調整状態を一切参照しない(look-ahead biasなし)。
+    同じdate_keyで複数回呼ばれても二重にカウントしない(冪等)。
+
+    戻り値・保存する状態: {"active": bool, "below_streak": int,
+    "above_streak": int, "spy_close": float, "sma200": float,
+    "ratio": float(ratio=RISKOFF_RATIO if active else 1.0),
+    "last_updated": date_key}。SMA200に必要な200件の終値が無い場合は
+    判定不能として前回状態をそのまま返す(架空の値は作らない)。"""
+    prev = store.get_riskoff_state()
+    if prev and prev.get("last_updated") == date_key:
+        return prev  # 同じ取引日の二重更新を防ぐ
+
+    sma200 = logic.sma(spy_closes, 200) if spy_closes else None
+    spy_close = spy_closes[-1] if spy_closes else None
+    if sma200 is None or spy_close is None:
+        return prev  # 判定不能(SMA200に必要な200営業日分の終値が未取得)
+
+    is_below = spy_close < sma200
+    was_active = bool(prev and prev.get("active"))
+    below_streak = prev.get("below_streak", 0) if prev else 0
+    above_streak = prev.get("above_streak", 0) if prev else 0
+
+    if is_below:
+        below_streak += 1
+        above_streak = 0
+    else:
+        above_streak += 1
+        below_streak = 0
+
+    active = was_active
+    if not was_active and below_streak >= RISKOFF_ENTRY_DAYS:
+        active = True
+    elif was_active and above_streak >= RISKOFF_EXIT_DAYS:
+        active = False
+
+    new_state = {
+        "active": active,
+        "below_streak": below_streak,
+        "above_streak": above_streak,
+        "spy_close": spy_close,
+        "sma200": round(sma200, 2),
+        "ratio": RISKOFF_RATIO if active else 1.0,
+        "last_updated": date_key,
+    }
+    store.set_riskoff_state(new_state)
+    return new_state
+
 
 def _q_on_date(history, date_key):
     """quintile:state の history(Qが変化した日だけを記録したコンパクト形式)
@@ -1115,6 +1184,13 @@ def run_quintile_refresh(api_key, watchlist):
         for _dates, _closes, _volumes in fetched.values():
             actual_trading_date = _dates[-1]
             break
+
+    # Risk-off判定(design 2026-10-16)。既存のQ1〜Q5パイプライン(quintile_updated
+    # ゲート)とは完全に独立しており、SPYが当日取得できていれば常に実行する
+    # (Q5の参照母集団プールの更新有無とは無関係)。_update_riskoff_state自体が
+    # 同じdate_keyの二重更新を防ぐため、ここでのガードはSPY取得成否のみでよい。
+    if spy_dates is not None and spy_closes is not None and actual_trading_date is not None:
+        _update_riskoff_state(spy_dates, spy_closes, actual_trading_date)
 
     pool_history = store.get_pool_history()
     prev_trading_date = None

@@ -213,3 +213,16 @@ def get_ai_market_env_state():
 
 def set_ai_market_env_state(data):
     return set_json("ai_market_env:state", data)
+
+
+def get_riskoff_state():
+    """Risk-off判定(design 2026-10-16、バックテスト検証済み)の状態を取得する。
+    戻り値: {"active": bool, "below_streak": int, "above_streak": int,
+    "spy_close": float, "sma200": float, "ratio": float, "last_updated": ...}
+    または None(未計算時)。既存のQ1〜Q5判定・購入/売却判定・AI一斉調整判定
+    とは完全に独立した表示専用データで、他のキーとは別キーに保存する。"""
+    return get_json("riskoff:state")
+
+
+def set_riskoff_state(data):
+    return set_json("riskoff:state", data)

@@ -56,6 +56,7 @@ class FakeStore:
         self.pool_history = None
         self.refpool = {}
         self.ai_market_env = None
+        self.riskoff = None
 
     def get_quintile_state(self, ticker):
         return self.quintile_states.get(ticker.upper())
@@ -89,6 +90,13 @@ class FakeStore:
 
     def set_ai_market_env_state(self, data):
         self.ai_market_env = data
+        return True
+
+    def get_riskoff_state(self):
+        return self.riskoff
+
+    def set_riskoff_state(self, data):
+        self.riskoff = data
         return True
 
 
