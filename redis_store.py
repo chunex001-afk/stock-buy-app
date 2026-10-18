@@ -226,3 +226,18 @@ def get_riskoff_state():
 
 def set_riskoff_state(data):
     return set_json("riskoff:state", data)
+
+
+def get_portfolio_state():
+    """日次アクション型UI(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md)
+    のポートフォリオ記録(ユーザーが「購入を記録」した結果)を取得する。
+    戻り値: {"positions": {"<TICKER>": {"entry_date": "YYYY-MM-DD",
+    "entry_price": float, "profit_taken": bool, "profit_taken_date": ... or None}},
+    "last_updated": ...} または None(未記録時)。既存のQ1〜Q5判定・Day0判定・
+    Risk-off判定とは完全に独立したデータで、他のキーとは別キーに保存する。
+    実際の証券口座とは連携しない(ユーザーが確認ボタンで記録した内容のみ)。"""
+    return get_json("portfolio:state")
+
+
+def set_portfolio_state(data):
+    return set_json("portfolio:state", data)

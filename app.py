@@ -149,6 +149,16 @@ def _trading_day_offset(calendar_dates, anchor_date, n):
     return calendar_dates[target_idx]
 
 
+def _trading_day_index(calendar_dates, date_str):
+    """calendar_dates(ソート済み"YYYY-MM-DD"文字列リスト)の中でdate_strが
+    何番目(0始まり)の取引日かを返す。見つからなければNone(日次アクション型
+    UI(design 2026-10-16)の保有営業日数計算専用。架空の取引日は作らない)。"""
+    idx = bisect.bisect_left(calendar_dates, date_str)
+    if idx < len(calendar_dates) and calendar_dates[idx] == date_str:
+        return idx
+    return None
+
+
 def _resolve_q_for_date(history, target_date):
     """historyから、target_date以前の最新のQを前方補完(carry-forward)で
     返す(2026-09-29追加: 従来JS側にあったresolveQForDateと同じロジックを
@@ -699,6 +709,142 @@ def _build_riskoff_view():
     }
 
 
+# 日次アクション型UI(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md
+# フェーズ2)。「今日やること」をSELL→PROFIT→空き枠確定→BUYの順で判定する。
+# 既存のQ1〜Q5判定・Day0判定・Risk-off判定・ランキング(sort_rows)には一切
+# 変更を加えない、読み取り専用の追加レイヤー。実際の証券口座とは連携せず、
+# ユーザーが確認ボタンで記録した内容(portfolio:state)だけを扱う。
+
+HOLD_DAYS = 20          # 1銘柄あたりの基本保有営業日数(既存のバックテスト検証値、無変更)
+PROFIT_THRESHOLD_PCT = 50  # +50%到達で利益確定(既存のバックテスト検証値、無変更)
+MAX_POSITIONS = 6          # 最大保有銘柄数(既存のバックテスト検証値、無変更)
+
+
+def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, trading_calendar):
+    """「今日のアクション」をSELL→PROFIT→空き枠確定→BUYの順で判定する純粋関数。
+    Redis・HTTPへのアクセスは一切行わない(呼び出し元が全て読み込んで渡す)。
+
+    rows: _build_rowが組み立てた監視銘柄一覧。**watchlist登録順(sort_rowsで
+    並び替える前の順)で渡すこと**(同日に複数Q5 Day0が出て空き枠を超えた場合、
+    この順番がBUY候補の優先順位になるため)。
+    portfolio_state: store.get_portfolio_state()の戻り値(None可)。
+      {"positions": {"<TICKER>": {"entry_date","entry_price","profit_taken",
+      "profit_taken_date"}}, "last_updated":...}
+    riskoff_state: store.get_riskoff_state()の戻り値(None可)。
+    anchor_date: 判定基準日("YYYY-MM-DD"、通常は最新の取引日)。
+    trading_calendar: ソート済み取引日リスト(_trading_days_calendar()の戻り値)。
+
+    戻り値: {"sell": [{"ticker","days_held","profit_eligible_too"}],
+             "profit": [{"ticker","gain_pct"}],
+             "buy": [{"ticker"}](free_slots件まで), "buy_candidates_total": int,
+             "free_slots": int(SELL確定後・BUY判定に使う値),
+             "held_count": int(現在の実際の保有数),
+             "risk_off_active": bool, "recommended_ratio": float}
+
+    状態遷移(IMPLEMENTATION_DESIGN_daily_action_ui.md 7節で確認済み):
+    - 保有銘柄が再びDay0になってもBUY候補にしない(ticker in positionsで除外)
+    - +50%到達後、profit_taken=trueなら二度とPROFITを出さない
+    - 20営業日到達とPROFITが同日に発生した場合はSELLのみ表示する
+    - Risk-offはBUY判定自体を変更しない(推奨比率の参考値を返すだけ)
+    """
+    positions = dict((portfolio_state or {}).get("positions") or {})
+
+    # --- 1. SELL判定(保有営業日数 >= HOLD_DAYS) ---
+    today_idx = _trading_day_index(trading_calendar, anchor_date)
+    sell_list = []
+    sell_tickers = set()
+    for ticker, pos in positions.items():
+        entry_idx = _trading_day_index(trading_calendar, pos.get("entry_date"))
+        if entry_idx is None or today_idx is None:
+            continue  # 判定不能(カレンダー範囲外等)。架空の値は作らない。
+        days_held = today_idx - entry_idx
+        if days_held >= HOLD_DAYS:
+            price = (store.get_ticker_record(ticker) or {}).get("price")
+            profit_eligible_too = False
+            entry_price = pos.get("entry_price")
+            if price is not None and entry_price:
+                profit_eligible_too = (price / entry_price - 1) * 100 >= PROFIT_THRESHOLD_PCT
+            sell_list.append({"ticker": ticker, "days_held": days_held,
+                               "profit_eligible_too": profit_eligible_too})
+            sell_tickers.add(ticker)
+
+    # --- 2. PROFIT判定(SELL対象は除く、+50%未到達・既に利確済みも除く) ---
+    profit_list = []
+    for ticker, pos in positions.items():
+        if ticker in sell_tickers or pos.get("profit_taken"):
+            continue
+        entry_price = pos.get("entry_price")
+        price = (store.get_ticker_record(ticker) or {}).get("price")
+        if not entry_price or price is None:
+            continue
+        gain_pct = (price / entry_price - 1) * 100
+        if gain_pct >= PROFIT_THRESHOLD_PCT:
+            profit_list.append({"ticker": ticker, "gain_pct": gain_pct})
+
+    # --- 3. 空き枠確定(SELL確定後の保有数を基準にする、PROFITは枠を変えない) ---
+    held_count = len(positions)
+    free_slots = max(0, MAX_POSITIONS - (held_count - len(sell_tickers)))
+
+    # --- 4. BUY判定(watchlist登録順、保有中銘柄とDay0以外は除外) ---
+    yesterday = _trading_day_offset(trading_calendar, anchor_date, 1) if trading_calendar else None
+    buy_candidates = []
+    for row in rows:
+        ticker = row.get("ticker")
+        if ticker in positions:
+            continue
+        q = row.get("quintile") or {}
+        if q.get("status") != "ready":
+            continue
+        history = q.get("history") or []
+        today_q = _resolve_q_for_date(history, anchor_date)
+        yesterday_q = _resolve_q_for_date(history, yesterday) if yesterday else None
+        is_day0 = (today_q == "Q5") and (yesterday_q != "Q5")
+        if is_day0:
+            buy_candidates.append({"ticker": ticker})
+
+    buy_list = buy_candidates[:free_slots]
+
+    risk_off_active = bool(riskoff_state and riskoff_state.get("active"))
+    recommended_ratio = (riskoff_state or {}).get("ratio", 1.0) if risk_off_active else 1.0
+
+    return {
+        "sell": sell_list,
+        "profit": profit_list,
+        "buy": buy_list,
+        "buy_candidates_total": len(buy_candidates),
+        "free_slots": free_slots,
+        "held_count": held_count,
+        "risk_off_active": risk_off_active,
+        "recommended_ratio": recommended_ratio,
+    }
+
+
+def _build_portfolio_view():
+    """保有枠(最大6)の表示用データを組み立てる。store.get_portfolio_state()・
+    store.get_ticker_record()を読むだけの表示専用関数(design 2026-10-16、
+    _build_riskoff_viewと同じ「読み取り専用で組み立てるだけ」のパターン)。
+    新しい価格取得・新しいQ5計算は一切行わない。"""
+    state = store.get_portfolio_state()
+    positions = (state or {}).get("positions") or {}
+    trading_calendar = _trading_days_calendar()
+    today_idx = _trading_day_index(trading_calendar, trading_calendar[-1]) if trading_calendar else None
+
+    holdings = []
+    for ticker, pos in sorted(positions.items(), key=lambda kv: kv[1].get("entry_date") or ""):
+        entry_price = pos.get("entry_price")
+        price = (store.get_ticker_record(ticker) or {}).get("price")
+        gain_pct = ((price / entry_price - 1) * 100) if (price is not None and entry_price) else None
+        entry_idx = _trading_day_index(trading_calendar, pos.get("entry_date")) if trading_calendar else None
+        days_held = (today_idx - entry_idx) if (today_idx is not None and entry_idx is not None) else None
+        holdings.append({
+            "ticker": ticker, "entry_date": pos.get("entry_date"), "entry_price": entry_price,
+            "current_price": price, "gain_pct": gain_pct, "days_held": days_held,
+            "profit_taken": bool(pos.get("profit_taken")),
+        })
+
+    return {"holdings": holdings, "held_count": len(positions), "max_positions": MAX_POSITIONS}
+
+
 def _get_watchlist():
     tickers = store.get_watchlist()
     if not tickers:
@@ -934,14 +1080,58 @@ details.logicinfo .small{margin-top:10px}
 .riskoff-exit{font-size:13px;font-weight:700;color:#172033;margin-top:14px;background:#fff;border-radius:10px;padding:10px 12px;line-height:1.6}
 .riskoff-exit b{color:#b42318}
 
+/* 今日のアクション(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md
+   フェーズ4)。daily_actions(SELL→PROFIT→BUYの優先順でサーバー側が計算済み)を
+   そのままカードとして描画するだけ。Q1〜Q5判定・Day0判定・Risk-off判定には
+   一切関与しない、表示とボタン操作のみの追加。 */
+#dailyActions{margin-bottom:14px;display:flex;flex-direction:column;gap:10px}
+.daction{border-radius:16px;padding:14px 16px;box-shadow:0 2px 14px #0000000c}
+.daction-sell{background:#fdeceb;border:1px solid #f3c9c6}
+.daction-profit{background:#fff7e6;border:1px solid #f4dba3}
+.daction-buy{background:#e6f6ee;border:1px solid #b8e6cf}
+.daction-none{background:#eef1f5;border:1px solid #dde1e8;color:#68748a;text-align:center;font-weight:700}
+.daction-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.daction-badge{font-weight:900;font-size:13px;padding:2px 10px;border-radius:999px}
+.daction-sell .daction-badge{background:#b42318;color:#fff}
+.daction-profit .daction-badge{background:#9a6a00;color:#fff}
+.daction-buy .daction-badge{background:#087443;color:#fff}
+.daction-ticker{font-weight:900;font-size:18px}
+.daction-rows{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:#475467;margin-bottom:10px}
+.daction-rows b{color:#172033;font-size:13.5px}
+.daction-note{font-size:12px;font-weight:700;color:#9a6a00;margin-bottom:8px}
+.daction-row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.daction-price-input{width:110px;padding:8px 10px;border:1px solid #ccd2db;border-radius:10px;font-size:14px}
+.daction-btn{border:0;border-radius:10px;padding:9px 14px;font-weight:800;font-size:13px;cursor:pointer;color:#fff}
+.daction-sell .daction-btn{background:#b42318}
+.daction-profit .daction-btn{background:#9a6a00}
+.daction-buy .daction-btn{background:#087443}
+.daction-btn:disabled{opacity:.5;cursor:not-allowed}
+.daction-msg{font-size:11.5px;margin-top:6px;min-height:14px}
+
+/* 保有ポートフォリオ表示(design 2026-10-16フェーズ4)。 */
+#portfolioStatus{margin-bottom:18px}
+.pfstatus{background:white;border-radius:16px;padding:14px 16px;box-shadow:0 2px 14px #0000000c}
+.pfstatus-head{font-weight:900;font-size:14px;margin-bottom:8px}
+.pfstatus-row{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;padding:8px 0;border-top:1px solid #eef1f5;font-size:12.5px;color:#475467}
+.pfstatus-row:first-of-type{border-top:none}
+.pfstatus-ticker{font-weight:900;font-size:14px;color:#172033;min-width:52px}
+.pfstatus-row b{color:#172033}
+.pfstatus-gain-up{color:#087443;font-weight:800}
+.pfstatus-gain-down{color:#b42318;font-weight:800}
+.pfstatus-taken{font-weight:800;color:#9a6a00}
+.pfstatus-empty{color:#98a2b3;font-size:12.5px}
+
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}
   .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}
-  .riskoff-alert{padding:14px 16px}.riskoff-alert-title{font-size:19px}.riskoff-ratio-value{font-size:28px}}
+  .riskoff-alert{padding:14px 16px}.riskoff-alert-title{font-size:19px}.riskoff-ratio-value{font-size:28px}
+  .daction{padding:12px 14px}.daction-ticker{font-size:16px}.daction-price-input{width:90px}}
 </style>
 </head>
 <body>
 <div class="wrap">
 <div id="riskoff"></div>
+<div id="dailyActions"></div>
+<div id="portfolioStatus"></div>
 <div class="title">📊 保有銘柄のQ1〜Q5状態</div>
 <div id="tickerCount" class="tickercount"></div>
 <div class="sub">実データ版｜最大20銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
@@ -1054,6 +1244,138 @@ function renderAiMarketEnv(d){
   </div>`;
 }
 
+// 今日のアクション(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md
+// フェーズ4)。app._compute_daily_actions(SELL→PROFIT→空き枠確定→BUYの順で
+// サーバー側が計算済み)とapp._build_portfolio_view(保有銘柄の取得価格・現在
+// 価格・損益率・保有日数)をそのまま組み合わせて描画するだけの表示専用関数。
+// 判定ロジック自体はここでは一切行わない(Q1〜Q5判定・Day0判定・Risk-off判定・
+// daily_actionsの計算には関与しない)。ボタンは既存のPhase3確認API
+// (/api/portfolio/confirm_buy・confirm_profit・confirm_sell)を呼ぶだけで、
+// 新しいAPIは追加しない。
+function fmtPrice(v){
+  return (v===null||v===undefined) ? "—" : Number(v).toFixed(2);
+}
+function fmtPctSigned(v){
+  if(v===null||v===undefined) return "—";
+  return (v>=0?"+":"") + v.toFixed(1) + "%";
+}
+
+async function confirmDailyAction(kind, ticker, extra){
+  const btn = document.getElementById(`daction-btn-${kind}-${ticker}`);
+  const msgEl = document.getElementById(`daction-msg-${kind}-${ticker}`);
+  if(btn) btn.disabled = true;
+  if(msgEl) msgEl.textContent = "処理中…";
+  try{
+    const path = kind==="buy" ? "/api/portfolio/confirm_buy"
+      : kind==="profit" ? "/api/portfolio/confirm_profit"
+      : "/api/portfolio/confirm_sell";
+    const body = Object.assign({ticker}, extra||{});
+    const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.error || "処理に失敗しました");
+    await updateRanking();
+  }catch(e){
+    if(msgEl) msgEl.textContent = "エラー："+e.message;
+    if(btn) btn.disabled = false;
+  }
+}
+
+function dactionSellCard(s, h){
+  const entryPrice = h ? h.entry_price : null;
+  const currentPrice = h ? h.current_price : null;
+  const gainPct = h ? h.gain_pct : null;
+  const note = s.profit_eligible_too
+    ? `<div class="daction-note">※+50%にも到達済み(保有期限のためSELLを優先表示)</div>` : "";
+  return `<div class="daction daction-sell">
+    <div class="daction-head"><span class="daction-badge">🔴 SELL</span><span class="daction-ticker">${esc(s.ticker)}</span></div>
+    <div class="daction-rows">
+      <span>保有 <b>${esc(s.days_held)}営業日</b></span>
+      <span>取得価格 <b>${fmtPrice(entryPrice)}</b></span>
+      <span>現在価格 <b>${fmtPrice(currentPrice)}</b></span>
+      <span>損益率 <b>${fmtPctSigned(gainPct)}</b></span>
+    </div>
+    ${note}
+    <div class="daction-row-actions">
+      <button class="daction-btn" id="daction-btn-sell-${esc(s.ticker)}" onclick="confirmDailyAction('sell','${esc(s.ticker)}')">売却しました</button>
+      <span class="daction-msg" id="daction-msg-sell-${esc(s.ticker)}"></span>
+    </div>
+  </div>`;
+}
+
+function dactionProfitCard(p, h){
+  const entryPrice = h ? h.entry_price : null;
+  const currentPrice = h ? h.current_price : null;
+  return `<div class="daction daction-profit">
+    <div class="daction-head"><span class="daction-badge">🟡 PROFIT</span><span class="daction-ticker">${esc(p.ticker)}</span></div>
+    <div class="daction-note">+50%到達: 取得原価分を残して利益確定</div>
+    <div class="daction-rows">
+      <span>取得価格 <b>${fmtPrice(entryPrice)}</b></span>
+      <span>現在価格 <b>${fmtPrice(currentPrice)}</b></span>
+      <span>損益率 <b>${fmtPctSigned(p.gain_pct)}</b></span>
+    </div>
+    <div class="daction-row-actions">
+      <button class="daction-btn" id="daction-btn-profit-${esc(p.ticker)}" onclick="confirmDailyAction('profit','${esc(p.ticker)}')">利益確定しました</button>
+      <span class="daction-msg" id="daction-msg-profit-${esc(p.ticker)}"></span>
+    </div>
+  </div>`;
+}
+
+function dactionBuyCard(b){
+  return `<div class="daction daction-buy">
+    <div class="daction-head"><span class="daction-badge">🟢 BUY</span><span class="daction-ticker">${esc(b.ticker)}</span></div>
+    <div class="daction-note">Q5 Day0</div>
+    <div class="daction-row-actions">
+      <input class="daction-price-input" type="number" step="0.01" min="0.01"
+             placeholder="取得価格" id="daction-price-${esc(b.ticker)}">
+      <button class="daction-btn" id="daction-btn-buy-${esc(b.ticker)}"
+              onclick="confirmDailyAction('buy','${esc(b.ticker)}',{entry_price: parseFloat(document.getElementById('daction-price-${esc(b.ticker)}').value)})">購入済みにする</button>
+      <span class="daction-msg" id="daction-msg-buy-${esc(b.ticker)}"></span>
+    </div>
+  </div>`;
+}
+
+function renderDailyActions(da, portfolio){
+  const el = document.getElementById("dailyActions");
+  if(!el) return;
+  if(!da){ el.innerHTML = ""; return; }
+  const holdingsByTicker = {};
+  ((portfolio && portfolio.holdings) || []).forEach(h => { holdingsByTicker[h.ticker] = h; });
+
+  // 表示優先順位: SELL → PROFIT → BUY(daily_actions側の計算順をそのまま使う)
+  const cards = [];
+  (da.sell || []).forEach(s => cards.push(dactionSellCard(s, holdingsByTicker[s.ticker])));
+  (da.profit || []).forEach(p => cards.push(dactionProfitCard(p, holdingsByTicker[p.ticker])));
+  (da.buy || []).forEach(b => cards.push(dactionBuyCard(b)));
+
+  el.innerHTML = cards.length
+    ? cards.join("")
+    : `<div class="daction daction-none">今日は売買アクションはありません</div>`;
+}
+
+function renderPortfolioStatus(portfolio){
+  const el = document.getElementById("portfolioStatus");
+  if(!el) return;
+  if(!portfolio){ el.innerHTML = ""; return; }
+  const rows = (portfolio.holdings || []).map(h => {
+    const gainCls = (h.gain_pct !== null && h.gain_pct !== undefined && h.gain_pct < 0)
+      ? "pfstatus-gain-down" : "pfstatus-gain-up";
+    const daysHeld = (h.days_held === null || h.days_held === undefined) ? "—" : h.days_held;
+    return `<div class="pfstatus-row">
+      <span class="pfstatus-ticker">${esc(h.ticker)}</span>
+      <span>取得日 <b>${esc(fmtDate(h.entry_date))}</b></span>
+      <span>取得価格 <b>${fmtPrice(h.entry_price)}</b></span>
+      <span>現在価格 <b>${fmtPrice(h.current_price)}</b></span>
+      <span class="${gainCls}">${fmtPctSigned(h.gain_pct)}</span>
+      <span>保有 <b>${esc(daysHeld)}営業日</b></span>
+      ${h.profit_taken ? `<span class="pfstatus-taken">PROFIT済み</span>` : ""}
+    </div>`;
+  }).join("");
+  el.innerHTML = `<div class="pfstatus">
+    <div class="pfstatus-head">保有：${esc(portfolio.held_count)} / ${esc(portfolio.max_positions)}</div>
+    ${rows || `<div class="pfstatus-empty">現在保有している銘柄はありません</div>`}
+  </div>`;
+}
+
 async function updateRanking(extraMsg){
   document.getElementById("status").textContent = extraMsg || "読み込み中…";
   try{
@@ -1062,6 +1384,8 @@ async function updateRanking(extraMsg){
     if(!j.ok) throw new Error(j.error||"取得失敗");
     render(j.rows);
     renderRiskOff(j.risk_off);
+    renderDailyActions(j.daily_actions, j.portfolio);
+    renderPortfolioStatus(j.portfolio);
     renderAiMarketEnv(j.ai_market_env);
     renderQ5Momentum(j.q5_momentum);
     renderOpInfo(j);
@@ -1581,6 +1905,135 @@ def delete_watchlist(ticker):
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+# 日次アクション型UI(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md
+# フェーズ3)。「実際にユーザーが取引した後に記録する」確認APIのみを追加する。
+# これらのAPIは証券口座と連携しておらず、呼び出しただけで売買が実行されたと
+# 仮定することは一切ない(ユーザーが実際の取引後に明示的に呼ぶ想定)。
+# いずれも_compute_daily_actions()の判定ロジックには一切関与しない
+# (判定はリクエスト時に/api/ranking側で都度計算するだけで、記録とは独立)。
+
+@app.post("/api/portfolio/confirm_buy")
+def confirm_buy():
+    try:
+        body = request.get_json(silent=True) or {}
+        ticker = _sanitize_ticker(body.get("ticker", ""))
+        if not ticker:
+            return jsonify({"ok": False, "error": "銘柄コードを入力してください"}), 400
+        if ticker not in _get_watchlist():
+            return jsonify({"ok": False, "error": f"{ticker}は監視銘柄に登録されていません"}), 400
+
+        try:
+            entry_price = float(body.get("entry_price"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "取得価格は数値で入力してください"}), 400
+        if not (entry_price > 0):
+            return jsonify({"ok": False, "error": "取得価格は正の数で入力してください"}), 400
+
+        trading_calendar = _trading_days_calendar()
+        entry_date = body.get("entry_date")
+        if entry_date:
+            try:
+                date.fromisoformat(entry_date)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "取得日はYYYY-MM-DD形式で入力してください"}), 400
+        elif trading_calendar:
+            entry_date = trading_calendar[-1]
+        else:
+            return jsonify({"ok": False, "error": "取引日カレンダーが未取得のため、取得日を省略できません"}), 400
+
+        state = store.get_portfolio_state() or {}
+        positions = dict(state.get("positions") or {})
+
+        # 二重登録防止: 既に保有中なら拒否する(entry_date/entry_price/
+        # profit_takenを勝手に上書きしない)。
+        if ticker in positions:
+            return jsonify({"ok": False, "error": f"{ticker}は既に保有中です"}), 400
+        # 6枠超過防止: 安全側で拒否する(強制入替・自動置換はしない)。
+        if len(positions) >= MAX_POSITIONS:
+            return jsonify({
+                "ok": False,
+                "error": f"保有枠が満杯です(最大{MAX_POSITIONS}銘柄)。空き枠ができてから記録してください",
+            }), 400
+
+        positions[ticker] = {
+            "entry_date": entry_date, "entry_price": entry_price,
+            "profit_taken": False, "profit_taken_date": None,
+        }
+        new_state = {"positions": positions,
+                      "last_updated": trading_calendar[-1] if trading_calendar else entry_date}
+        if not store.set_portfolio_state(new_state):
+            return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
+
+        return jsonify({"ok": True, "ticker": ticker, "position": positions[ticker],
+                         "held_count": len(positions)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/portfolio/confirm_profit")
+def confirm_profit():
+    try:
+        body = request.get_json(silent=True) or {}
+        ticker = _sanitize_ticker(body.get("ticker", ""))
+        if not ticker:
+            return jsonify({"ok": False, "error": "銘柄コードを入力してください"}), 400
+
+        state = store.get_portfolio_state() or {}
+        positions = dict(state.get("positions") or {})
+        pos = positions.get(ticker)
+        if not pos:
+            return jsonify({"ok": False, "error": f"{ticker}は保有していません"}), 400
+
+        # 冪等性: 既に利確済みなら状態を変更せずそのまま成功として返す
+        # (entry_date/entry_price/profit_taken_dateはいずれも書き換えない)。
+        if pos.get("profit_taken"):
+            return jsonify({"ok": True, "ticker": ticker, "position": pos, "already_done": True})
+
+        trading_calendar = _trading_days_calendar()
+        today = trading_calendar[-1] if trading_calendar else state.get("last_updated")
+        new_pos = dict(pos)
+        new_pos["profit_taken"] = True
+        new_pos["profit_taken_date"] = today
+        # entry_date/entry_priceは変更しない(20日タイマー・損益計算の基準を保つ)。
+        positions[ticker] = new_pos
+        new_state = {"positions": positions, "last_updated": today}
+        if not store.set_portfolio_state(new_state):
+            return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
+
+        return jsonify({"ok": True, "ticker": ticker, "position": new_pos, "already_done": False})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/portfolio/confirm_sell")
+def confirm_sell():
+    try:
+        body = request.get_json(silent=True) or {}
+        ticker = _sanitize_ticker(body.get("ticker", ""))
+        if not ticker:
+            return jsonify({"ok": False, "error": "銘柄コードを入力してください"}), 400
+
+        state = store.get_portfolio_state() or {}
+        positions = dict(state.get("positions") or {})
+
+        # 冪等性: 既に未保有なら状態を変更せずそのまま成功として返す。
+        if ticker not in positions:
+            return jsonify({"ok": True, "ticker": ticker, "already_absent": True,
+                             "held_count": len(positions)})
+
+        del positions[ticker]
+        trading_calendar = _trading_days_calendar()
+        today = trading_calendar[-1] if trading_calendar else state.get("last_updated")
+        new_state = {"positions": positions, "last_updated": today}
+        if not store.set_portfolio_state(new_state):
+            return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
+
+        return jsonify({"ok": True, "ticker": ticker, "already_absent": False,
+                         "held_count": len(positions)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.get("/api/ranking")
 def ranking():
     try:
@@ -1591,6 +2044,11 @@ def ranking():
         # 回数を増やさないため)。
         trading_calendar = _trading_days_calendar()
         rows = [_build_row(t, trading_calendar) for t in tickers]
+        # 日次アクション型UI(design 2026-10-16)のBUY候補選定はwatchlist登録順
+        # (検出順)を使う仕様のため、表示用の並び替え(sort_rows、下記)より前の
+        # 順序を別名で保持しておく。既存のrows(表示用)の並び順・内容には
+        # 一切影響しない(sort_rows自体・その呼び出し位置も変更しない)。
+        rows_watchlist_order = list(rows)
         rows = logic.sort_rows(rows)
 
         last_refresh = store.get_last_refresh()
@@ -1605,12 +2063,26 @@ def ranking():
 
         budget_left, used = refresh.remaining_td_budget()
 
+        # 日次アクション型UI(design 2026-10-16、フェーズ3)。既存のQ1〜Q5判定・
+        # Day0判定・Risk-off判定・ランキング(sort_rows)・他のレスポンスキーには
+        # 一切変更を加えない、読み取り専用の追加キー。trading_calendarが空
+        # (初回デプロイ直後等)の場合は判定基準日が無いためdaily_actionsはNone
+        # のままとする(架空の判定は作らない)。
+        daily_actions = None
+        if trading_calendar:
+            daily_actions = _compute_daily_actions(
+                rows_watchlist_order, store.get_portfolio_state(), store.get_riskoff_state(),
+                trading_calendar[-1], trading_calendar,
+            )
+
         return jsonify({
             "ok": True,
             "rows": rows,
             "q5_momentum": _compute_q5_momentum_ranking(rows),
             "ai_market_env": _build_ai_market_env_view(),
             "risk_off": _build_riskoff_view(),
+            "daily_actions": daily_actions,
+            "portfolio": _build_portfolio_view(),
             "last_refresh": last_refresh_view,
             "budget": {"used": used, "limit": td.DAILY_API_BUDGET, "remaining": budget_left},
             "max_tickers": logic.MAX_TICKERS,
