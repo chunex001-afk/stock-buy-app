@@ -720,6 +720,35 @@ PROFIT_THRESHOLD_PCT = 50  # +50%到達で利益確定(既存のバックテス�
 MAX_POSITIONS = 6          # 最大保有銘柄数(既存のバックテスト検証値、無変更)
 
 
+def _compute_profit_take_amounts(shares, entry_price, current_price):
+    """+50%利益100%利確ルール(design 2026-10-18、バックテスト検証済み: 戦略Eが
+    CAGR/Sharpe/Calmarいずれも最良水準かつ運用が最も単純)の$計算。「取得原本
+    (shares*entry_price)は残し、含み益(現在評価額-取得原本)を100%利確する」。
+
+    保有株数の50%を売るのではなく、現在の評価額に対して取得原本相当額を
+    残すように売却株数を計算する(ユーザー確定仕様)。部分株式(小数)を許容する。
+
+    shares(保有株数)が未入力(None)の場合は計算不能として全てNoneを返す
+    (架空の株数は作らない。既存の「取得価格のみ記録する」フローとの後方互換)。
+
+    戻り値: {"cost_basis_value","current_value","profit_value",
+             "sell_shares","sell_value","remaining_shares","remaining_value"}
+    """
+    if not shares or not entry_price or current_price is None:
+        return {"cost_basis_value": None, "current_value": None, "profit_value": None,
+                "sell_shares": None, "sell_value": None, "remaining_shares": None, "remaining_value": None}
+    cost_basis_value = shares * entry_price
+    current_value = shares * current_price
+    profit_value = max(0.0, current_value - cost_basis_value)
+    sell_shares = min(profit_value / current_price, shares) if (profit_value > 0 and current_price > 0) else 0.0
+    sell_value = sell_shares * current_price
+    remaining_shares = shares - sell_shares
+    remaining_value = remaining_shares * current_price
+    return {"cost_basis_value": cost_basis_value, "current_value": current_value, "profit_value": profit_value,
+            "sell_shares": sell_shares, "sell_value": sell_value,
+            "remaining_shares": remaining_shares, "remaining_value": remaining_value}
+
+
 def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, trading_calendar):
     """「今日のアクション」をSELL→PROFIT→空き枠確定→BUYの順で判定する純粋関数。
     Redis・HTTPへのアクセスは一切行わない(呼び出し元が全て読み込んで渡す)。
@@ -728,14 +757,17 @@ def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, tr
     並び替える前の順)で渡すこと**(同日に複数Q5 Day0が出て空き枠を超えた場合、
     この順番がBUY候補の優先順位になるため)。
     portfolio_state: store.get_portfolio_state()の戻り値(None可)。
-      {"positions": {"<TICKER>": {"entry_date","entry_price","profit_taken",
-      "profit_taken_date"}}, "last_updated":...}
+      {"positions": {"<TICKER>": {"entry_date","entry_price","shares"(任意、
+      未入力ならNone),"profit_taken","profit_taken_date"}}, "last_updated":...}
     riskoff_state: store.get_riskoff_state()の戻り値(None可)。
     anchor_date: 判定基準日("YYYY-MM-DD"、通常は最新の取引日)。
     trading_calendar: ソート済み取引日リスト(_trading_days_calendar()の戻り値)。
 
     戻り値: {"sell": [{"ticker","days_held","profit_eligible_too"}],
-             "profit": [{"ticker","gain_pct"}],
+             "profit": [{"ticker","gain_pct","cost_basis_value","current_value",
+               "profit_value","sell_shares","sell_value","remaining_shares",
+               "remaining_value"}](+50%利益100%利確ルール、design 2026-10-18。
+               sharesが未入力の銘柄は金額系が全てNone)],
              "buy": [{"ticker","suggested_price"}](free_slots件まで), "buy_candidates_total": int,
              "free_slots": int(SELL確定後・BUY判定に使う値),
              "held_count": int(現在の実際の保有数),
@@ -779,7 +811,8 @@ def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, tr
             continue
         gain_pct = (price / entry_price - 1) * 100
         if gain_pct >= PROFIT_THRESHOLD_PCT:
-            profit_list.append({"ticker": ticker, "gain_pct": gain_pct})
+            amounts = _compute_profit_take_amounts(pos.get("shares"), entry_price, price)
+            profit_list.append({"ticker": ticker, "gain_pct": gain_pct, **amounts})
 
     # --- 3. 空き枠確定(SELL確定後の保有数を基準にする、PROFITは枠を変えない) ---
     held_count = len(positions)
@@ -836,10 +869,15 @@ def _build_portfolio_view():
         gain_pct = ((price / entry_price - 1) * 100) if (price is not None and entry_price) else None
         entry_idx = _trading_day_index(trading_calendar, pos.get("entry_date")) if trading_calendar else None
         days_held = (today_idx - entry_idx) if (today_idx is not None and entry_idx is not None) else None
+        shares = pos.get("shares")
+        current_value = (shares * price) if (shares and price is not None) else None
         holdings.append({
             "ticker": ticker, "entry_date": pos.get("entry_date"), "entry_price": entry_price,
             "current_price": price, "gain_pct": gain_pct, "days_held": days_held,
             "profit_taken": bool(pos.get("profit_taken")),
+            "shares": shares, "current_value": current_value,
+            "profit_take_sold_shares": pos.get("profit_take_sold_shares"),
+            "profit_take_sold_value": pos.get("profit_take_sold_value"),
         })
 
     return {"holdings": holdings, "held_count": len(positions), "max_positions": MAX_POSITIONS}
@@ -1305,16 +1343,29 @@ function dactionSellCard(s, h){
 function dactionProfitCard(p, h){
   const entryPrice = h ? h.entry_price : null;
   const currentPrice = h ? h.current_price : null;
+  const hasAmounts = p.cost_basis_value !== null && p.cost_basis_value !== undefined;
+  const amountsHtml = hasAmounts ? `
+    <div class="daction-rows">
+      <span>取得原本 <b>${fmtPrice(p.cost_basis_value)}</b></span>
+      <span>現在評価額 <b>${fmtPrice(p.current_value)}</b></span>
+      <span>利確額(約) <b>${fmtPrice(p.sell_value)}</b></span>
+      <span>利確後残す評価額(約) <b>${fmtPrice(p.remaining_value)}</b></span>
+    </div>
+    <div class="daction-rows">
+      <span>売却株数(約) <b>${p.sell_shares!=null ? p.sell_shares.toFixed(3) : "—"}</b>株</span>
+      <span>残す株数(約) <b>${p.remaining_shares!=null ? p.remaining_shares.toFixed(3) : "—"}</b>株</span>
+    </div>` : `<div class="daction-note">※株数未入力のため金額は計算できません(BUY時に株数を入力すると表示されます)</div>`;
   return `<div class="daction daction-profit">
     <div class="daction-head"><span class="daction-badge">🟡 PROFIT</span><span class="daction-ticker">${esc(p.ticker)}</span></div>
-    <div class="daction-note">+50%到達: 取得原価分を残して利益確定</div>
+    <div class="daction-note">+50%到達: 取得原本を残し、利益を100%利確(design確定仕様)</div>
     <div class="daction-rows">
       <span>取得価格 <b>${fmtPrice(entryPrice)}</b></span>
       <span>現在価格 <b>${fmtPrice(currentPrice)}</b></span>
       <span>損益率 <b>${fmtPctSigned(p.gain_pct)}</b></span>
     </div>
+    ${amountsHtml}
     <div class="daction-row-actions">
-      <button class="daction-btn" id="daction-btn-profit-${esc(p.ticker)}" onclick="confirmDailyAction('profit','${esc(p.ticker)}')">利益確定しました</button>
+      <button class="daction-btn" id="daction-btn-profit-${esc(p.ticker)}" onclick="confirmDailyAction('profit','${esc(p.ticker)}')">+50%利益100%利確を確定</button>
       <span class="daction-msg" id="daction-msg-profit-${esc(p.ticker)}"></span>
     </div>
   </div>`;
@@ -1328,10 +1379,13 @@ function dactionBuyCard(b){
     <div class="daction-row-actions">
       <input class="daction-price-input" type="number" step="0.01" min="0.01"
              placeholder="取得価格" value="${esc(suggested)}" id="daction-price-${esc(b.ticker)}">
+      <input class="daction-price-input" type="number" step="0.0001" min="0.0001"
+             placeholder="株数(任意)" id="daction-shares-${esc(b.ticker)}">
       <button class="daction-btn" id="daction-btn-buy-${esc(b.ticker)}"
-              onclick="confirmDailyAction('buy','${esc(b.ticker)}',{entry_price: parseFloat(document.getElementById('daction-price-${esc(b.ticker)}').value)})">購入済みにする</button>
+              onclick="confirmDailyAction('buy','${esc(b.ticker)}',{entry_price: parseFloat(document.getElementById('daction-price-${esc(b.ticker)}').value), shares: (document.getElementById('daction-shares-${esc(b.ticker)}').value ? parseFloat(document.getElementById('daction-shares-${esc(b.ticker)}').value) : undefined)})">購入済みにする</button>
       <span class="daction-msg" id="daction-msg-buy-${esc(b.ticker)}"></span>
     </div>
+    <div class="daction-note">株数を入力すると、+50%到達時に「原本を残して利益のみ利確」する金額を自動計算できます(未入力の場合は従来どおり利確フラグのみ記録)</div>
   </div>`;
 }
 
@@ -1361,6 +1415,8 @@ function renderPortfolioStatus(portfolio){
     const gainCls = (h.gain_pct !== null && h.gain_pct !== undefined && h.gain_pct < 0)
       ? "pfstatus-gain-down" : "pfstatus-gain-up";
     const daysHeld = (h.days_held === null || h.days_held === undefined) ? "—" : h.days_held;
+    const sharesInfo = (h.shares !== null && h.shares !== undefined)
+      ? `<span>残り株数 <b>${h.shares.toFixed(3)}</b>株(評価額 ${fmtPrice(h.current_value)})</span>` : "";
     return `<div class="pfstatus-row">
       <span class="pfstatus-ticker">${esc(h.ticker)}</span>
       <span>取得日 <b>${esc(fmtDate(h.entry_date))}</b></span>
@@ -1368,7 +1424,8 @@ function renderPortfolioStatus(portfolio){
       <span>現在価格 <b>${fmtPrice(h.current_price)}</b></span>
       <span class="${gainCls}">${fmtPctSigned(h.gain_pct)}</span>
       <span>保有 <b>${esc(daysHeld)}営業日</b></span>
-      ${h.profit_taken ? `<span class="pfstatus-taken">PROFIT済み</span>` : ""}
+      ${sharesInfo}
+      ${h.profit_taken ? `<span class="pfstatus-taken">PROFIT済み(原本のみ保有中)</span>` : ""}
     </div>`;
   }).join("");
   el.innerHTML = `<div class="pfstatus">
@@ -1930,6 +1987,21 @@ def confirm_buy():
         if not (entry_price > 0):
             return jsonify({"ok": False, "error": "取得価格は正の数で入力してください"}), 400
 
+        # 株数(shares)は任意入力(design 2026-10-18、+50%利益100%利確ルール用)。
+        # 省略時はNoneのまま保存し、_compute_daily_actions/confirm_profitの
+        # $ベース利確計算は行わない(架空の株数は作らない、既存の「取得価格のみ
+        # 記録する」フローはそのまま維持する)。部分株式(小数)を許容する
+        # (ユーザー確定仕様: 3.333...株のような端数計算を前提とするため)。
+        shares = None
+        shares_raw = body.get("shares")
+        if shares_raw not in (None, ""):
+            try:
+                shares = float(shares_raw)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "株数は数値で入力してください"}), 400
+            if not (shares > 0):
+                return jsonify({"ok": False, "error": "株数は正の数で入力してください"}), 400
+
         trading_calendar = _trading_days_calendar()
         entry_date = body.get("entry_date")
         if entry_date:
@@ -1957,7 +2029,7 @@ def confirm_buy():
             }), 400
 
         positions[ticker] = {
-            "entry_date": entry_date, "entry_price": entry_price,
+            "entry_date": entry_date, "entry_price": entry_price, "shares": shares,
             "profit_taken": False, "profit_taken_date": None,
         }
         new_state = {"positions": positions,
@@ -1996,6 +2068,21 @@ def confirm_profit():
         new_pos["profit_taken"] = True
         new_pos["profit_taken_date"] = today
         # entry_date/entry_priceは変更しない(20日タイマー・損益計算の基準を保つ)。
+
+        # +50%利益100%利確ルール(design 2026-10-18): sharesが記録されている
+        # 銘柄のみ、現在価格で「取得原本を残し含み益を100%利確」した結果の
+        # 残り株数を計算してpositionsに反映する(保存先の実行結果はこの1回の
+        # confirm呼び出し時点の価格で確定する、既存のconfirm_buy/confirm_sellと
+        # 同じ「ユーザーが確認した時点の値で記録する」方式)。sharesが無い場合は
+        # 既存通りprofit_takenフラグのみを更新する(手動「利益確定」機能の
+        # 後方互換、架空の株数は作らない)。
+        current_price = (store.get_ticker_record(ticker) or {}).get("price")
+        amounts = _compute_profit_take_amounts(pos.get("shares"), pos.get("entry_price"), current_price)
+        if amounts["remaining_shares"] is not None:
+            new_pos["shares"] = amounts["remaining_shares"]
+            new_pos["profit_take_sold_shares"] = amounts["sell_shares"]
+            new_pos["profit_take_sold_value"] = amounts["sell_value"]
+            new_pos["profit_take_price"] = current_price
         positions[ticker] = new_pos
         new_state = {"positions": positions, "last_updated": today}
         if not store.set_portfolio_state(new_state):

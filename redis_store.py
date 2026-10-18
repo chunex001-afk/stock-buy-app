@@ -232,10 +232,14 @@ def get_portfolio_state():
     """日次アクション型UI(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md)
     のポートフォリオ記録(ユーザーが「購入を記録」した結果)を取得する。
     戻り値: {"positions": {"<TICKER>": {"entry_date": "YYYY-MM-DD",
-    "entry_price": float, "profit_taken": bool, "profit_taken_date": ... or None}},
-    "last_updated": ...} または None(未記録時)。既存のQ1〜Q5判定・Day0判定・
-    Risk-off判定とは完全に独立したデータで、他のキーとは別キーに保存する。
-    実際の証券口座とは連携しない(ユーザーが確認ボタンで記録した内容のみ)。"""
+    "entry_price": float, "shares": float or None(design 2026-10-18、+50%利益
+    100%利確ルール用の任意入力。未入力ならNoneのまま、$ベースの利確計算は行わない)、
+    "profit_taken": bool, "profit_taken_date": ... or None,
+    "profit_take_sold_shares"/"profit_take_sold_value"/"profit_take_price":
+    利確実行時のみ記録(それ以外はキー自体が存在しない)}}, "last_updated": ...}
+    または None(未記録時)。既存のQ1〜Q5判定・Day0判定・Risk-off判定とは完全に
+    独立したデータで、他のキーとは別キーに保存する。実際の証券口座とは連携しない
+    (ユーザーが確認ボタンで記録した内容のみ)。"""
     return get_json("portfolio:state")
 
 
