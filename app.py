@@ -736,7 +736,7 @@ def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, tr
 
     戻り値: {"sell": [{"ticker","days_held","profit_eligible_too"}],
              "profit": [{"ticker","gain_pct"}],
-             "buy": [{"ticker"}](free_slots件まで), "buy_candidates_total": int,
+             "buy": [{"ticker","suggested_price"}](free_slots件まで), "buy_candidates_total": int,
              "free_slots": int(SELL確定後・BUY判定に使う値),
              "held_count": int(現在の実際の保有数),
              "risk_off_active": bool, "recommended_ratio": float}
@@ -800,7 +800,7 @@ def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, tr
         yesterday_q = _resolve_q_for_date(history, yesterday) if yesterday else None
         is_day0 = (today_q == "Q5") and (yesterday_q != "Q5")
         if is_day0:
-            buy_candidates.append({"ticker": ticker})
+            buy_candidates.append({"ticker": ticker, "suggested_price": row.get("price")})
 
     buy_list = buy_candidates[:free_slots]
 
@@ -1321,12 +1321,13 @@ function dactionProfitCard(p, h){
 }
 
 function dactionBuyCard(b){
+  const suggested = (b.suggested_price===null||b.suggested_price===undefined) ? "" : Number(b.suggested_price).toFixed(2);
   return `<div class="daction daction-buy">
     <div class="daction-head"><span class="daction-badge">🟢 BUY</span><span class="daction-ticker">${esc(b.ticker)}</span></div>
     <div class="daction-note">Q5 Day0</div>
     <div class="daction-row-actions">
       <input class="daction-price-input" type="number" step="0.01" min="0.01"
-             placeholder="取得価格" id="daction-price-${esc(b.ticker)}">
+             placeholder="取得価格" value="${esc(suggested)}" id="daction-price-${esc(b.ticker)}">
       <button class="daction-btn" id="daction-btn-buy-${esc(b.ticker)}"
               onclick="confirmDailyAction('buy','${esc(b.ticker)}',{entry_price: parseFloat(document.getElementById('daction-price-${esc(b.ticker)}').value)})">購入済みにする</button>
       <span class="daction-msg" id="daction-msg-buy-${esc(b.ticker)}"></span>
