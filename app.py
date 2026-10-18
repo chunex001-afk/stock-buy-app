@@ -856,7 +856,12 @@ def _build_portfolio_view():
     """保有枠(最大6)の表示用データを組み立てる。store.get_portfolio_state()・
     store.get_ticker_record()を読むだけの表示専用関数(design 2026-10-16、
     _build_riskoff_viewと同じ「読み取り専用で組み立てるだけ」のパターン)。
-    新しい価格取得・新しいQ5計算は一切行わない。"""
+    新しい価格取得・新しいQ5計算は一切行わない。各holdingのdays_heldは
+    _compute_daily_actionsのSELL判定(20営業日)と完全に同じ_trading_day_index
+    ベースの計算を再利用しており(design 2026-10-18、保有期間表示機能)、
+    値そのものは元から計算済みだった(今回新規に追加した計算ではない)。
+    hold_days(=HOLD_DAYS定数)はPF一覧側の表示用に追加しただけで、
+    SELL判定ロジック自体はここでは一切行わない・変更しない。"""
     state = store.get_portfolio_state()
     positions = (state or {}).get("positions") or {}
     trading_calendar = _trading_days_calendar()
@@ -880,7 +885,8 @@ def _build_portfolio_view():
             "profit_take_sold_value": pos.get("profit_take_sold_value"),
         })
 
-    return {"holdings": holdings, "held_count": len(positions), "max_positions": MAX_POSITIONS}
+    return {"holdings": holdings, "held_count": len(positions), "max_positions": MAX_POSITIONS,
+             "hold_days": HOLD_DAYS}
 
 
 def _get_watchlist():
@@ -1158,6 +1164,11 @@ details.logicinfo .small{margin-top:10px}
 .pfstatus-gain-down{color:#b42318;font-weight:800}
 .pfstatus-taken{font-weight:800;color:#9a6a00}
 .pfstatus-empty{color:#98a2b3;font-size:12.5px}
+/* 保有期間(design 2026-10-18)。1〜14営業日=通常・15〜19=注意・20以上=SELL対象。
+   表示専用(既存の20営業日SELL判定ロジック自体は一切変更しない)。 */
+.pfstatus-hold-normal{color:#172033;font-weight:800}
+.pfstatus-hold-warn{color:#9a6a00;font-weight:800}
+.pfstatus-hold-sell{color:#b42318;font-weight:900}
 
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}
   .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}
@@ -1411,19 +1422,28 @@ function renderPortfolioStatus(portfolio){
   const el = document.getElementById("portfolioStatus");
   if(!el) return;
   if(!portfolio){ el.innerHTML = ""; return; }
+  const holdDays = portfolio.hold_days;  // サーバー側HOLD_DAYS定数(表示のみ、判定はしない)
   const rows = (portfolio.holdings || []).map(h => {
     const gainCls = (h.gain_pct !== null && h.gain_pct !== undefined && h.gain_pct < 0)
       ? "pfstatus-gain-down" : "pfstatus-gain-up";
-    const daysHeld = (h.days_held === null || h.days_held === undefined) ? "—" : h.days_held;
     const sharesInfo = (h.shares !== null && h.shares !== undefined)
       ? `<span>残り株数 <b>${h.shares.toFixed(3)}</b>株(評価額 ${fmtPrice(h.current_value)})</span>` : "";
+    // 保有期間表示(design 2026-10-18): 既存の_compute_daily_actionsが使う
+    // days_heldをそのまま流用するだけで、ここでは何も再計算・再判定しない。
+    // 1〜14=通常・15〜19=注意・20以上=SELL対象、という表示上の色分けのみ。
+    let holdPeriodHtml = `<span>保有期間 <b>—</b></span>`;
+    if(h.days_held !== null && h.days_held !== undefined && holdDays){
+      const d = h.days_held;
+      const cls = d >= holdDays ? "pfstatus-hold-sell" : (d >= holdDays - 5 ? "pfstatus-hold-warn" : "pfstatus-hold-normal");
+      holdPeriodHtml = `<span>保有期間 <b class="${cls}">${esc(d)}/${esc(holdDays)}営業日</b></span>`;
+    }
     return `<div class="pfstatus-row">
       <span class="pfstatus-ticker">${esc(h.ticker)}</span>
       <span>取得日 <b>${esc(fmtDate(h.entry_date))}</b></span>
       <span>取得価格 <b>${fmtPrice(h.entry_price)}</b></span>
       <span>現在価格 <b>${fmtPrice(h.current_price)}</b></span>
       <span class="${gainCls}">${fmtPctSigned(h.gain_pct)}</span>
-      <span>保有 <b>${esc(daysHeld)}営業日</b></span>
+      ${holdPeriodHtml}
       ${sharesInfo}
       ${h.profit_taken ? `<span class="pfstatus-taken">PROFIT済み(原本のみ保有中)</span>` : ""}
     </div>`;
