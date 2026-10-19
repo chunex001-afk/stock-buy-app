@@ -1,7 +1,7 @@
 import bisect
 import os
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request, render_template_string
 
@@ -99,6 +99,18 @@ def _days_between(from_date_str, to_date_str):
     _trading_days_betweenに置き換えた)。取引日カレンダーが取得できない
     起動直後などの縮退時フォールバックとしてのみ残す。"""
     return (date.fromisoformat(to_date_str) - date.fromisoformat(from_date_str)).days
+
+
+_JST = timezone(timedelta(hours=9))
+
+
+def _today_jst_str():
+    """日本時間(JST、UTC+9固定、DST無しのため固定オフセットで十分)での
+    「今日」の日付文字列(design 2026-10-20)。_trading_days_calendar()[-1]
+    (株価データの処理が追いついた最終取引日)とは別物で、株価データの取得
+    タイミングに左右されない実時間の「今日」を表す。取得日の未来日判定
+    (/api/portfolio/edit_entry)専用。"""
+    return datetime.now(_JST).strftime("%Y-%m-%d")
 
 
 def _trading_days_calendar():
@@ -2249,10 +2261,13 @@ def edit_entry():
                 date.fromisoformat(entry_date_raw)
             except (TypeError, ValueError):
                 return jsonify({"ok": False, "error": "取得日はYYYY-MM-DD形式で入力してください"}), 400
-            trading_calendar = _trading_days_calendar()
-            current_trading_date = trading_calendar[-1] if trading_calendar else date.today().isoformat()
-            if entry_date_raw > current_trading_date:
-                return jsonify({"ok": False, "error": "取得日は現在の取引日より後の日付にできません"}), 400
+            # 未来日判定は実時間の「今日(JST)」を基準にする(design 2026-10-20
+            # 修正: _trading_days_calendar()[-1]は株価データが実際に処理された
+            # 最終取引日であり、更新タイミングによっては実際の今日より遅れる
+            # ことがある。そのため「株価データの最終取引日より後」という理由
+            # だけでは拒否しない。実際に未来の日付だけを拒否する)。
+            if entry_date_raw > _today_jst_str():
+                return jsonify({"ok": False, "error": "取得日は未来の日付にできません"}), 400
             new_entry_date = entry_date_raw
 
         if new_entry_price is None and new_entry_date is None:

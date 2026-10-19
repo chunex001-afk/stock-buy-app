@@ -45,6 +45,11 @@ class EditEntryTestCase(unittest.TestCase):
         self.client = app.app.test_client()
         self._portfolio_state = None
         self._records = {}
+        self._calendar = CAL
+        # 未来日判定の基準(JSTの「今日」)はCAL[-1](株価データの最終取引日)
+        # とは独立に固定する(design 2026-10-20修正の回帰確認用)。デフォルトは
+        # 実際のCOHR事例に合わせた2026-10-20。
+        self._today_jst = "2026-10-20"
 
         def fake_get_portfolio_state():
             return self._portfolio_state
@@ -57,7 +62,8 @@ class EditEntryTestCase(unittest.TestCase):
             mock.patch.object(app.store, "get_portfolio_state", side_effect=fake_get_portfolio_state),
             mock.patch.object(app.store, "set_portfolio_state", side_effect=fake_set_portfolio_state),
             mock.patch.object(app.store, "get_ticker_record", side_effect=lambda t: self._records.get(t)),
-            mock.patch.object(app, "_trading_days_calendar", side_effect=lambda: CAL),
+            mock.patch.object(app, "_trading_days_calendar", side_effect=lambda: self._calendar),
+            mock.patch.object(app, "_today_jst_str", side_effect=lambda: self._today_jst),
         ]
         for p in patches:
             p.start()
@@ -72,12 +78,12 @@ class EditEntryTestCase(unittest.TestCase):
         return (self._portfolio_state or {}).get("positions") or {}
 
     def _set_position(self, ticker, **fields):
-        base = {"entry_date": CAL[-1], "entry_price": 100.0,
+        base = {"entry_date": self._calendar[-1], "entry_price": 100.0,
                 "profit_taken": False, "profit_taken_date": None}
         base.update(fields)
         positions = dict(self._positions())
         positions[ticker] = base
-        self._portfolio_state = {"positions": positions, "last_updated": CAL[-1]}
+        self._portfolio_state = {"positions": positions, "last_updated": self._calendar[-1]}
 
 
 class EntryDateCorrectionTests(EditEntryTestCase):
@@ -206,12 +212,22 @@ class ValidationRejectionTests(EditEntryTestCase):
         self.assertEqual(self._positions()["COHR"]["entry_date"], CAL[-1])
 
     def test_10_rejects_future_entry_date(self):
+        # 未来日判定は実時間の「今日(JST)」基準(self._today_jst="2026-10-20")。
+        # 株価データの最終取引日(CAL[-1]、2026年3月)が基準ではないことの確認
+        # も兼ねる(CAL[-1]より後でも、今日より後でなければ拒否されない)。
         self._set_position("COHR")
-        future = (date.fromisoformat(CAL[-1]) + timedelta(days=5)).isoformat()
+        future = (date.fromisoformat(self._today_jst) + timedelta(days=1)).isoformat()
         resp, data = self._post({"ticker": "COHR", "entry_date": future})
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(data["ok"])
         self.assertEqual(self._positions()["COHR"]["entry_date"], CAL[-1])
+
+    def test_10b_accepts_entry_date_equal_to_today_jst(self):
+        self._set_position("COHR")
+        resp, data = self._post({"ticker": "COHR", "entry_date": self._today_jst})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(self._positions()["COHR"]["entry_date"], self._today_jst)
 
     def test_rejects_unheld_ticker(self):
         resp, data = self._post({"ticker": "ZZZZ", "entry_price": 100.0})
@@ -234,6 +250,63 @@ class ValidationRejectionTests(EditEntryTestCase):
         resp, data = self._post({"ticker": "COHR", "entry_price": "", "entry_date": ""})
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(data["ok"])
+
+
+class StaleTradingCalendarDoesNotBlockRealEntryDateTests(EditEntryTestCase):
+    """実際の本番障害の回帰テスト: 株価データの処理が遅れて
+    _trading_days_calendar()[-1](最終取引日)が実際の今日より古い状態でも、
+    「今日(JST)より後でなければ」取得日を登録できることを確認する(design
+    2026-10-20修正)。COHRの実事例(最終取引日が2026-10-16で止まっていた
+    状態で、実際の購入日2026-10-19を登録しようとして誤って拒否された)を
+    そのまま再現する。"""
+
+    def setUp(self):
+        super().setUp()
+        # 株価データが2026-10-16までしか処理されていない(例: refresh遅延)
+        self._calendar = _business_days(60, start="2026-07-27")
+        self.assertEqual(self._calendar[-1], "2026-10-16")
+        # 実際の「今日」はJSTで2026-10-20(本番障害発生時の実際の状況を再現)
+        self._today_jst = "2026-10-20"
+
+    def test_entry_date_after_stale_calendar_but_not_after_today_is_accepted(self):
+        """修正前はここで「取得日は現在の取引日より後の日付にできません」
+        エラーになっていた(_trading_days_calendar()[-1]='2026-10-16' <
+        entry_date='2026-10-19' のため)。修正後は実際の今日(JST)基準で
+        判定するため、正しい購入日2026-10-19を登録できる。"""
+        self._set_position("COHR", entry_date="2026-10-16", entry_price=120.0)
+
+        resp, data = self._post({"ticker": "COHR", "entry_date": "2026-10-19"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(self._positions()["COHR"]["entry_date"], "2026-10-19")
+
+    def test_entry_date_still_rejected_once_actually_future(self):
+        self._set_position("COHR", entry_date="2026-10-16", entry_price=120.0)
+
+        resp, data = self._post({"ticker": "COHR", "entry_date": "2026-10-21"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(data["ok"])
+        self.assertEqual(self._positions()["COHR"]["entry_date"], "2026-10-16")
+
+    def test_holding_period_shows_unknown_until_price_data_catches_up(self):
+        """保有期間計算(_trading_day_index)自体は無変更であることの確認。
+        entry_dateの訂正(2026-10-19)は保存されるが、株価データがまだ
+        2026-10-19を処理していない間はdays_heldはNone("—"表示)のままで、
+        架空の取引日を作って計算したりはしない(既存仕様どおり)。"""
+        self._set_position("COHR", entry_date="2026-10-16", entry_price=120.0)
+        self._records["COHR"] = {"price": 125.0}
+        self._post({"ticker": "COHR", "entry_date": "2026-10-19"})
+
+        view = app._build_portfolio_view()
+        self.assertEqual(view["holdings"][0]["entry_date"], "2026-10-19")
+        self.assertIsNone(view["holdings"][0]["days_held"])  # データ未到達のため算出不能
+
+        # 翌日以降の自動更新で2026-10-19まで株価データが処理されると、
+        # 既存の_trading_day_indexベースの計算がそのまま機能する
+        # (このテスト専用の再現用カレンダー、再計算ロジック自体は無変更)。
+        self._calendar = self._calendar + ["2026-10-19"]
+        view_after_data_catches_up = app._build_portfolio_view()
+        self.assertEqual(view_after_data_catches_up["holdings"][0]["days_held"], 0)
 
 
 class ProfitHistoryPreservedTests(EditEntryTestCase):
