@@ -1169,6 +1169,15 @@ details.logicinfo .small{margin-top:10px}
 .pfstatus-hold-normal{color:#172033;font-weight:800}
 .pfstatus-hold-warn{color:#9a6a00;font-weight:800}
 .pfstatus-hold-sell{color:#b42318;font-weight:900}
+/* 取得情報(取得単価・取得日)の訂正フォーム(design 2026-10-20)。 */
+.pfedit-togglebtn{background:#eef1f5;color:#172033;border:0;border-radius:10px;padding:6px 10px;font-weight:700;font-size:11.5px;cursor:pointer}
+.pfedit-form{display:flex;gap:10px;flex-wrap:wrap;align-items:end;padding:10px 0 12px;border-top:1px dashed #dde2e8}
+.pfedit-label{display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:#475467;font-weight:700}
+.pfedit-input{padding:9px;border:1px solid #ccd2db;border-radius:10px;font-size:14px;min-width:130px}
+.pfedit-actions{display:flex;gap:8px}
+.pfedit-savebtn{background:#172033;color:white;border:0;border-radius:10px;padding:9px 14px;font-weight:800;font-size:13px;cursor:pointer}
+.pfedit-cancelbtn{background:#eef1f5;color:#172033;border:0;border-radius:10px;padding:9px 14px;font-weight:800;font-size:13px;cursor:pointer}
+.pfedit-msg{font-size:11.5px;color:#b42318;min-height:14px;width:100%}
 
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}
   .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}
@@ -1418,9 +1427,46 @@ function renderDailyActions(da, portfolio){
     : `<div class="daction daction-none">今日は売買アクションはありません</div>`;
 }
 
+// 取得情報(取得単価・取得日)の訂正機能(design 2026-10-20)。実際の購入日/
+// 購入価格が誤って登録された場合に、既存ポジションのentry_price/entry_date
+// を訂正するだけの機能(新しい日付フィールドは追加しない、二重管理しない)。
+// Q5判定・BUY判定・20営業日SELL判定・PROFIT判定・Risk-off等の既存ロジックは
+// 一切変更しない(/api/portfolio/edit_entryがpositions[ticker]を更新する
+// だけで、再計算は既存のentry_date参照ロジックがそのまま行う)。
+let lastPortfolioData = null;
+let pfEditingTicker = null;
+
+function pfToggleEdit(ticker){
+  pfEditingTicker = (pfEditingTicker === ticker) ? null : ticker;
+  renderPortfolioStatus(lastPortfolioData);
+}
+function pfCancelEdit(){
+  pfEditingTicker = null;
+  renderPortfolioStatus(lastPortfolioData);
+}
+async function savePfEntryEdit(ticker){
+  const msgEl = document.getElementById(`pfedit-msg-${ticker}`);
+  const priceEl = document.getElementById(`pfedit-price-${ticker}`);
+  const dateEl = document.getElementById(`pfedit-date-${ticker}`);
+  const body = {ticker};
+  if(priceEl && priceEl.value !== "") body.entry_price = parseFloat(priceEl.value);
+  if(dateEl && dateEl.value !== "") body.entry_date = dateEl.value;
+  if(msgEl) msgEl.textContent = "保存中…";
+  try{
+    const r = await fetch("/api/portfolio/edit_entry", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.error || "保存に失敗しました");
+    pfEditingTicker = null;
+    await updateRanking();
+  }catch(e){
+    if(msgEl) msgEl.textContent = "エラー："+e.message;
+  }
+}
+
 function renderPortfolioStatus(portfolio){
   const el = document.getElementById("portfolioStatus");
   if(!el) return;
+  lastPortfolioData = portfolio;
   if(!portfolio){ el.innerHTML = ""; return; }
   const holdDays = portfolio.hold_days;  // サーバー側HOLD_DAYS定数(表示のみ、判定はしない)
   const rows = (portfolio.holdings || []).map(h => {
@@ -1437,6 +1483,21 @@ function renderPortfolioStatus(portfolio){
       const cls = d >= holdDays ? "pfstatus-hold-sell" : (d >= holdDays - 5 ? "pfstatus-hold-warn" : "pfstatus-hold-normal");
       holdPeriodHtml = `<span>保有期間 <b class="${cls}">${esc(d)}/${esc(holdDays)}営業日</b></span>`;
     }
+    const isEditing = (pfEditingTicker === h.ticker);
+    const editToggleBtn = `<button class="pfedit-togglebtn" onclick="pfToggleEdit('${esc(h.ticker)}')">${isEditing ? "編集を閉じる" : "取得情報を編集"}</button>`;
+    const editForm = isEditing ? `<div class="pfedit-form">
+      <label class="pfedit-label">取得単価
+        <input type="number" step="0.01" min="0.01" class="pfedit-input" id="pfedit-price-${esc(h.ticker)}" value="${esc(h.entry_price != null ? h.entry_price : "")}">
+      </label>
+      <label class="pfedit-label">取得日
+        <input type="date" class="pfedit-input" id="pfedit-date-${esc(h.ticker)}" value="${esc(h.entry_date || "")}">
+      </label>
+      <div class="pfedit-actions">
+        <button class="pfedit-savebtn" onclick="savePfEntryEdit('${esc(h.ticker)}')">保存</button>
+        <button class="pfedit-cancelbtn" onclick="pfCancelEdit()">キャンセル</button>
+      </div>
+      <div class="pfedit-msg" id="pfedit-msg-${esc(h.ticker)}"></div>
+    </div>` : "";
     return `<div class="pfstatus-row">
       <span class="pfstatus-ticker">${esc(h.ticker)}</span>
       <span>取得日 <b>${esc(fmtDate(h.entry_date))}</b></span>
@@ -1446,7 +1507,8 @@ function renderPortfolioStatus(portfolio){
       ${holdPeriodHtml}
       ${sharesInfo}
       ${h.profit_taken ? `<span class="pfstatus-taken">PROFIT済み(原本のみ保有中)</span>` : ""}
-    </div>`;
+      ${editToggleBtn}
+    </div>${editForm}`;
   }).join("");
   el.innerHTML = `<div class="pfstatus">
     <div class="pfstatus-head">保有：${esc(portfolio.held_count)} / ${esc(portfolio.max_positions)}</div>
@@ -2138,6 +2200,81 @@ def confirm_sell():
 
         return jsonify({"ok": True, "ticker": ticker, "already_absent": False,
                          "held_count": len(positions)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/portfolio/edit_entry")
+def edit_entry():
+    """既存保有ポジションの取得単価・取得日を訂正する(design 2026-10-20)。
+    実際の購入日/購入価格が誤って登録された場合の訂正専用で、新規購入
+    (confirm_buy)とは別のAPI。positions[ticker]のentry_price/entry_dateを
+    直接更新するだけで、新しい日付フィールドは追加しない(二重管理しない)。
+
+    entry_priceだけ・entry_dateだけ・両方同時、のいずれの指定も許可する
+    (未指定/空欄のフィールドは変更しない)。entry_dateを変更すると、
+    20営業日SELL判定・保有期間表示はいずれも既存の_trading_day_index
+    ベースの計算がentry_dateを読むだけなので、ここでentry_dateを書き換える
+    以外の追加対応は不要(再計算ロジック自体は無変更)。
+
+    profit_taken/profit_taken_date/profit_take_sold_shares/
+    profit_take_sold_value/profit_take_priceといった利確履歴は、取得情報の
+    訂正によって一切リセットしない。"""
+    try:
+        body = request.get_json(silent=True) or {}
+        ticker = _sanitize_ticker(body.get("ticker", ""))
+        if not ticker:
+            return jsonify({"ok": False, "error": "銘柄コードを入力してください"}), 400
+
+        state = store.get_portfolio_state() or {}
+        positions = dict(state.get("positions") or {})
+        pos = positions.get(ticker)
+        if not pos:
+            return jsonify({"ok": False, "error": f"{ticker}は保有していません"}), 400
+
+        new_entry_price = None
+        entry_price_raw = body.get("entry_price")
+        if entry_price_raw not in (None, ""):
+            try:
+                new_entry_price = float(entry_price_raw)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "取得単価は数値で入力してください"}), 400
+            if not (new_entry_price > 0):
+                return jsonify({"ok": False, "error": "取得単価は正の数で入力してください"}), 400
+
+        new_entry_date = None
+        entry_date_raw = body.get("entry_date")
+        if entry_date_raw not in (None, ""):
+            try:
+                date.fromisoformat(entry_date_raw)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "取得日はYYYY-MM-DD形式で入力してください"}), 400
+            trading_calendar = _trading_days_calendar()
+            current_trading_date = trading_calendar[-1] if trading_calendar else date.today().isoformat()
+            if entry_date_raw > current_trading_date:
+                return jsonify({"ok": False, "error": "取得日は現在の取引日より後の日付にできません"}), 400
+            new_entry_date = entry_date_raw
+
+        if new_entry_price is None and new_entry_date is None:
+            return jsonify({"ok": False, "error": "取得単価または取得日のいずれかを入力してください"}), 400
+
+        new_pos = dict(pos)
+        if new_entry_price is not None:
+            new_pos["entry_price"] = new_entry_price
+        if new_entry_date is not None:
+            new_pos["entry_date"] = new_entry_date
+        # profit_taken/profit_taken_date/profit_take_sold_shares/
+        # profit_take_sold_value/profit_take_price/sharesはここでは一切
+        # 変更しない(利確履歴を取得情報の訂正でリセットしないため)。
+        positions[ticker] = new_pos
+
+        trading_calendar = _trading_days_calendar()
+        new_state = {"positions": positions,
+                      "last_updated": trading_calendar[-1] if trading_calendar else state.get("last_updated")}
+        if not store.set_portfolio_state(new_state):
+            return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
+
+        return jsonify({"ok": True, "ticker": ticker, "position": new_pos})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
