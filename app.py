@@ -933,6 +933,7 @@ HTML = r"""
 .card{background:white;border-radius:22px;padding:18px;margin-bottom:16px;box-shadow:0 2px 14px #0000000c}
 .controls{display:flex;gap:8px;flex-wrap:wrap}
 .controls input{flex:1;min-width:150px;padding:13px;border:1px solid #ccd2db;border-radius:13px;font-size:16px}
+.controls input#ticker-date,.controls input#ticker-price{min-width:130px}
 button{border:0;border-radius:13px;padding:12px 16px;font-weight:800;font-size:15px;cursor:pointer;background:#172033;color:white}
 button:disabled{opacity:.5;cursor:not-allowed}
 button.secondary{background:#eef1f5;color:#172033;padding:8px 14px;font-size:13px}
@@ -1209,8 +1210,11 @@ details.logicinfo .small{margin-top:10px}
 <div class="card">
   <div class="controls">
     <input id="ticker" placeholder="例 NVDA" maxlength="10" onkeydown="if(event.key==='Enter')addTicker()">
+    <input id="ticker-date" type="date" title="取得日(任意・省略時は本日)">
+    <input id="ticker-price" type="number" step="0.01" min="0.01" placeholder="取得価格(任意)" onkeydown="if(event.key==='Enter')addTicker()">
     <button onclick="addTicker()" id="addBtn">＋追加（即時取得）</button>
   </div>
+  <div class="small">取得価格を入力すると、保有銘柄として取得日・取得価格が記録されます(省略時はウォッチリストへの登録のみ)</div>
   <div id="status" class="small">読み込み中…</div>
   <details class="opinfo"><summary>運用情報</summary><div id="opinfo" class="opbody"></div></details>
 </div>
@@ -1610,6 +1614,9 @@ function renderOpInfo(j){
 async function addTicker(){
   const el=document.getElementById("ticker"), t=el.value.trim().toUpperCase().replace(/[^A-Z0-9.\-]/g,"");
   if(!t)return;
+  const dateEl=document.getElementById("ticker-date"), priceEl=document.getElementById("ticker-price");
+  const dateRaw = dateEl ? dateEl.value.trim() : "";
+  const priceRaw = priceEl ? priceEl.value.trim() : "";
   const btn=document.getElementById("addBtn");
   btn.disabled=true;
   document.getElementById("status").textContent=`${t}を追加して即時取得中…`;
@@ -1617,8 +1624,24 @@ async function addTicker(){
     const r=await fetch("/api/watchlist",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ticker:t})});
     const j=await r.json();
     if(!j.ok){alert(j.error||"追加できませんでした");return;}
-    el.value="";
-    await updateRanking(j.fetch_note?`${t}: ${j.fetch_note}`:null);
+    let note = j.fetch_note ? `${t}: ${j.fetch_note}` : null;
+
+    // 取得価格が入力されている場合のみ、追加直後に保有ポジションとしても登録する
+    // (省略時は従来どおりウォッチリスト登録のみ、既存の「監視だけ」の使い方を維持)。
+    // entry_date/entry_price自体の検証・保存ロジックは既存の/api/portfolio/confirm_buy
+    // (Q5/BUY/SELL/+50%利確/Risk-off等の既存ロジックには一切関与しない)をそのまま使う。
+    if(priceRaw !== ""){
+      const buyBody = {ticker:t, entry_price: parseFloat(priceRaw)};
+      if(dateRaw) buyBody.entry_date = dateRaw;
+      const r2 = await fetch("/api/portfolio/confirm_buy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(buyBody)});
+      const j2 = await r2.json();
+      if(!j2.ok){
+        note = `${t}はウォッチリストに追加しましたが、保有登録に失敗しました（${j2.error||"不明なエラー"}）`;
+      }
+    }
+
+    el.value=""; if(dateEl) dateEl.value=""; if(priceEl) priceEl.value="";
+    await updateRanking(note);
   }catch(e){alert("追加エラー: "+e.message)}
   finally{btn.disabled=false;}
 }
@@ -2103,6 +2126,12 @@ def confirm_buy():
                 date.fromisoformat(entry_date)
             except (TypeError, ValueError):
                 return jsonify({"ok": False, "error": "取得日はYYYY-MM-DD形式で入力してください"}), 400
+            # 未来日判定は実時間の「今日(JST)」基準(edit_entryと同じ判定、design
+            # 2026-10-20の修正をそのまま踏襲)。株価データの最終取引日
+            # (trading_calendar[-1])より古い/新しいかは無関係に、実際の未来日
+            # のみを拒否する(過去日・最終取引日より後でも今日以前なら許可)。
+            if entry_date > _today_jst_str():
+                return jsonify({"ok": False, "error": "取得日は未来の日付にできません"}), 400
         elif trading_calendar:
             entry_date = trading_calendar[-1]
         else:
