@@ -1643,29 +1643,40 @@ function cmpDetailRowHtml(e){
     ${dayCell(e.day60_date, e.day60_price, e.day60_return_pct)}
   </div>`;
 }
-// Q5直近勢い(design 2026-10-21)。既存の「Q5確定成績」(day5/20/60の確定
-// リターン、recent_window)とは別の指標で、day0から現在までの途中経過
-// (day5/20/60の確定を問わない)を表示する。既存のcmpRowHtml/cmpTable等は
-// 一切変更せず、見出しの直下に2行だけ追加する。
-function momentumCellHtml(label, agg){
-  const sub = agg.n > 0 ? `(n=${agg.n},${agg.unique_day0_dates}日)` : "";
-  return `<span class="cmp-headline-item">${esc(label)} <b>${fmtPctSigned(agg.mean)}</b><span class="cmp-side-label">${sub}</span></span>`;
+// 「① Q5直近勢い」(design 2026-10-22改訂: 平均のみだったUI表示を、
+// バックエンドで既に計算済みのmean/median/win_rate/nがすべて見える
+// テーブル形式に変更。1銘柄の極端な値動きが「Q5全体の勢い」に見えて
+// しまうのを防ぐため中央値も併記し、nが少ない期間は「⚠ サンプル少」を
+// 添える(データ自体は除外しない、あくまで参考値として表示するだけ)。
+// バックエンド(build_momentum_report)は変更しない、新しいAPI・新しい
+// データ保存も作らない。
+const MOMENTUM_LOW_SAMPLE_THRESHOLD = 3;
+function momentumRowHtml(label, agg){
+  const lowSample = agg.n > 0 && agg.n <= MOMENTUM_LOW_SAMPLE_THRESHOLD;
+  const nCell = lowSample
+    ? `${fmtCount(agg.n)}<div class="pfstatus-taken">⚠ サンプル少</div>`
+    : fmtCount(agg.n);
+  return `<tr>
+    <td>${esc(label)}</td>
+    <td>${fmtPctSigned(agg.mean)}</td>
+    <td>${fmtPctSigned(agg.median)}</td>
+    <td>${fmtWinRate(agg.win_rate)}</td>
+    <td>${nCell}</td>
+  </tr>`;
 }
-// 「① Q5直近勢い」(design 2026-10-22改訂: 画面を①Q5直近勢い/②実績比較の
-// 2本構成に整理。旧「Q5確定成績」の見出し表示はここでは廃止するが、
-// recent_window自体はAPIレスポンスに残したまま(バックエンドのロジック・
-// データは変更しない、今回の画面で表示しないだけ)。
 function cmpHeadlineHtml(data){
   const mom = data.momentum || {};
+  const emptyAgg = {n: 0, mean: null, median: null, win_rate: null};
   const dateLabel = data.latest_price_date ? `（${esc(fmtDate(data.latest_price_date))}時点）` : "";
-  const momentumRow = `<div class="cmp-headline-row">
-    <span class="cmp-headline-label">① Q5直近勢い${dateLabel}</span>
-    ${momentumCellHtml("直近5日", mom["5"] || {n:0})}
-    ${momentumCellHtml("直近20日", mom["20"] || {n:0})}
-    ${momentumCellHtml("直近60日", mom["60"] || {n:0})}
-  </div>`;
-  return `<div class="cmp-headline">${momentumRow}</div>
-  <div class="cmp-note">「Q5直近勢い」は、直近にQ5 Day0になった銘柄が現在まで(20営業日を超えても)どれだけ動いているかを示す「騰落・勢い」の指標です(運用成績ではありません)。20営業日運用した場合の確定成績は、下の「② 実績比較」で確認できます。同じ「5日」でも②とは意味が異なります(①＝現在までの騰落、②＝20営業日運用ルールでの実績)。</div>`;
+  const rows = ["5", "20", "60"].map(h => momentumRowHtml(`直近${h}日`, mom[h] || emptyAgg)).join("");
+  return `<div class="cmp-head">① Q5直近勢い${dateLabel}</div>
+  <div style="overflow-x:auto">
+  <table class="cmp-table">
+    <thead><tr><th>期間</th><th>平均</th><th>中央値</th><th>勝率</th><th>件数</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  </div>
+  <div class="cmp-note">「Q5直近勢い」は、直近にQ5 Day0になった銘柄が現在まで(20営業日を超えても)どれだけ動いているかを示す「騰落・勢い」の指標です(運用成績ではありません)。件数(n)が${MOMENTUM_LOW_SAMPLE_THRESHOLD}件以下の期間は「⚠ サンプル少」と表示します(データは除外せず参考値として表示、特定銘柄の値動きに強く依存するため平均・中央値とも鵜呑みにしないでください)。20営業日運用した場合の成績は、下の「② 実績比較」で確認できます。同じ「5日」でも②とは意味が異なります(①＝現在までの騰落、②＝20営業日運用ルールでの実績)。</div>`;
 }
 // 【保有確定】【現在価格】の2ブロック比較(design 2026-10-21確定仕様)。
 // Q5側はQ5 Day0起算(既存のrecent_window=確定成績・momentum=直近勢いを
@@ -1726,23 +1737,32 @@ function actualPerfRowHtml(label, row){
   const diffCls = (row.mean_diff === null || row.mean_diff === undefined) ? "" : (row.mean_diff >= 0 ? "pfstatus-gain-up" : "pfstatus-gain-down");
   const subDiff = `<div class="cmp-side-label">中央値差 ${fmtPctSigned(row.median_diff)} / 勝率差 ${row.win_rate_diff==null?"—":(row.win_rate_diff>=0?"+":"")+row.win_rate_diff.toFixed(0)+"pt"}</div>`;
   // Q5側の件数セルには対象/未確定の内訳を添える(未確定=20営業日以上経過
-  // したのにday20_priceが無く、現在価格を代用せず集計から除外した件数)。
+  // したのにday20_priceが無く、現在価格を代用せず集計から除外した件数。
+  // データが存在しないケース)。
   const q5Unconfirmed = q5.unconfirmed || 0;
   const q5CountHtml = q5Unconfirmed > 0
     ? `${fmtCount(q5.n)}<div class="cmp-side-label">対象${fmtCount(q5.total)}・未確定${fmtCount(q5Unconfirmed)}</div>`
     : fmtCount(q5.n);
+  // 私側の件数セルには対象/比較対象外の内訳を添える(比較対象外=主に
+  // 20営業日を超えた売却/保有で、実データは存在するがQ5側と比較条件が
+  // 合わないため除外した件数。Q5側の「未確定」=データ不存在とは意味が
+  // 異なるため、あえて別の呼び名にしている)。
+  const mineExcluded = mine.excluded || 0;
+  const mineCountHtml = mineExcluded > 0
+    ? `${fmtCount(mine.n)}<div class="cmp-side-label">対象${fmtCount(mine.total)}・比較対象外${fmtCount(mineExcluded)}</div>`
+    : fmtCount(mine.n);
   return `<tr>
     <td>${esc(label)}</td>
     <td>${q5CountHtml}</td><td>${fmtPctSigned(q5.mean)}</td><td>${fmtPctSigned(q5.median)}</td><td>${fmtWinRate(q5.win_rate)}</td>
-    <td>${fmtCount(mine.n)}</td><td>${fmtPctSigned(mine.mean)}</td><td>${fmtPctSigned(mine.median)}</td><td>${fmtWinRate(mine.win_rate)}</td>
+    <td>${mineCountHtml}</td><td>${fmtPctSigned(mine.mean)}</td><td>${fmtPctSigned(mine.median)}</td><td>${fmtWinRate(mine.win_rate)}</td>
     <td class="${diffCls}">${fmtPctSigned(row.mean_diff)}${subDiff}</td>
   </tr>`;
 }
 function actualPerformanceBlockHtml(data){
   const ap = data.actual_performance || {};
-  const emptyAgg = {n: 0, mean: null, median: null, win_rate: null};
   const emptyQ5Agg = {n: 0, mean: null, median: null, win_rate: null, total: 0, unconfirmed: 0};
-  const emptyRow = {q5: emptyQ5Agg, mine: emptyAgg, mean_diff: null, median_diff: null, win_rate_diff: null};
+  const emptyMineAgg = {n: 0, mean: null, median: null, win_rate: null, total: 0, excluded: 0};
+  const emptyRow = {q5: emptyQ5Agg, mine: emptyMineAgg, mean_diff: null, median_diff: null, win_rate_diff: null};
   const rows = ["5", "20", "60", "120", "180"].map(h =>
     actualPerfRowHtml(`直近${h}営業日`, ap[h] || emptyRow)
   ).join("");
@@ -1764,7 +1784,7 @@ function actualPerformanceBlockHtml(data){
     <tbody>${rows}</tbody>
   </table>
   </div>
-  <div class="cmp-note">Q5側はQ5 Day0を仮想購入日とし、20営業日未満は現在価格、20営業日以上は20営業日後の価格で固定した成績です(固定後は値動きを反映しません)。20営業日以上経過してもまだ20営業日後価格が取得できていない銘柄は、現在価格を代用せず「未確定」として集計から除外します(対象件数・未確定件数は件数欄に表示)。私側は実際の購入日を基準に、売却済みは実売却価格、保有中は現在価格を使います。5/20/60/120/180営業日は保有期間ではなく、直近どの期間に発生したDay0・購入かという観測ウィンドウです(まだ20営業日経過していない銘柄も対象に含みます)。株数・資金額・NAV等は使用していません。上の「① Q5直近勢い」と同じ「5日」等の数字でも、①は現在までの騰落、②は20営業日運用ルールでの実績比較という別の意味です。</div>`;
+  <div class="cmp-note">Q5側はQ5 Day0を仮想購入日とし、20営業日未満は現在価格、20営業日以上は20営業日後の価格で固定した成績です(固定後は値動きを反映しません)。20営業日以上経過してもまだ20営業日後価格が取得できていない銘柄は、現在価格を代用せず「未確定」として集計から除外します(データが存在しないケース)。私側は、Q5 48ユニバースに含まれる銘柄のみを対象に、実際の購入日を基準として、売却済みは20営業日以内の実売却価格、保有中は20営業日未満の現在価格を使います。20営業日を超えてからの売却・20営業日以上の保有は、実データ自体はあってもQ5側と比較条件が合わないため「比較対象外」として除外します(未確定とは異なり、データ不存在ではなく比較条件不一致が理由です)。いずれも対象件数・未確定/比較対象外件数は件数欄に表示します。5/20/60/120/180営業日は保有期間ではなく、直近どの期間に発生したDay0・購入かという観測ウィンドウです(まだ20営業日経過していない銘柄も対象に含みます)。株数・資金額・NAV等は使用していません。上の「① Q5直近勢い」と同じ「5日」等の数字でも、①は現在までの騰落、②は20営業日運用ルールでの実績比較という別の意味です。</div>`;
 }
 // design 2026-10-22改訂: 比較画面を「① Q5直近勢い」「② 実績比較」の2本
 // 構成に整理。旧「Q5確定成績」見出し・【保有確定】【現在価格】ブロック・

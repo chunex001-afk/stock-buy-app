@@ -24,6 +24,7 @@ Q5=day20_priceが確定している全entriesのday20リターンのみ(本番�
 import statistics
 
 import q5_universe_logic
+import quintile_logic
 
 CUMULATIVE_HORIZON = 20
 
@@ -344,8 +345,14 @@ def enrich_entries_with_returns(q5_entries):
 # 使わない)。既存のQ5確定成績・Q5直近勢いとは別の第3の計算で、既存の
 # build_comparison_report/build_momentum_reportは一切変更しない。
 #
-# 私側: 実際の購入日(entry_date)を基準に、売却済みはentry_price→exit_price
-# (既存のreturn_pctをそのまま使う)、保有中はentry_price→現在価格。
+# 私側: 実際の購入日(entry_date)を基準に、quintile_logic.ROTATION_UNIVERSE
+# (Q5 48ユニバース)に含まれるtickerのみを対象にする(ユニバース外は完全
+# 除外、design 2026-10-22改訂)。売却済みはentry_price→exit_price(既存の
+# return_pctをそのまま使う)、保有中はentry_price→現在価格。いずれもQ5側の
+# 20営業日運用ルールと条件を揃えるため、保有営業日数が20営業日を超える
+# (保有中は20営業日以上の)ものは、実データの有無に関わらず「比較対象外」
+# として除外する(詳細は_my_sold_return_for_comparison/_my_open_return_
+# for_comparison参照)。
 #
 # 観測期間(5/20/60/120/180営業日)は「保有期間」ではなく「現在から遡った
 # 観測ウィンドウ」。day0_date/entry_dateがウィンドウ内であれば、Q5側の
@@ -411,53 +418,124 @@ def q5_actual_performance_returns(q5_entries, latest_price, trading_calendar, an
     return returns, total, unconfirmed
 
 
+def _my_sold_return_for_comparison(entry_date, exit_date, return_pct, trading_calendar):
+    """私側・売却済み取引の②実績比較用リターン(design 2026-10-22改訂:
+    Q5側の20営業日運用ルールと条件を揃えるための上限)。
+    保有営業日数(entry_date→exit_date)が20営業日以内(ACTUAL_PERFORMANCE_
+    HOLD_DAYS以内)なら、実際のreturn_pctをそのまま比較対象として使う。
+    20営業日を超えてからの売却は、実際の売却データ自体は存在するが、
+    Q5の「20営業日運用」とは比較条件が異なるため、「比較対象外」として
+    Noneを返す(集計から除外する。day20_priceが無い等の「未確定」=データが
+    存在しないケースとは意味が異なるため区別する)。
+    保有営業日数が計算不能(日付がカレンダーに無い等)な場合は、20営業日
+    超過を証明できないため、実際のreturn_pctをそのまま使う(Q5側の経過日数
+    不明時の扱いと同じ安全側の判断)。"""
+    held = _trading_days_held(entry_date, exit_date, trading_calendar)
+    if held is not None and held > ACTUAL_PERFORMANCE_HOLD_DAYS:
+        return None
+    return return_pct
+
+
+def _my_open_return_for_comparison(entry_date, entry_price, current_price, anchor_date, trading_calendar):
+    """私側・保有中ポジションの②実績比較用リターン(design 2026-10-22改訂)。
+    保有営業日数(entry_date→anchor_date)が20営業日未満なら、現在価格で
+    mark-to-marketする(従来通り)。20営業日以上保有している場合は、20営業日
+    時点の価格データを保存していないため、現在価格を代用せず「比較対象外」
+    としてNoneを返す(Q5側の「elapsed>=20でday20_price未確定なら現在価格を
+    使わない」ルールと同じ考え方。ただしこちらは「データが存在しない」
+    のではなく「比較条件(20営業日)に合わない」ことが理由なので、Q5側の
+    「未確定」とは呼び名を分ける)。
+    保有営業日数が計算不能な場合は、20営業日超過を証明できないため、従来
+    通り現在価格でmark-to-marketする(安全側の判断)。"""
+    held = _trading_days_held(entry_date, anchor_date, trading_calendar)
+    if held is not None and held >= ACTUAL_PERFORMANCE_HOLD_DAYS:
+        return None
+    if entry_price is None or current_price is None:
+        return None
+    return (current_price / entry_price - 1) * 100
+
+
 def my_actual_performance_returns(trade_history, positions, current_price_by_ticker,
                                    trading_calendar, anchor_date, window_days):
-    """私側の「②私の実運用」用リターン(design確定仕様)。entry_date(購入日)
-    が直近window_days営業日以内の購入(売却済み・保有中を問わず)を対象に、
-    売却済みは既存のreturn_pct(実売却価格基準)、保有中はentry_price→
-    現在価格のmark-to-marketでリターン%のリストを返す。"""
+    """私側の「②実績比較」用リターン(design 2026-10-22改訂: Q5 48ユニバース
+    外銘柄の除外、20営業日上限の適用)。entry_date(購入日)が直近window_days
+    営業日以内の購入のうち、quintile_logic.ROTATION_UNIVERSE(Q5 48ユニバース)
+    に含まれるtickerのみを対象にする(ユニバース外のtickerは対象件数にすら
+    含めず完全に除外する。「比較対象外」の集計にも含めない、そもそも
+    今回の比較の母集団ではないため)。
+
+    対象のうち、20営業日以内の売却/20営業日未満の保有中はそのまま比較対象
+    として採用し、20営業日を超えた売却・20営業日以上の保有中は「比較対象外」
+    として除外する(_my_sold_return_for_comparison/_my_open_return_for_
+    comparison参照)。
+
+    戻り値: (returns, total, excluded)のタプル。totalはROTATION_UNIVERSE内
+    かつ観測ウィンドウ内の対象件数、excludedはそのうち比較対象外(主に20
+    営業日超過、まれに現在価格取得不能等)で集計から除外された件数
+    (returns側はtotal-excluded件=比較対象件数になる)。"""
     anchor_idx = _safe_trading_day_index(trading_calendar, anchor_date)
     returns = []
+    total = 0
     for trade in trade_history:
+        if trade.get("ticker") not in quintile_logic.ROTATION_UNIVERSE:
+            continue
         date_idx = _safe_trading_day_index(trading_calendar, trade.get("entry_date"))
-        if _within_recent_window(date_idx, anchor_idx, window_days) and trade.get("return_pct") is not None:
-            returns.append(trade["return_pct"])
+        if not _within_recent_window(date_idx, anchor_idx, window_days):
+            continue
+        total += 1
+        r = _my_sold_return_for_comparison(trade.get("entry_date"), trade.get("exit_date"),
+                                            trade.get("return_pct"), trading_calendar)
+        if r is not None:
+            returns.append(r)
     for ticker, pos in (positions or {}).items():
+        if ticker not in quintile_logic.ROTATION_UNIVERSE:
+            continue
         date_idx = _safe_trading_day_index(trading_calendar, pos.get("entry_date"))
-        if _within_recent_window(date_idx, anchor_idx, window_days):
-            entry_price = pos.get("entry_price")
-            current_price = (current_price_by_ticker or {}).get(ticker)
-            if entry_price is not None and current_price is not None:
-                returns.append((current_price / entry_price - 1) * 100)
-    return returns
+        if not _within_recent_window(date_idx, anchor_idx, window_days):
+            continue
+        total += 1
+        current_price = (current_price_by_ticker or {}).get(ticker)
+        r = _my_open_return_for_comparison(pos.get("entry_date"), pos.get("entry_price"),
+                                            current_price, anchor_date, trading_calendar)
+        if r is not None:
+            returns.append(r)
+    excluded = total - len(returns)
+    return returns, total, excluded
 
 
 def build_actual_performance_report(q5_entries, trade_history, positions, latest_price,
                                      current_price_by_ticker, trading_calendar, anchor_date):
-    """「③実運用成績」(design確定仕様、2026-10-21改訂: Q5側未確定件数の
-    可視化を追加)。5/20/60/120/180営業日それぞれについて、Q5側(①Q5 48を
-    機械的に20営業日運用した場合の成績)・私側(②私が実際に購入した銘柄群
-    の成績)・差(私−Q5)を返す。Q5側のaggには通常の{n, mean, median,
-    win_rate}に加えて、observation window内のDay0総数(total)と、20営業日
-    以上経過済みなのにday20_price未確定で集計から除外された件数
-    (unconfirmed)を追加する(n = total - unconfirmedの関係、データ欠損で
-    nが減っていることが分かるようにするため)。私側にはこの概念が無いため
-    追加しない。
-    戻り値: {"5": {"q5": agg(+total/unconfirmed), "mine": agg, "mean_diff",
-    "median_diff", "win_rate_diff"}, "20": {...}, "60": {...}, "120": {...},
-    "180": {...}}。"""
+    """「②実績比較」(design 2026-10-22改訂: Q5 48ユニバース外銘柄の除外・
+    私側20営業日上限・比較対象外件数の可視化を追加)。5/20/60/120/180営業日
+    それぞれについて、Q5側(Q5 48を機械的に20営業日運用した場合の成績)・
+    私側(私が実際に購入したQ5 48ユニバース内銘柄の成績、20営業日上限つき)・
+    差(私−Q5)を返す。
+
+    両側のaggには通常の{n, mean, median, win_rate}に加えてtotal(観測window
+    内の対象件数)を追加する。加えて、
+    ・Q5側は"unconfirmed"(20営業日以上経過済みなのにday20_priceが未確定で
+      データが存在しないため除外された件数)
+    ・私側は"excluded"(主に20営業日を超えた売却/保有により、実データは
+      存在するがQ5側と比較条件が合わないため除外された件数)
+    をそれぞれ追加する。両者は意味が異なるため名称を分けている
+    (unconfirmed=データ不存在、excluded=比較条件不一致)。いずれもn = total
+    - (unconfirmed|excluded)の関係になる。
+    戻り値: {"5": {"q5": agg(+total/unconfirmed), "mine": agg(+total/
+    excluded), "mean_diff", "median_diff", "win_rate_diff"}, "20": {...},
+    "60": {...}, "120": {...}, "180": {...}}。"""
     trading_calendar = trading_calendar or []
     report = {}
     for window_days in ACTUAL_PERFORMANCE_WINDOWS:
         q5_returns, q5_total, q5_unconfirmed = q5_actual_performance_returns(
             q5_entries, latest_price, trading_calendar, anchor_date, window_days)
-        mine_returns = my_actual_performance_returns(trade_history, positions, current_price_by_ticker,
-                                                       trading_calendar, anchor_date, window_days)
+        mine_returns, mine_total, mine_excluded = my_actual_performance_returns(
+            trade_history, positions, current_price_by_ticker, trading_calendar, anchor_date, window_days)
         q5_agg = _aggregate(q5_returns)
         q5_agg["total"] = q5_total
         q5_agg["unconfirmed"] = q5_unconfirmed
         mine_agg = _aggregate(mine_returns)
+        mine_agg["total"] = mine_total
+        mine_agg["excluded"] = mine_excluded
 
         def _diff(key):
             a, b = mine_agg.get(key), q5_agg.get(key)

@@ -362,7 +362,8 @@ class ActualPerformanceBlockResponseTests(CompareApiTestCase):
             self.assertEqual(set(row.keys()), {"q5", "mine", "mean_diff", "median_diff", "win_rate_diff"})
             self.assertEqual(set(row["q5"].keys()),
                               {"n", "mean", "median", "win_rate", "total", "unconfirmed"})
-            self.assertEqual(set(row["mine"].keys()), {"n", "mean", "median", "win_rate"})
+            self.assertEqual(set(row["mine"].keys()),
+                              {"n", "mean", "median", "win_rate", "total", "excluded"})
 
     def test_q5_entry_overdue_without_day20_price_excluded_not_current_price(self):
         """2026-10-21追加修正: 20営業日以上経過してday20_priceが未確定の
@@ -450,6 +451,60 @@ class ActualPerformanceBlockResponseTests(CompareApiTestCase):
         self._calendar = CAL[:30]
         resp, data = self._get()
         self.assertAlmostEqual(data["actual_performance"]["60"]["mean_diff"], 40.0)
+
+    def test_rotation_universe_outside_ticker_fully_excluded_from_mine(self):
+        """【1】Q5 48ユニバース(quintile_logic.ROTATION_UNIVERSE)外の
+        tickerは私側の比較対象から完全に除外される(total/nいずれにも
+        カウントされない)。IONQはROTATION_UNIVERSE外。"""
+        self._portfolio_state = {
+            "positions": {"IONQ": {"entry_date": CAL[90], "entry_price": 100.0}},
+            "trade_history": [],
+        }
+        self._q5_state = {"entries": []}
+        self._ticker_prices = {"IONQ": 150.0}
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        row = data["actual_performance"]["20"]["mine"]
+        self.assertEqual(row["n"], 0)
+        self.assertEqual(row["total"], 0)
+        self.assertEqual(row["excluded"], 0)
+
+    def test_mine_sold_beyond_20_days_is_excluded_not_unconfirmed(self):
+        """【2】私側・売却済みで保有20営業日を超えている場合、実データ
+        (return_pct)は存在するが「比較対象外」としてexcludedにカウント
+        される(未確定=データ不存在とは異なる概念)。"""
+        self._portfolio_state = {
+            "positions": {},
+            "trade_history": [
+                {"ticker": "AMD", "entry_date": CAL[0], "entry_price": 100.0,
+                 "exit_date": CAL[40], "exit_price": 999.0, "return_pct": 899.0},
+            ],
+        }
+        self._q5_state = {"entries": []}
+        self._calendar = CAL[:41]
+        resp, data = self._get()
+        row = data["actual_performance"]["60"]["mine"]
+        self.assertEqual(row["total"], 1)
+        self.assertEqual(row["n"], 0)
+        self.assertEqual(row["excluded"], 1)
+        self.assertIsNone(row["mean"])
+
+    def test_mine_open_20_days_or_more_excluded_current_price_never_used(self):
+        """【2】私側・保有中で20営業日以上経過している場合、現在価格が
+        どれだけ高くてもexcludedとして集計から除外される。"""
+        self._portfolio_state = {
+            "positions": {"AMD": {"entry_date": CAL[0], "entry_price": 100.0}},
+            "trade_history": [],
+        }
+        self._q5_state = {"entries": []}
+        self._ticker_prices = {"AMD": 999.0}  # +899%、これが使われてはいけない
+        self._calendar = CAL[:41]
+        resp, data = self._get()
+        row = data["actual_performance"]["60"]["mine"]
+        self.assertEqual(row["total"], 1)
+        self.assertEqual(row["n"], 0)
+        self.assertEqual(row["excluded"], 1)
+        self.assertIsNone(row["mean"])
 
     def test_existing_keys_unchanged_when_actual_performance_present(self):
         """9: 既存のmomentum/recent_window/my_confirmed/my_current_priceが

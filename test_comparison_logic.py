@@ -6,6 +6,7 @@ import unittest
 from datetime import date, timedelta
 
 import comparison_logic as cmp
+import quintile_logic
 
 
 def _business_days(n, start="2026-01-01"):
@@ -646,46 +647,163 @@ class Q5ActualPerformanceReturnsWindowTests(unittest.TestCase):
 
 class MyActualPerformanceReturnsTests(unittest.TestCase):
     """5・6・7: 私側は実際の購入日(entry_date)を起点に、売却済みは実売却
-    価格、保有中は現在価格を使う。観測ウィンドウは保有期間ではない。"""
+    価格、保有中は現在価格を使う。観測ウィンドウは保有期間ではない。
+    design 2026-10-22改訂: ticker must be in quintile_logic.ROTATION_
+    UNIVERSE to be counted at all, so tests use real universe tickers
+    (AMD/NVDA/MU) instead of placeholder "AAA"/"BBB"。戻り値は
+    (returns, total, excluded)のタプル。"""
 
     def test_scenario5_open_position_uses_current_price(self):
         """5. 私側の保有中銘柄は現在価格を使う。"""
-        positions = {"AAA": {"entry_date": CAL[90], "entry_price": 100.0}}
-        returns = cmp.my_actual_performance_returns([], positions, {"AAA": 108.0}, CAL, CAL[100], 20)
+        positions = {"AMD": {"entry_date": CAL[90], "entry_price": 100.0}}
+        returns, total, excluded = cmp.my_actual_performance_returns(
+            [], positions, {"AMD": 108.0}, CAL, CAL[100], 20)
         self.assertEqual(len(returns), 1)
         self.assertAlmostEqual(returns[0], 8.0)
+        self.assertEqual(total, 1)
+        self.assertEqual(excluded, 0)
 
     def test_scenario6_sold_trade_uses_actual_exit_price_return(self):
         """6. 私側の売却済みは実売却価格(既存のreturn_pct)を使う。"""
-        trade = _purchase_trade("AAA", CAL[90], 100.0, exit_date=CAL[95], exit_price=150.0)
-        returns = cmp.my_actual_performance_returns([trade], {}, {}, CAL, CAL[100], 20)
+        trade = _purchase_trade("AMD", CAL[90], 100.0, exit_date=CAL[95], exit_price=150.0)
+        returns, total, excluded = cmp.my_actual_performance_returns([trade], {}, {}, CAL, CAL[100], 20)
         self.assertEqual(len(returns), 1)
         self.assertAlmostEqual(returns[0], 50.0)
+        self.assertEqual(total, 1)
+        self.assertEqual(excluded, 0)
 
     def test_scenario7_entry_10_days_ago_included_in_180_not_in_5(self):
         """7. 10営業日前に購入して現在+8%の銘柄は、直近180営業日の集計には
         含まれるが、直近5営業日の集計には含まれない。"""
-        positions = {"AAA": {"entry_date": CAL[90], "entry_price": 100.0}}
+        positions = {"AMD": {"entry_date": CAL[90], "entry_price": 100.0}}
         anchor = CAL[100]
-        self.assertEqual(cmp.my_actual_performance_returns([], positions, {"AAA": 108.0}, CAL, anchor, 5), [])
+        returns5, total5, _ = cmp.my_actual_performance_returns([], positions, {"AMD": 108.0}, CAL, anchor, 5)
+        self.assertEqual(returns5, [])
+        self.assertEqual(total5, 0)
         for window_days in (20, 60, 120, 180):
-            returns = cmp.my_actual_performance_returns([], positions, {"AAA": 108.0}, CAL, anchor, window_days)
+            returns, total, excluded = cmp.my_actual_performance_returns(
+                [], positions, {"AMD": 108.0}, CAL, anchor, window_days)
             self.assertEqual(len(returns), 1, f"window={window_days}")
+            self.assertEqual(total, 1, f"window={window_days}")
+            self.assertEqual(excluded, 0, f"window={window_days}")
 
     def test_selection_is_entry_date_anchored_for_sold_too_not_exit_date(self):
         """売却済みも売却日ではなく購入日でウィンドウ判定する(私側は保有中・
         売却済みともentry_date起算で統一するdesign最終仕様)。"""
-        trade = _purchase_trade("AAA", CAL[10], 100.0, exit_date=CAL[95], exit_price=150.0)
-        returns = cmp.my_actual_performance_returns([trade], {}, {}, CAL, CAL[100], 20)
+        trade = _purchase_trade("AMD", CAL[10], 100.0, exit_date=CAL[95], exit_price=150.0)
+        returns, total, excluded = cmp.my_actual_performance_returns([trade], {}, {}, CAL, CAL[100], 20)
         self.assertEqual(returns, [])
+        self.assertEqual(total, 0)
+        self.assertEqual(excluded, 0)
 
     def test_blends_sold_and_open_together(self):
-        trade = _purchase_trade("AAA", CAL[90], 100.0, exit_date=CAL[95], exit_price=110.0)  # +10%
-        positions = {"BBB": {"entry_date": CAL[90], "entry_price": 50.0}}  # +4%
-        returns = cmp.my_actual_performance_returns([trade], positions, {"BBB": 52.0}, CAL, CAL[100], 20)
+        trade = _purchase_trade("AMD", CAL[90], 100.0, exit_date=CAL[95], exit_price=110.0)  # +10%
+        positions = {"NVDA": {"entry_date": CAL[90], "entry_price": 50.0}}  # +4%
+        returns, total, excluded = cmp.my_actual_performance_returns(
+            [trade], positions, {"NVDA": 52.0}, CAL, CAL[100], 20)
         self.assertEqual(len(returns), 2)
         self.assertAlmostEqual(sorted(returns)[0], 4.0)
         self.assertAlmostEqual(sorted(returns)[1], 10.0)
+        self.assertEqual(total, 2)
+        self.assertEqual(excluded, 0)
+
+
+class MyActualPerformanceRotationUniverseFilterTests(unittest.TestCase):
+    """【1】Q5 48ユニバース(quintile_logic.ROTATION_UNIVERSE)外のtickerは
+    私側の比較対象から完全に除外される(total/returns/excludedいずれにも
+    カウントされない)。"""
+
+    def test_ticker_outside_rotation_universe_fully_excluded_from_open(self):
+        self.assertNotIn("IONQ", quintile_logic.ROTATION_UNIVERSE)
+        positions = {"IONQ": {"entry_date": CAL[90], "entry_price": 100.0}}
+        returns, total, excluded = cmp.my_actual_performance_returns(
+            [], positions, {"IONQ": 150.0}, CAL, CAL[100], 20)
+        self.assertEqual(returns, [])
+        self.assertEqual(total, 0)
+        self.assertEqual(excluded, 0)
+
+    def test_ticker_outside_rotation_universe_fully_excluded_from_sold(self):
+        self.assertNotIn("IONQ", quintile_logic.ROTATION_UNIVERSE)
+        trade = _purchase_trade("IONQ", CAL[90], 100.0, exit_date=CAL[95], exit_price=150.0)
+        returns, total, excluded = cmp.my_actual_performance_returns([trade], {}, {}, CAL, CAL[100], 20)
+        self.assertEqual(returns, [])
+        self.assertEqual(total, 0)
+        self.assertEqual(excluded, 0)
+
+    def test_mixed_in_and_out_of_universe_only_in_universe_counted(self):
+        self.assertIn("AMD", quintile_logic.ROTATION_UNIVERSE)
+        positions = {
+            "AMD": {"entry_date": CAL[90], "entry_price": 100.0},   # in-universe
+            "IONQ": {"entry_date": CAL[90], "entry_price": 50.0},   # out-of-universe
+        }
+        returns, total, excluded = cmp.my_actual_performance_returns(
+            [], positions, {"AMD": 110.0, "IONQ": 999.0}, CAL, CAL[100], 20)
+        self.assertEqual(len(returns), 1)
+        self.assertAlmostEqual(returns[0], 10.0)
+        self.assertEqual(total, 1)
+        self.assertEqual(excluded, 0)
+
+
+class MyActualPerformanceTwentyDayCapTests(unittest.TestCase):
+    """【2】②実績比較・私側の20営業日上限(design 2026-10-22改訂)。
+    「未確定」(データが存在しない)ではなく「比較対象外」(データはあるが
+    比較条件に合わない)として区別する。"""
+
+    def test_sold_within_20_days_uses_actual_return(self):
+        trade = _purchase_trade("AMD", CAL[0], 100.0, exit_date=CAL[20], exit_price=130.0)  # held=20
+        r = cmp._my_sold_return_for_comparison(CAL[0], CAL[20], 30.0, CAL)
+        self.assertAlmostEqual(r, 30.0)
+
+    def test_sold_beyond_20_days_excluded_not_unconfirmed_label(self):
+        """売却済みデータ自体は存在するが、20営業日を超えているため
+        「比較対象外」としてNoneを返す(現在価格等は一切関係ない)。"""
+        r = cmp._my_sold_return_for_comparison(CAL[0], CAL[40], 999.0, CAL)  # held=40
+        self.assertIsNone(r)
+
+    def test_sold_held_unresolvable_falls_back_to_actual_return(self):
+        r = cmp._my_sold_return_for_comparison(CAL[0], "2099-01-01", 15.0, CAL)
+        self.assertAlmostEqual(r, 15.0)
+
+    def test_open_under_20_days_uses_current_price(self):
+        r = cmp._my_open_return_for_comparison(CAL[0], 100.0, 112.0, CAL[10], CAL)
+        self.assertAlmostEqual(r, 12.0)
+
+    def test_open_20_days_or_more_excluded_current_price_never_used(self):
+        """保有中・20営業日以上は、現在価格がどんなに高くても比較対象外
+        (Noneを返す、未確定とは異なり「比較条件に合わない」ため除外)。"""
+        r = cmp._my_open_return_for_comparison(CAL[0], 100.0, 999.0, CAL[20], CAL)  # held=20
+        self.assertIsNone(r)
+        r2 = cmp._my_open_return_for_comparison(CAL[0], 100.0, 999.0, CAL[40], CAL)  # held=40
+        self.assertIsNone(r2)
+
+    def test_open_held_unresolvable_falls_back_to_current_price(self):
+        r = cmp._my_open_return_for_comparison(CAL[0], 100.0, 112.0, "2099-01-01", CAL)
+        self.assertAlmostEqual(r, 12.0)
+
+    def test_my_actual_performance_returns_excludes_sold_beyond_20_days(self):
+        trade = _purchase_trade("AMD", CAL[0], 100.0, exit_date=CAL[40], exit_price=999.0)
+        returns, total, excluded = cmp.my_actual_performance_returns([trade], {}, {}, CAL, CAL[170], 180)
+        self.assertEqual(returns, [])
+        self.assertEqual(total, 1)
+        self.assertEqual(excluded, 1)
+
+    def test_my_actual_performance_returns_excludes_open_beyond_20_days(self):
+        positions = {"AMD": {"entry_date": CAL[0], "entry_price": 100.0}}
+        returns, total, excluded = cmp.my_actual_performance_returns(
+            [], positions, {"AMD": 999.0}, CAL, CAL[170], 180)
+        self.assertEqual(returns, [])
+        self.assertEqual(total, 1)
+        self.assertEqual(excluded, 1)
+
+    def test_excluded_and_in_window_sold_and_open_mix(self):
+        trade = _purchase_trade("AMD", CAL[0], 100.0, exit_date=CAL[10], exit_price=110.0)  # held=10, OK
+        positions = {"NVDA": {"entry_date": CAL[0], "entry_price": 50.0}}  # held(anchor)=40, excluded
+        returns, total, excluded = cmp.my_actual_performance_returns(
+            [trade], positions, {"NVDA": 999.0}, CAL, CAL[40], 60)
+        self.assertEqual(len(returns), 1)
+        self.assertAlmostEqual(returns[0], 10.0)
+        self.assertEqual(total, 2)
+        self.assertEqual(excluded, 1)
 
 
 class BuildActualPerformanceReportTests(unittest.TestCase):
@@ -703,7 +821,8 @@ class BuildActualPerformanceReportTests(unittest.TestCase):
                               {"q5", "mine", "mean_diff", "median_diff", "win_rate_diff"})
             self.assertEqual(set(row["q5"].keys()),
                               {"n", "mean", "median", "win_rate", "total", "unconfirmed"})
-            self.assertEqual(set(row["mine"].keys()), {"n", "mean", "median", "win_rate"})
+            self.assertEqual(set(row["mine"].keys()),
+                              {"n", "mean", "median", "win_rate", "total", "excluded"})
 
     def test_q5_total_equals_n_plus_unconfirmed(self):
         """total(対象) = n(確定) + unconfirmed(未確定)の関係を確認する。"""
@@ -722,7 +841,7 @@ class BuildActualPerformanceReportTests(unittest.TestCase):
 
     def test_mean_diff_is_mine_minus_q5(self):
         entry = _q5_entry(day0_price=100.0, day20=(CAL[20], 110.0))  # Q5 +10%
-        trade = _purchase_trade("BBB", CAL[0], 100.0, exit_date=CAL[20], exit_price=130.0)  # 私 +30%
+        trade = _purchase_trade("AMD", CAL[0], 100.0, exit_date=CAL[20], exit_price=130.0)  # 私 +30%, held=20
         report = cmp.build_actual_performance_report([entry], [trade], {}, {}, {}, CAL, CAL[25])
         self.assertAlmostEqual(report["60"]["mean_diff"], 20.0)
 
@@ -730,15 +849,30 @@ class BuildActualPerformanceReportTests(unittest.TestCase):
         """8. 資金/NAV/複利などが計算に入っていないことの確認(_aggregateが
         平均・中央値・勝率のみを返し、合算も株数・資金額も一切登場しない)。"""
         entry = _q5_entry(day0_price=100.0, day20=(CAL[20], 150.0))
-        trade = _purchase_trade("BBB", CAL[0], 100.0, exit_date=CAL[20], exit_price=120.0)
+        trade = _purchase_trade("AMD", CAL[0], 100.0, exit_date=CAL[20], exit_price=120.0)
         report = cmp.build_actual_performance_report([entry], [trade], {}, {}, {}, CAL, CAL[25])
         for window_key, row in report.items():
             self.assertEqual(set(row["q5"].keys()),
                               {"n", "mean", "median", "win_rate", "total", "unconfirmed"})
-            self.assertEqual(set(row["mine"].keys()), {"n", "mean", "median", "win_rate"})
+            self.assertEqual(set(row["mine"].keys()),
+                              {"n", "mean", "median", "win_rate", "total", "excluded"})
         # 単純合計していないことの確認: +10% +30%の合計(+40%)がどこにも出ない。
         self.assertNotEqual(report["60"]["q5"]["mean"], 40.0)
         self.assertNotEqual(report["60"]["mine"]["mean"], 40.0)
+
+    def test_mine_total_equals_n_plus_excluded(self):
+        """total(対象) = n(比較対象) + excluded(比較対象外)の関係を確認する。
+        未確定(データ不存在)ではなく比較対象外(20営業日超過)であることを
+        確認する。"""
+        in_window_ok = _purchase_trade("AMD", CAL[0], 100.0, exit_date=CAL[10], exit_price=110.0)
+        positions = {"NVDA": {"entry_date": CAL[0], "entry_price": 50.0}}  # 保有中、held=40で比較対象外
+        report = cmp.build_actual_performance_report(
+            [], [in_window_ok], positions, {}, {"NVDA": 999.0}, CAL, CAL[40])
+        row = report["60"]["mine"]
+        self.assertEqual(row["total"], 2)
+        self.assertEqual(row["n"], 1)
+        self.assertEqual(row["excluded"], 1)
+        self.assertEqual(row["total"], row["n"] + row["excluded"])
 
     def test_scenario9_existing_reports_unchanged_when_actual_performance_also_computed(self):
         """9. 既存のQ5直近勢い・Q5確定成績・①②ブロックに影響がないこと。"""
