@@ -1358,6 +1358,7 @@ function dactionSellCard(s, h){
   const entryPrice = h ? h.entry_price : null;
   const currentPrice = h ? h.current_price : null;
   const gainPct = h ? h.gain_pct : null;
+  const suggestedExit = (currentPrice===null||currentPrice===undefined) ? "" : Number(currentPrice).toFixed(2);
   const note = s.profit_eligible_too
     ? `<div class="daction-note">※+50%にも到達済み(保有期限のためSELLを優先表示)</div>` : "";
   return `<div class="daction daction-sell">
@@ -1370,7 +1371,11 @@ function dactionSellCard(s, h){
     </div>
     ${note}
     <div class="daction-row-actions">
-      <button class="daction-btn" id="daction-btn-sell-${esc(s.ticker)}" onclick="confirmDailyAction('sell','${esc(s.ticker)}')">売却しました</button>
+      <input class="daction-price-input" type="number" step="0.01" min="0.01"
+             placeholder="売却価格" value="${esc(suggestedExit)}" id="daction-exitprice-${esc(s.ticker)}">
+      <input class="daction-price-input" type="date" id="daction-exitdate-${esc(s.ticker)}" title="売却日(任意・省略時は本日)">
+      <button class="daction-btn" id="daction-btn-sell-${esc(s.ticker)}"
+              onclick="confirmDailyAction('sell','${esc(s.ticker)}',{exit_price: parseFloat(document.getElementById('daction-exitprice-${esc(s.ticker)}').value), exit_date: (document.getElementById('daction-exitdate-${esc(s.ticker)}').value || undefined)})">売却しました</button>
       <span class="daction-msg" id="daction-msg-sell-${esc(s.ticker)}"></span>
     </div>
   </div>`;
@@ -2155,7 +2160,10 @@ def confirm_buy():
             "entry_date": entry_date, "entry_price": entry_price, "shares": shares,
             "profit_taken": False, "profit_taken_date": None,
         }
-        new_state = {"positions": positions,
+        # trade_history(design 2026-10-21、実運用の売買履歴記録)はここでは
+        # 変更しないが、state全体を上書きするため素通しで引き継ぐ(引き継がないと
+        # 次のconfirm_buy呼び出しで既存の売却履歴が消えてしまう)。
+        new_state = {"positions": positions, "trade_history": state.get("trade_history") or [],
                       "last_updated": trading_calendar[-1] if trading_calendar else entry_date}
         if not store.set_portfolio_state(new_state):
             return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
@@ -2207,7 +2215,10 @@ def confirm_profit():
             new_pos["profit_take_sold_value"] = amounts["sell_value"]
             new_pos["profit_take_price"] = current_price
         positions[ticker] = new_pos
-        new_state = {"positions": positions, "last_updated": today}
+        # trade_history(design 2026-10-21)はここでは変更しないが、素通しで引き継ぐ
+        # (引き継がないと次回呼び出しで既存の売却履歴が消えてしまう)。
+        new_state = {"positions": positions, "trade_history": state.get("trade_history") or [],
+                      "last_updated": today}
         if not store.set_portfolio_state(new_state):
             return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
 
@@ -2218,6 +2229,13 @@ def confirm_profit():
 
 @app.post("/api/portfolio/confirm_sell")
 def confirm_sell():
+    """保有ポジションの売却を記録する。design 2026-10-21で、実際の売買成績を
+    蓄積するため、売却価格(exit_price)・売却日(exit_date)を任意で受け取り、
+    positions削除前にtrade_history(ticker/entry_date/entry_price/exit_date/
+    exit_price/return_pct)へ追記する。exit_priceが未指定かつ現在価格も
+    取得できない場合はtrade_historyへの追記のみスキップし、positions削除自体
+    は従来通り成功させる(既存の「価格を入れずに売却確認するだけ」の挙動を
+    壊さない)。株数(shares)はこの履歴には含めない(design確定仕様)。"""
     try:
         body = request.get_json(silent=True) or {}
         ticker = _sanitize_ticker(body.get("ticker", ""))
@@ -2232,10 +2250,58 @@ def confirm_sell():
             return jsonify({"ok": True, "ticker": ticker, "already_absent": True,
                              "held_count": len(positions)})
 
-        del positions[ticker]
+        pos = positions[ticker]
+
+        exit_price = None
+        exit_price_raw = body.get("exit_price")
+        if exit_price_raw not in (None, ""):
+            try:
+                exit_price = float(exit_price_raw)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "売却価格は数値で入力してください"}), 400
+            if not (exit_price > 0):
+                return jsonify({"ok": False, "error": "売却価格は正の数で入力してください"}), 400
+
         trading_calendar = _trading_days_calendar()
+        exit_date = body.get("exit_date")
+        if exit_date:
+            try:
+                date.fromisoformat(exit_date)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "売却日はYYYY-MM-DD形式で入力してください"}), 400
+            # 未来日判定はconfirm_buy/edit_entryと同じ実時間の「今日(JST)」基準。
+            if exit_date > _today_jst_str():
+                return jsonify({"ok": False, "error": "売却日は未来の日付にできません"}), 400
+        else:
+            exit_date = trading_calendar[-1] if trading_calendar else state.get("last_updated")
+
+        # 取得日より前の売却日は拒否する(design 2026-10-21修正: 買う前に売った
+        # という矛盾したtrade_historyが記録される不具合の修正)。entry_date==
+        # exit_dateは許可(同日中の売買)。exit_dateが省略時デフォルト由来でも
+        # 同じ基準を適用する(entry_dateは常に「今日(JST)」以前のため通常は
+        # 問題にならないが、一貫性のため分岐しない)。
+        if pos.get("entry_date") and exit_date and exit_date < pos.get("entry_date"):
+            return jsonify({"ok": False, "error": "売却日は取得日より前にできません"}), 400
+
+        if exit_price is None:
+            exit_price = (store.get_ticker_record(ticker) or {}).get("price")
+
+        del positions[ticker]
+
+        trade_history = list(state.get("trade_history") or [])
+        entry_price = pos.get("entry_price")
+        if exit_price is not None and entry_price:
+            trade_history.append({
+                "ticker": ticker,
+                "entry_date": pos.get("entry_date"),
+                "entry_price": entry_price,
+                "exit_date": exit_date,
+                "exit_price": exit_price,
+                "return_pct": (exit_price / entry_price - 1) * 100,
+            })
+
         today = trading_calendar[-1] if trading_calendar else state.get("last_updated")
-        new_state = {"positions": positions, "last_updated": today}
+        new_state = {"positions": positions, "trade_history": trade_history, "last_updated": today}
         if not store.set_portfolio_state(new_state):
             return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
 
@@ -2313,7 +2379,9 @@ def edit_entry():
         positions[ticker] = new_pos
 
         trading_calendar = _trading_days_calendar()
-        new_state = {"positions": positions,
+        # trade_history(design 2026-10-21)はここでは変更しないが、素通しで引き継ぐ
+        # (引き継がないと既存の売却履歴が訂正操作のたびに消えてしまう)。
+        new_state = {"positions": positions, "trade_history": state.get("trade_history") or [],
                       "last_updated": trading_calendar[-1] if trading_calendar else state.get("last_updated")}
         if not store.set_portfolio_state(new_state):
             return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
