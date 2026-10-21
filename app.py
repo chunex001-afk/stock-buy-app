@@ -1205,6 +1205,14 @@ details.logicinfo .small{margin-top:10px}
 .cmp-side-label{font-size:10px;color:#98a2b3;display:block}
 .cmp-empty{color:#98a2b3}
 .cmp-note{font-size:11px;color:#758096;margin-top:8px;line-height:1.6}
+details.cmp-details{margin:10px 0}
+details.cmp-details summary{cursor:pointer;font-size:12px;color:#475467;font-weight:700;list-style:none}
+details.cmp-details summary::-webkit-details-marker{display:none}
+details.cmp-details summary::before{content:"▸ "}
+details.cmp-details[open] summary::before{content:"▾ "}
+details.cmp-details .cmp-details-body{margin-top:6px}
+details.cmp-details .cmp-note{margin-top:10px}
+details.cmp-details .cmp-note:first-child{margin-top:6px}
 .cmp-detail{margin-top:14px;border-top:1px dashed #dde2e8;padding-top:10px}
 .cmp-detail-row{display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;padding:6px 0;border-top:1px solid #eef1f5;font-size:12px;color:#475467}
 .cmp-detail-row:first-of-type{border-top:none}
@@ -1675,8 +1683,22 @@ function cmpHeadlineHtml(data){
     <thead><tr><th>期間</th><th>平均</th><th>中央値</th><th>勝率</th><th>件数</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>
+  </div>`;
+}
+// design 2026-10-22改訂: ①②それぞれの説明文(cmp-note)は通常表示では
+// 邪魔になるため、「ℹ️ この比較の見方」という1つの折りたたみ(<details>)に
+// まとめる。計算ロジック・APIレスポンスには一切触れない表示のみの変更。
+// 既存の<details class="opinfo">/<details class="q5stats">と同じ、
+// ::before擬似要素で▸/▾を出す既存パターンを踏襲する(デフォルトは閉じた
+// 状態=openなし)。
+function cmpGuideDetailsHtml(){
+  return `<details class="cmp-details">
+  <summary>ℹ️ この比較の見方</summary>
+  <div class="cmp-details-body">
+    <div class="cmp-note">「Q5直近勢い」は、直近にQ5 Day0になった銘柄が現在まで(20営業日を超えても)どれだけ動いているかを示す「騰落・勢い」の指標です(運用成績ではありません)。件数(n)が${MOMENTUM_LOW_SAMPLE_THRESHOLD}件以下の期間は「⚠ サンプル少」と表示します(データは除外せず参考値として表示、特定銘柄の値動きに強く依存するため平均・中央値とも鵜呑みにしないでください)。20営業日運用した場合の成績は、下の「② 実績比較」で確認できます。同じ「5日」でも②とは意味が異なります(①＝現在までの騰落、②＝20営業日運用ルールでの実績)。</div>
+    <div class="cmp-note">Q5側はQ5 Day0を仮想購入日とし、20営業日未満は現在価格、20営業日以上は20営業日後の価格で固定した成績です(固定後は値動きを反映しません)。20営業日以上経過してもまだ20営業日後価格が取得できていない銘柄は、現在価格を代用せず「未確定」として集計から除外します(データが存在しないケース)。私側は、Q5 48ユニバースに含まれる銘柄のみを対象に、実際の購入日を基準として、売却済みは20営業日以内の実売却価格、保有中は20営業日未満の現在価格を使います。20営業日を超えてからの売却・20営業日以上の保有は、実データ自体はあってもQ5側と比較条件が合わないため「比較対象外」として除外します(未確定とは異なり、データ不存在ではなく比較条件不一致が理由です)。いずれも対象件数・未確定/比較対象外件数は件数欄に表示します。5/20/60/120/180営業日は保有期間ではなく、直近どの期間に発生したDay0・購入かという観測ウィンドウです(まだ20営業日経過していない銘柄も対象に含みます)。株数・資金額・NAV等は使用していません。上の「① Q5直近勢い」と同じ「5日」等の数字でも、①は現在までの騰落、②は20営業日運用ルールでの実績比較という別の意味です。</div>
   </div>
-  <div class="cmp-note">「Q5直近勢い」は、直近にQ5 Day0になった銘柄が現在まで(20営業日を超えても)どれだけ動いているかを示す「騰落・勢い」の指標です(運用成績ではありません)。件数(n)が${MOMENTUM_LOW_SAMPLE_THRESHOLD}件以下の期間は「⚠ サンプル少」と表示します(データは除外せず参考値として表示、特定銘柄の値動きに強く依存するため平均・中央値とも鵜呑みにしないでください)。20営業日運用した場合の成績は、下の「② 実績比較」で確認できます。同じ「5日」でも②とは意味が異なります(①＝現在までの騰落、②＝20営業日運用ルールでの実績)。</div>`;
+  </details>`;
 }
 // 【保有確定】【現在価格】の2ブロック比較(design 2026-10-21確定仕様)。
 // Q5側はQ5 Day0起算(既存のrecent_window=確定成績・momentum=直近勢いを
@@ -1783,8 +1805,7 @@ function actualPerformanceBlockHtml(data){
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>
-  </div>
-  <div class="cmp-note">Q5側はQ5 Day0を仮想購入日とし、20営業日未満は現在価格、20営業日以上は20営業日後の価格で固定した成績です(固定後は値動きを反映しません)。20営業日以上経過してもまだ20営業日後価格が取得できていない銘柄は、現在価格を代用せず「未確定」として集計から除外します(データが存在しないケース)。私側は、Q5 48ユニバースに含まれる銘柄のみを対象に、実際の購入日を基準として、売却済みは20営業日以内の実売却価格、保有中は20営業日未満の現在価格を使います。20営業日を超えてからの売却・20営業日以上の保有は、実データ自体はあってもQ5側と比較条件が合わないため「比較対象外」として除外します(未確定とは異なり、データ不存在ではなく比較条件不一致が理由です)。いずれも対象件数・未確定/比較対象外件数は件数欄に表示します。5/20/60/120/180営業日は保有期間ではなく、直近どの期間に発生したDay0・購入かという観測ウィンドウです(まだ20営業日経過していない銘柄も対象に含みます)。株数・資金額・NAV等は使用していません。上の「① Q5直近勢い」と同じ「5日」等の数字でも、①は現在までの騰落、②は20営業日運用ルールでの実績比較という別の意味です。</div>`;
+  </div>`;
 }
 // design 2026-10-22改訂: 比較画面を「① Q5直近勢い」「② 実績比較」の2本
 // 構成に整理。旧「Q5確定成績」見出し・【保有確定】【現在価格】ブロック・
@@ -1797,6 +1818,7 @@ function renderComparison(data){
   el.innerHTML = `<div class="cmp-panel">
     <div class="cmp-head">📈 実績比較：私 vs Q5</div>
     ${cmpHeadlineHtml(data)}
+    ${cmpGuideDetailsHtml()}
     ${actualPerformanceBlockHtml(data)}
   </div>`;
 }
