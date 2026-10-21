@@ -264,12 +264,19 @@ def get_q5universe_state():
     "day60_date","day60_price"}, ...](Day0イベントの配列、株数は持たない。
     同一tickerでも(ticker,day0_date)ごとに別イベント),
     "last_processed_date": "YYYY-MM-DD"(この日付までの処理が完全に成功した
-    ことを示す。未完了日はこの値を更新しない)} または None(未初期化時)。
+    ことを示す。未完了日はこの値を更新しない),
+    "latest_price": {"<TICKER>": float, ...}(design 2026-10-21追加、48銘柄
+    の当日終値スナップショット。「Q5直近勢い」=day0からの途中経過リターン
+    算出専用、entries自体には追加フィールドを持たせない),
+    "latest_price_date": "YYYY-MM-DD"(latest_priceの基準日)}
+    または None(未初期化時)。latest_price/latest_price_dateが存在しない
+    古いstate(本機能追加前に保存されたもの)でも、.get()で安全にNone/空dict
+    として扱われる想定(呼び出し側で対応、マイグレーション不要)。
 
-    prev_q・entries・last_processed_dateを1つのJSONにまとめているのは、
-    48銘柄全件の取得・判定が完全に成功した場合だけ、この3つを同時に
-    (1回のRedis書き込みで)確定させるため(design: 「全件取得・判定→検証→
-    一括確定」、途中書き込みによる不整合を避ける)。"""
+    prev_q・entries・last_processed_date・latest_price・latest_price_dateを
+    1つのJSONにまとめているのは、48銘柄全件の取得・判定が完全に成功した
+    場合だけ、これらを同時に(1回のRedis書き込みで)確定させるため(design:
+    「全件取得・判定→検証→一括確定」、途中書き込みによる不整合を避ける)。"""
     return get_json("q5universe:state")
 
 

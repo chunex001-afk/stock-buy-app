@@ -133,5 +133,107 @@ class ReadOnlyTests(CompareApiTestCase):
             set_q5.assert_not_called()
 
 
+class MomentumResponseTests(CompareApiTestCase):
+    """Q5直近勢い(design 2026-10-21)のAPIレベルテスト。"""
+
+    def test_momentum_key_present_in_response_with_expected_shape(self):
+        self._q5_state = {
+            "entries": [
+                {"ticker": "AMD", "day0_date": CAL[98], "day0_price": 100.0,
+                 "day5_date": None, "day5_price": None,
+                 "day20_date": None, "day20_price": None,
+                 "day60_date": None, "day60_price": None},
+            ],
+            "latest_price": {"AMD": 110.0},
+            "latest_price_date": CAL[100],
+        }
+        self._calendar = CAL[:101]  # 今日=CAL[100]
+        resp, data = self._get()
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(set(data["momentum"].keys()), {"5", "20", "60"})
+        self.assertEqual(data["latest_price_date"], CAL[100])
+
+    def test_momentum_includes_unresolved_day0(self):
+        """未経過(day5/20/60が全てNone)のDay0もmomentumには含まれることを
+        APIレベルで確認する。"""
+        self._q5_state = {
+            "entries": [
+                {"ticker": "AMD", "day0_date": CAL[99], "day0_price": 100.0,
+                 "day5_date": None, "day5_price": None,
+                 "day20_date": None, "day20_price": None,
+                 "day60_date": None, "day60_price": None},
+            ],
+            "latest_price": {"AMD": 105.0},
+            "latest_price_date": CAL[100],
+        }
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertEqual(data["momentum"]["5"]["n"], 1)
+        self.assertAlmostEqual(data["momentum"]["5"]["mean"], 5.0)
+
+    def test_momentum_empty_when_latest_price_key_missing(self):
+        """12: latest_priceキーが存在しない古いq5universe:state(本機能
+        追加前に保存されたもの)でもエラーにならず0件になる。"""
+        self._q5_state = {
+            "entries": [
+                {"ticker": "AMD", "day0_date": CAL[99], "day0_price": 100.0,
+                 "day5_date": None, "day5_price": None,
+                 "day20_date": None, "day20_price": None,
+                 "day60_date": None, "day60_price": None},
+            ],
+            # latest_price/latest_price_dateキー自体が存在しない
+        }
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(data["ok"])
+        for horizon in ("5", "20", "60"):
+            self.assertEqual(data["momentum"][horizon]["n"], 0)
+        self.assertIsNone(data["latest_price_date"])
+
+    def test_momentum_with_stale_latest_price_date_still_returns_data(self):
+        """14: latest_price_dateが古い(ジョブが数日止まっている)場合でも、
+        エラーにならずその古い日付のまま結果を返す。"""
+        self._q5_state = {
+            "entries": [
+                {"ticker": "AMD", "day0_date": CAL[95], "day0_price": 100.0,
+                 "day5_date": None, "day5_price": None,
+                 "day20_date": None, "day20_price": None,
+                 "day60_date": None, "day60_price": None},
+            ],
+            "latest_price": {"AMD": 120.0},
+            "latest_price_date": CAL[96],  # last_processed_dateより古い想定
+        }
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["latest_price_date"], CAL[96])
+        self.assertEqual(data["momentum"]["60"]["n"], 1)
+
+    def test_existing_recent_window_and_all_time_unaffected_by_momentum_addition(self):
+        """既存のQ5確定成績が変わらないことのAPIレベル確認。"""
+        self._portfolio_state = {"trade_history": [
+            {"ticker": "AAA", "entry_date": CAL[0], "entry_price": 100.0,
+             "exit_date": CAL[95], "exit_price": 110.0, "return_pct": 10.0},
+        ]}
+        self._q5_state = {
+            "entries": [
+                {"ticker": "BBB", "day0_date": CAL[0], "day0_price": 100.0,
+                 "day5_date": None, "day5_price": None,
+                 "day20_date": CAL[20], "day20_price": 120.0,
+                 "day60_date": None, "day60_price": None},
+            ],
+            "latest_price": {"BBB": 999.0},  # momentum側だけに影響する想定の値
+            "latest_price_date": CAL[100],
+        }
+        resp, data = self._get()
+        self.assertEqual(set(data["recent_window"].keys()), {"5", "20", "60", "cumulative"})
+        self.assertAlmostEqual(data["q5_entries"][0]["day20_return_pct"], 20.0)
+        # momentumキーの追加によって既存キーの値がぶれていないこと
+        self.assertIn("momentum", data)
+
+
 if __name__ == "__main__":
     unittest.main()

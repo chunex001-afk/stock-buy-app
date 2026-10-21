@@ -39,6 +39,17 @@ fill_checkpoints参照)。対象日が取得した履歴の範囲外で見つか
 nullのまま次回以降に委ねる。day0の判定自体は従来どおりリアルタイム
 (その日時点で分かる情報だけ)で行い、day0_date/day0_priceは一度確定したら
 変更しない。
+
+【Q5直近勢い用のlatest_price(design 2026-10-21追加)】
+「最近Q5 Day0になった銘柄が、現在までどれだけ動いているか」(確定成績=
+day5/20/60とは別の指標、comparison_logic.build_momentum_report参照)の
+算出に使う、48銘柄の当日終値のスナップショットをq5universe:state.
+latest_price(ticker→price)・latest_price_dateとして保存する。prices_by_
+ticker(day0価格計算に既に使っている当日終値)をそのまま再利用するだけで、
+新しいAPI呼び出し・新しいループは発生しない。既存の完全性ゲート(48銘柄
+全件成功後の一括確定)の内側にあるため、1件でも失敗した日はlatest_price
+も含めて一切更新されない。entries自体には新しいフィールドを追加しない
+(既存の確定成績ロジック・既存entriesの構造は無変更)。
 """
 import os
 import sys
@@ -138,11 +149,17 @@ def main():
     filled_entries = q5logic.fill_checkpoints(entries, trading_calendar, today, close_by_date_by_ticker)
     final_entries = filled_entries + new_entries
 
-    # --- 一括確定(1回のRedis書き込みでprev_q・entries・last_processed_dateを同時に確定) ---
-    new_state = {"prev_q": today_q, "entries": final_entries, "last_processed_date": today}
+    # --- 一括確定(1回のRedis書き込みでprev_q・entries・last_processed_date・
+    # latest_price・latest_price_dateを同時に確定、design 2026-10-21「Q5直近
+    # 勢い」用)。latest_priceは既にprices_by_ticker(day0価格計算用)として
+    # 計算済みの値をそのまま再利用するだけで、新しいAPI呼び出し・新しい
+    # ループは発生しない。48銘柄全件成功後のこの一括確定の内側にあるため、
+    # 既存の完全性ゲート(1件でも失敗したら中止)がそのまま適用される。 ---
+    new_state = {"prev_q": today_q, "entries": final_entries, "last_processed_date": today,
+                 "latest_price": prices_by_ticker, "latest_price_date": today}
     if not store.set_q5universe_state(new_state):
         print("[Q5UNIV][ABORT] Redisへの保存に失敗しました"
-              "(prev_q/entries/last_processed_dateは更新されていません、次回再試行されます)。")
+              "(prev_q/entries/last_processed_date/latest_priceは更新されていません、次回再試行されます)。")
         return 1
 
     print(f"[Q5UNIV][DONE] {today}分を確定しました"

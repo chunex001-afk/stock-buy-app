@@ -129,6 +129,12 @@ class Q5UniverseRefreshTestCase(unittest.TestCase):
     def _set_today(self, idx):
         self._pool_history["dates"] = CAL[: idx + 1]
 
+    def _latest_price(self):
+        return (self._state or {}).get("latest_price") or {}
+
+    def _latest_price_date(self):
+        return (self._state or {}).get("latest_price_date")
+
 
 class SkipWithoutApiCallTests(Q5UniverseRefreshTestCase):
     """10: pool_historyが今日まで更新されていなければAPIを呼ばず終了。"""
@@ -186,6 +192,67 @@ class CompletenessGateTests(Q5UniverseRefreshTestCase):
         self.assertEqual(rc, 1)
         self.assertIsNone(self._state)
         self.assertEqual(self._entries(), [])
+
+    def test_13_partial_failure_does_not_write_latest_price(self):
+        """13: 失敗時に部分的なlatest_priceが保存されないことの確認。
+        1回目は正常に成功させてlatest_priceを確定し、2回目に1銘柄だけ
+        失敗させても、1回目のlatest_priceが変化しないことを確認する。"""
+        self._set_today(OFFSET)
+        rc1 = job.main()
+        self.assertEqual(rc1, 0)
+        latest_price_after_success = dict(self._latest_price())
+        self.assertEqual(len(latest_price_after_success), len(UNIVERSE))
+
+        self._set_today(OFFSET + 1)
+        self._price_by_ticker["AMD"] = 999.0  # 失敗時にこの値が紛れ込まないか確認用
+        self._fail_tickers = {UNIVERSE[3]}
+        rc2 = job.main()
+        self.assertEqual(rc2, 1)
+        self.assertEqual(self._latest_price(), latest_price_after_success)  # 変化していない
+
+
+class LatestPriceForMomentumTests(Q5UniverseRefreshTestCase):
+    """Q5直近勢い(design 2026-10-21)用のlatest_price/latest_price_dateが、
+    既存のprices_by_ticker(day0価格計算用)をそのまま再利用して保存される
+    ことの確認。"""
+
+    def test_latest_price_contains_all_48_tickers_with_closing_prices(self):
+        self._set_today(OFFSET)
+        self._price_by_ticker["AMD"] = 123.45
+        rc = job.main()
+        self.assertEqual(rc, 0)
+        latest_price = self._latest_price()
+        self.assertEqual(len(latest_price), len(UNIVERSE))
+        self.assertEqual(latest_price["AMD"], 123.45)
+
+    def test_latest_price_date_matches_processed_date(self):
+        self._set_today(OFFSET)
+        job.main()
+        self.assertEqual(self._latest_price_date(), CAL[OFFSET])
+
+    def test_latest_price_updates_on_subsequent_successful_runs(self):
+        self._set_today(OFFSET)
+        job.main()
+        self._set_today(OFFSET + 1)
+        self._price_by_ticker["AMD"] = 200.0
+        job.main()
+        self.assertEqual(self._latest_price()["AMD"], 200.0)
+        self.assertEqual(self._latest_price_date(), CAL[OFFSET + 1])
+
+    def test_latest_price_does_not_add_fields_to_entries(self):
+        """entries自体には新しいフィールドを追加しない(既存の確定成績
+        ロジック・既存entriesの構造は無変更)ことの確認。"""
+        self._set_today(OFFSET)
+        job.main()
+        self._set_today(OFFSET + 1)
+        self._score_by_ticker["AMD"] = BOUNDS_SCORE
+        job.main()
+        entry = self._amd_entry()
+        self.assertEqual(
+            set(entry.keys()),
+            {"ticker", "day0_date", "day0_price", "day5_date", "day5_price",
+             "day20_date", "day20_price", "day60_date", "day60_price"},
+        )
 
 
 class Day0EndToEndTests(Q5UniverseRefreshTestCase):

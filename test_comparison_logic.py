@@ -217,5 +217,142 @@ class EnrichEntriesTests(unittest.TestCase):
         self.assertIsNone(enriched[0]["day60_return_pct"])
 
 
+def _momentum_entry(ticker, day0_date, day0_price, **checkpoints):
+    """Q5直近勢いテスト専用: ticker/day0_dateを自由に指定できるentryを作る
+    (既存の_q5_entryはticker="AAA"/day0_date=CAL[0]固定のため、複数ticker・
+    複数day0_dateを扱う勢いテストには別のヘルパーを使う)。"""
+    e = {"ticker": ticker, "day0_date": day0_date, "day0_price": day0_price,
+         "day5_date": None, "day5_price": None,
+         "day20_date": None, "day20_price": None,
+         "day60_date": None, "day60_price": None}
+    e.update(checkpoints)
+    return e
+
+
+class MomentumWindowSelectionTests(unittest.TestCase):
+    """Q5直近勢い(design 2026-10-21)のウィンドウ選別テスト。"""
+
+    def test_momentum_includes_day0_within_5_business_days(self):
+        anchor = CAL[100]
+        entry = _momentum_entry("AAA", CAL[97], 100.0)  # 3営業日前
+        latest_price = {"AAA": 110.0}
+        matches = cmp.q5_momentum_matches_in_window([entry], latest_price, CAL, anchor, 5)
+        self.assertEqual(len(matches), 1)
+        self.assertAlmostEqual(matches[0][1], 10.0)
+
+    def test_momentum_excludes_day0_outside_5_business_days(self):
+        anchor = CAL[100]
+        entry = _momentum_entry("AAA", CAL[90], 100.0)  # 10営業日前
+        matches = cmp.q5_momentum_matches_in_window([entry], {"AAA": 110.0}, CAL, anchor, 5)
+        self.assertEqual(matches, [])
+
+    def test_momentum_includes_day0_within_20_business_days(self):
+        anchor = CAL[100]
+        entry = _momentum_entry("AAA", CAL[85], 100.0)  # 15営業日前
+        matches = cmp.q5_momentum_matches_in_window([entry], {"AAA": 120.0}, CAL, anchor, 20)
+        self.assertEqual(len(matches), 1)
+        self.assertAlmostEqual(matches[0][1], 20.0)
+
+    def test_momentum_includes_day0_within_60_business_days(self):
+        anchor = CAL[100]
+        entry = _momentum_entry("AAA", CAL[50], 100.0)  # 50営業日前
+        matches = cmp.q5_momentum_matches_in_window([entry], {"AAA": 150.0}, CAL, anchor, 60)
+        self.assertEqual(len(matches), 1)
+        self.assertAlmostEqual(matches[0][1], 50.0)
+
+    def test_momentum_boundary_excludes_exactly_n_days_ago(self):
+        anchor = CAL[100]
+        entry = _momentum_entry("AAA", CAL[80], 100.0)  # ちょうど20営業日前
+        matches = cmp.q5_momentum_matches_in_window([entry], {"AAA": 999.0}, CAL, anchor, 20)
+        self.assertEqual(matches, [])
+
+    def test_momentum_windows_are_nested(self):
+        """5/20/60の対象が入れ子になる: 直近5営業日のDay0は、直近20・60
+        営業日の条件も満たす。"""
+        anchor = CAL[100]
+        entry = _momentum_entry("AAA", CAL[98], 100.0)  # 2営業日前
+        latest_price = {"AAA": 105.0}
+        n5 = cmp.q5_momentum_matches_in_window([entry], latest_price, CAL, anchor, 5)
+        n20 = cmp.q5_momentum_matches_in_window([entry], latest_price, CAL, anchor, 20)
+        n60 = cmp.q5_momentum_matches_in_window([entry], latest_price, CAL, anchor, 60)
+        self.assertEqual(len(n5), 1)
+        self.assertEqual(len(n20), 1)
+        self.assertEqual(len(n60), 1)
+
+    def test_momentum_includes_entries_without_any_resolved_checkpoint(self):
+        """未経過のDay0も含まれる: day5/20/60が全てNoneでも、day0_priceと
+        latest_priceだけでmomentumが計算できる。"""
+        anchor = CAL[100]
+        entry = _momentum_entry("AAA", CAL[99], 100.0)  # day5/20/60は全て未確定
+        matches = cmp.q5_momentum_matches_in_window([entry], {"AAA": 103.0}, CAL, anchor, 5)
+        self.assertEqual(len(matches), 1)
+        self.assertAlmostEqual(matches[0][1], 3.0)
+
+    def test_momentum_excludes_ticker_missing_from_latest_price(self):
+        """latest_priceに存在しない銘柄は誤って計算されない(Noneで除外)。"""
+        anchor = CAL[100]
+        entry = _momentum_entry("ZZZ", CAL[98], 100.0)
+        matches = cmp.q5_momentum_matches_in_window([entry], {"AAA": 110.0}, CAL, anchor, 5)
+        self.assertEqual(matches, [])
+
+    def test_momentum_handles_empty_or_none_latest_price(self):
+        anchor = CAL[100]
+        entry = _momentum_entry("AAA", CAL[98], 100.0)
+        self.assertEqual(cmp.q5_momentum_matches_in_window([entry], {}, CAL, anchor, 5), [])
+        self.assertEqual(cmp.q5_momentum_matches_in_window([entry], None, CAL, anchor, 5), [])
+
+
+class MomentumReportTests(unittest.TestCase):
+    def test_build_momentum_report_has_5_20_60_keys_only(self):
+        report = cmp.build_momentum_report([], {}, CAL, CAL[100])
+        self.assertEqual(set(report.keys()), {"5", "20", "60"})
+
+    def test_n_and_unique_day0_dates_correct(self):
+        """nとユニークDay0日数: 同日に複数Day0があっても重複排除される。"""
+        anchor = CAL[100]
+        entries = [
+            _momentum_entry("AAA", CAL[98], 100.0),
+            _momentum_entry("BBB", CAL[98], 50.0),  # AAAと同じday0_date
+            _momentum_entry("CCC", CAL[97], 200.0),
+        ]
+        latest_price = {"AAA": 110.0, "BBB": 55.0, "CCC": 210.0}
+        report = cmp.build_momentum_report(entries, latest_price, CAL, anchor)
+        self.assertEqual(report["5"]["n"], 3)
+        self.assertEqual(report["5"]["unique_day0_dates"], 2)  # CAL[98]とCAL[97]の2日
+
+    def test_mean_is_average_of_momentum_returns(self):
+        anchor = CAL[100]
+        entries = [_momentum_entry("AAA", CAL[98], 100.0), _momentum_entry("BBB", CAL[98], 100.0)]
+        latest_price = {"AAA": 110.0, "BBB": 90.0}
+        report = cmp.build_momentum_report(entries, latest_price, CAL, anchor)
+        self.assertAlmostEqual(report["5"]["mean"], 0.0)  # (+10%, -10%)の平均
+
+    def test_empty_momentum_returns_n_zero_not_error(self):
+        report = cmp.build_momentum_report([], {}, CAL, CAL[100])
+        for horizon in ("5", "20", "60"):
+            self.assertEqual(report[horizon]["n"], 0)
+            self.assertIsNone(report[horizon]["mean"])
+            self.assertEqual(report[horizon]["unique_day0_dates"], 0)
+
+    def test_handles_empty_trading_calendar_without_crashing(self):
+        entries = [_momentum_entry("AAA", CAL[98], 100.0)]
+        report = cmp.build_momentum_report(entries, {"AAA": 110.0}, [], None)
+        for horizon in ("5", "20", "60"):
+            self.assertEqual(report[horizon]["n"], 0)
+
+    def test_confirmed_performance_unaffected_by_momentum_feature(self):
+        """既存のQ5確定成績が変わらないことの確認: build_comparison_report
+        (確定成績)は、build_momentum_report(勢い)の追加とは無関係に、
+        従来どおりの値を返す。"""
+        anchor = CAL[100]
+        trades = [_trade(CAL[95], 30.0)]
+        entries = [_q5_entry(day0_price=100.0, day20=(CAL[95], 110.0))]
+        report_before_like = cmp.build_comparison_report(trades, entries, CAL, anchor)
+        # 同じ入力に対し、momentum計算を追加で呼んでも確定成績の結果は不変
+        cmp.build_momentum_report(entries, {"AAA": 999.0}, CAL, anchor)
+        report_after = cmp.build_comparison_report(trades, entries, CAL, anchor)
+        self.assertEqual(report_before_like, report_after)
+
+
 if __name__ == "__main__":
     unittest.main()

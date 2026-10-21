@@ -1209,6 +1209,11 @@ details.logicinfo .small{margin-top:10px}
 .cmp-detail-row{display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;padding:6px 0;border-top:1px solid #eef1f5;font-size:12px;color:#475467}
 .cmp-detail-row:first-of-type{border-top:none}
 .cmp-detail-ticker{font-weight:900;color:#172033;min-width:52px}
+.cmp-headline{margin-bottom:8px}
+.cmp-headline-row{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;padding:4px 0;font-size:12.5px}
+.cmp-headline-label{font-weight:900;color:#172033;min-width:118px}
+.cmp-headline-item{color:#475467}
+.cmp-headline-item b{color:#172033}
 
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}
   .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}
@@ -1638,6 +1643,33 @@ function cmpDetailRowHtml(e){
     ${dayCell(e.day60_date, e.day60_price, e.day60_return_pct)}
   </div>`;
 }
+// Q5直近勢い(design 2026-10-21)。既存の「Q5確定成績」(day5/20/60の確定
+// リターン、recent_window)とは別の指標で、day0から現在までの途中経過
+// (day5/20/60の確定を問わない)を表示する。既存のcmpRowHtml/cmpTable等は
+// 一切変更せず、見出しの直下に2行だけ追加する。
+function momentumCellHtml(label, agg){
+  const sub = agg.n > 0 ? `(n=${agg.n},${agg.unique_day0_dates}日)` : "";
+  return `<span class="cmp-headline-item">${esc(label)} <b>${fmtPctSigned(agg.mean)}</b><span class="cmp-side-label">${sub}</span></span>`;
+}
+function cmpHeadlineHtml(data){
+  const rw = data.recent_window;
+  const mom = data.momentum || {};
+  const confirmedRow = `<div class="cmp-headline-row">
+    <span class="cmp-headline-label">Q5確定成績</span>
+    <span class="cmp-headline-item">5日後 <b>${fmtPctSigned(rw["5"].q5.mean)}</b></span>
+    <span class="cmp-headline-item">20日後 <b>${fmtPctSigned(rw["20"].q5.mean)}</b></span>
+    <span class="cmp-headline-item">60日後 <b>${fmtPctSigned(rw["60"].q5.mean)}</b></span>
+  </div>`;
+  const dateLabel = data.latest_price_date ? `（${esc(fmtDate(data.latest_price_date))}時点）` : "";
+  const momentumRow = `<div class="cmp-headline-row">
+    <span class="cmp-headline-label">Q5直近勢い${dateLabel}</span>
+    ${momentumCellHtml("直近5日", mom["5"] || {n:0})}
+    ${momentumCellHtml("直近20日", mom["20"] || {n:0})}
+    ${momentumCellHtml("直近60日", mom["60"] || {n:0})}
+  </div>`;
+  return `<div class="cmp-headline">${confirmedRow}${momentumRow}</div>
+  <div class="cmp-note">「Q5確定成績」はDay0から5/20/60営業日後に確定した成績、「Q5直近勢い」は直近にQ5 Day0になった銘柄が現在まで(未経過含む)どれだけ動いているかを示す、別の指標です。</div>`;
+}
 function renderComparison(data){
   const el = document.getElementById("comparePanel");
   if(!el) return;
@@ -1654,6 +1686,7 @@ function renderComparison(data){
     .map(cmpDetailRowHtml).join("");
   el.innerHTML = `<div class="cmp-panel">
     <div class="cmp-head">📈 実績比較：私 vs Q5 Day0 48銘柄</div>
+    ${cmpHeadlineHtml(data)}
     <div style="overflow-x:auto">
     <table class="cmp-table">
       <thead><tr>
@@ -2560,16 +2593,25 @@ def compare_q5universe():
 
         q5_state = store.get_q5universe_state() or {}
         q5_entries = q5_state.get("entries") or []
+        latest_price = q5_state.get("latest_price") or {}
+        latest_price_date = q5_state.get("latest_price_date")
 
         trading_calendar = _trading_days_calendar()
         anchor_date = trading_calendar[-1] if trading_calendar else None
 
         report = comparison_logic.build_comparison_report(trade_history, q5_entries, trading_calendar, anchor_date)
+        # 「Q5直近勢い」(design 2026-10-21): 既存の確定成績(report)とは別の
+        # 指標で、day5/20/60の確定を問わずday0から現在までの途中経過を
+        # 含める。既存のrecent_window/all_time_by_horizonのキー・値には
+        # 一切影響しない(完全に追加のキー)。
+        momentum = comparison_logic.build_momentum_report(q5_entries, latest_price, trading_calendar, anchor_date)
         return jsonify({
             "ok": True,
             "recent_window": report["recent_window"],
             "all_time_by_horizon": report["all_time_by_horizon"],
             "q5_entries": comparison_logic.enrich_entries_with_returns(q5_entries),
+            "momentum": momentum,
+            "latest_price_date": latest_price_date,
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
