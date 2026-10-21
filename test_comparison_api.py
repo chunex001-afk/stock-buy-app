@@ -31,10 +31,16 @@ class CompareApiTestCase(unittest.TestCase):
         self._portfolio_state = None
         self._q5_state = None
         self._calendar = list(CAL)
+        self._ticker_prices = {}  # 保有中ポジションの現在価格(テスト専用、ticker->price)
+
+        def fake_get_ticker_record(ticker):
+            price = self._ticker_prices.get(ticker)
+            return {"price": price} if price is not None else None
 
         patches = [
             mock.patch.object(app.store, "get_portfolio_state", side_effect=lambda: self._portfolio_state),
             mock.patch.object(app.store, "get_q5universe_state", side_effect=lambda: self._q5_state),
+            mock.patch.object(app.store, "get_ticker_record", side_effect=fake_get_ticker_record),
             mock.patch.object(app, "_trading_days_calendar", side_effect=lambda: self._calendar),
         ]
         for p in patches:
@@ -233,6 +239,250 @@ class MomentumResponseTests(CompareApiTestCase):
         self.assertAlmostEqual(data["q5_entries"][0]["day20_return_pct"], 20.0)
         # momentumキーの追加によって既存キーの値がぶれていないこと
         self.assertIn("momentum", data)
+
+
+class MyConfirmedBlockResponseTests(CompareApiTestCase):
+    """①【保有確定】(design 2026-10-21)のAPIレベルテスト。
+    私側は実際の購入日起算(Q5側はQ5 Day0起算、既存のrecent_windowを再利用)。"""
+
+    def test_my_confirmed_key_present_with_expected_shape(self):
+        self._portfolio_state = {"positions": {}, "trade_history": []}
+        self._q5_state = {"entries": []}
+        resp, data = self._get()
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(set(data["my_confirmed"].keys()), {"5", "20", "60"})
+
+    def test_sold_trade_past_threshold_uses_real_exit_return(self):
+        self._portfolio_state = {"positions": {}, "trade_history": [
+            {"ticker": "AMD", "entry_date": CAL[0], "entry_price": 100.0,
+             "exit_date": CAL[25], "exit_price": 130.0, "return_pct": 30.0},
+        ]}
+        self._q5_state = {"entries": []}
+        self._calendar = CAL[:30]
+        resp, data = self._get()
+        self.assertEqual(data["my_confirmed"]["20"]["n"], 1)
+        self.assertAlmostEqual(data["my_confirmed"]["20"]["mean"], 30.0)
+
+    def test_open_position_past_threshold_uses_current_price(self):
+        self._portfolio_state = {"positions": {"AMD": {"entry_date": CAL[0], "entry_price": 100.0}},
+                                  "trade_history": []}
+        self._q5_state = {"entries": []}
+        self._ticker_prices = {"AMD": 125.0}
+        self._calendar = CAL[:30]
+        resp, data = self._get()
+        self.assertEqual(data["my_confirmed"]["20"]["n"], 1)
+        self.assertAlmostEqual(data["my_confirmed"]["20"]["mean"], 25.0)
+
+    def test_my_confirmed_does_not_require_q5_entries(self):
+        """Q5側はrecent_window(既存)をそのまま再利用するだけで、
+        my_confirmed自体はQ5側のデータが空でも正常に計算される。"""
+        self._portfolio_state = {"positions": {"AMD": {"entry_date": CAL[0], "entry_price": 100.0}},
+                                  "trade_history": []}
+        self._q5_state = None
+        self._ticker_prices = {"AMD": 110.0}
+        self._calendar = CAL[:30]
+        resp, data = self._get()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(data["my_confirmed"]["20"]["n"], 1)
+
+
+class MyCurrentPriceBlockResponseTests(CompareApiTestCase):
+    """②【現在価格】(design 2026-10-21)のAPIレベルテスト。
+    私側は実際の購入日起算、保有中(open)と売却済み(sold)を分けて返す。"""
+
+    def test_my_current_price_key_present_with_open_and_sold(self):
+        self._portfolio_state = {"positions": {}, "trade_history": []}
+        self._q5_state = {"entries": []}
+        resp, data = self._get()
+        self.assertEqual(resp.status_code, 200)
+        for h in ("5", "20", "60"):
+            self.assertEqual(set(data["my_current_price"][h].keys()), {"open", "sold"})
+
+    def test_open_position_recently_purchased_uses_mark_to_market(self):
+        self._portfolio_state = {"positions": {"AMD": {"entry_date": CAL[98], "entry_price": 100.0}},
+                                  "trade_history": []}
+        self._q5_state = {"entries": []}
+        self._ticker_prices = {"AMD": 115.0}
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertEqual(data["my_current_price"]["5"]["open"]["n"], 1)
+        self.assertAlmostEqual(data["my_current_price"]["5"]["open"]["mean"], 15.0)
+        self.assertEqual(data["my_current_price"]["5"]["sold"]["n"], 0)
+
+    def test_recently_purchased_and_sold_trade_reported_separately(self):
+        self._portfolio_state = {"positions": {}, "trade_history": [
+            {"ticker": "AMD", "entry_date": CAL[98], "entry_price": 100.0,
+             "exit_date": CAL[99], "exit_price": 108.0, "return_pct": 8.0},
+        ]}
+        self._q5_state = {"entries": []}
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertEqual(data["my_current_price"]["5"]["open"]["n"], 0)
+        self.assertEqual(data["my_current_price"]["5"]["sold"]["n"], 1)
+        self.assertAlmostEqual(data["my_current_price"]["5"]["sold"]["mean"], 8.0)
+
+
+class NewBlocksExistingKeysUnaffectedTests(CompareApiTestCase):
+    """既存のQ5直近勢い・確定成績・既存の詳細テーブル用キーが、新しい
+    2ブロック追加によって変化しないことのAPIレベル確認(12)。"""
+
+    def test_existing_keys_unchanged_when_new_blocks_present(self):
+        self._q5_state = {
+            "entries": [{"ticker": "AMD", "day0_date": CAL[98], "day0_price": 100.0,
+                         "day5_date": None, "day5_price": None,
+                         "day20_date": CAL[20], "day20_price": 110.0,
+                         "day60_date": None, "day60_price": None}],
+            "latest_price": {"AMD": 112.0}, "latest_price_date": CAL[100],
+        }
+        self._portfolio_state = {"positions": {"AMD": {"entry_date": CAL[99], "entry_price": 90.0}},
+                                  "trade_history": []}
+        self._ticker_prices = {"AMD": 99.0}
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertAlmostEqual(data["momentum"]["5"]["mean"], 12.0)  # (112/100-1)*100、新ブロックと無関係
+        self.assertEqual(set(data["recent_window"].keys()), {"5", "20", "60", "cumulative"})
+        self.assertIn("my_confirmed", data)
+        self.assertIn("my_current_price", data)
+
+
+class ActualPerformanceBlockResponseTests(CompareApiTestCase):
+    """③【実運用成績】(design 2026-10-21最終確定仕様)のAPIレベルテスト。
+    Q5側はQ5 Day0起算で20営業日運用後に固定、私側は実際の購入日起算。"""
+
+    def test_actual_performance_key_present_with_5_20_60_120_180_keys(self):
+        self._portfolio_state = {"positions": {}, "trade_history": []}
+        self._q5_state = {"entries": []}
+        resp, data = self._get()
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(set(data["actual_performance"].keys()), {"5", "20", "60", "120", "180"})
+        for window_key in data["actual_performance"]:
+            row = data["actual_performance"][window_key]
+            self.assertEqual(set(row.keys()), {"q5", "mine", "mean_diff", "median_diff", "win_rate_diff"})
+            self.assertEqual(set(row["q5"].keys()),
+                              {"n", "mean", "median", "win_rate", "total", "unconfirmed"})
+            self.assertEqual(set(row["mine"].keys()), {"n", "mean", "median", "win_rate"})
+
+    def test_q5_entry_overdue_without_day20_price_excluded_not_current_price(self):
+        """2026-10-21追加修正: 20営業日以上経過してday20_priceが未確定の
+        Q5 Day0は、latest_priceがどれだけ動いても集計(n/mean)に入らず、
+        unconfirmedとしてカウントされる(現在価格を絶対に代用しない)。"""
+        self._q5_state = {
+            "entries": [{"ticker": "AMD", "day0_date": CAL[0], "day0_price": 100.0,
+                         "day5_date": None, "day5_price": None,
+                         "day20_date": None, "day20_price": None,  # 未確定のまま
+                         "day60_date": None, "day60_price": None}],
+            "latest_price": {"AMD": 200.0},  # +100%、これが使われてはいけない
+            "latest_price_date": CAL[40],
+        }
+        self._portfolio_state = {"positions": {}, "trade_history": []}
+        self._calendar = CAL[:41]
+        resp, data = self._get()
+        row = data["actual_performance"]["60"]["q5"]
+        self.assertEqual(row["total"], 1)
+        self.assertEqual(row["n"], 0)
+        self.assertEqual(row["unconfirmed"], 1)
+        self.assertIsNone(row["mean"])
+
+    def test_q5_side_freezes_at_day20_price_not_current_price(self):
+        """2・3: 20営業日後価格が確定済みのQ5 Day0は、latest_priceが
+        どれだけ動いても20営業日後価格のリターンで固定される。"""
+        self._q5_state = {
+            "entries": [{"ticker": "AMD", "day0_date": CAL[0], "day0_price": 100.0,
+                         "day5_date": None, "day5_price": None,
+                         "day20_date": CAL[20], "day20_price": 130.0,
+                         "day60_date": None, "day60_price": None}],
+            "latest_price": {"AMD": 999.0},
+            "latest_price_date": CAL[100],
+        }
+        self._portfolio_state = {"positions": {}, "trade_history": []}
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertEqual(data["actual_performance"]["180"]["q5"]["n"], 1)
+        self.assertAlmostEqual(data["actual_performance"]["180"]["q5"]["mean"], 30.0)
+
+    def test_q5_side_under_20_days_uses_current_price(self):
+        """1: 20営業日未満のQ5 Day0はlatest_priceでmark-to-marketする。"""
+        self._q5_state = {
+            "entries": [{"ticker": "AMD", "day0_date": CAL[90], "day0_price": 100.0,
+                         "day5_date": None, "day5_price": None,
+                         "day20_date": None, "day20_price": None,
+                         "day60_date": None, "day60_price": None}],
+            "latest_price": {"AMD": 108.0},
+            "latest_price_date": CAL[100],
+        }
+        self._portfolio_state = {"positions": {}, "trade_history": []}
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertEqual(data["actual_performance"]["20"]["q5"]["n"], 1)
+        self.assertAlmostEqual(data["actual_performance"]["20"]["q5"]["mean"], 8.0)
+
+    def test_my_side_uses_entry_date_for_both_sold_and_open(self):
+        """6・5・7: 私側は売却済み(実売却価格)・保有中(現在価格)を
+        混在させ、購入日(entry_date)でウィンドウ判定する。"""
+        self._portfolio_state = {
+            "positions": {"AMD": {"entry_date": CAL[90], "entry_price": 100.0}},
+            "trade_history": [
+                {"ticker": "NVDA", "entry_date": CAL[90], "entry_price": 50.0,
+                 "exit_date": CAL[95], "exit_price": 70.0, "return_pct": 40.0},
+            ],
+        }
+        self._q5_state = {"entries": []}
+        self._ticker_prices = {"AMD": 108.0}
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertEqual(data["actual_performance"]["20"]["mine"]["n"], 2)
+        self.assertAlmostEqual(data["actual_performance"]["20"]["mine"]["mean"], 24.0)
+
+    def test_mean_diff_is_mine_minus_q5(self):
+        self._q5_state = {
+            "entries": [{"ticker": "AMD", "day0_date": CAL[0], "day0_price": 100.0,
+                         "day5_date": None, "day5_price": None,
+                         "day20_date": CAL[20], "day20_price": 110.0,
+                         "day60_date": None, "day60_price": None}],
+            "latest_price": {},
+        }
+        self._portfolio_state = {"positions": {}, "trade_history": [
+            {"ticker": "NVDA", "entry_date": CAL[0], "entry_price": 50.0,
+             "exit_date": CAL[20], "exit_price": 75.0, "return_pct": 50.0},
+        ]}
+        self._calendar = CAL[:30]
+        resp, data = self._get()
+        self.assertAlmostEqual(data["actual_performance"]["60"]["mean_diff"], 40.0)
+
+    def test_existing_keys_unchanged_when_actual_performance_present(self):
+        """9: 既存のmomentum/recent_window/my_confirmed/my_current_priceが
+        ③実運用成績の追加によって変化しないことのAPIレベル確認。"""
+        self._q5_state = {
+            "entries": [{"ticker": "AMD", "day0_date": CAL[98], "day0_price": 100.0,
+                         "day5_date": None, "day5_price": None,
+                         "day20_date": CAL[20], "day20_price": 110.0,
+                         "day60_date": None, "day60_price": None}],
+            "latest_price": {"AMD": 112.0}, "latest_price_date": CAL[100],
+        }
+        self._portfolio_state = {"positions": {"AMD": {"entry_date": CAL[99], "entry_price": 90.0}},
+                                  "trade_history": []}
+        self._ticker_prices = {"AMD": 99.0}
+        self._calendar = CAL[:101]
+        resp, data = self._get()
+        self.assertAlmostEqual(data["momentum"]["5"]["mean"], 12.0)
+        self.assertEqual(set(data["recent_window"].keys()), {"5", "20", "60", "cumulative"})
+        self.assertIn("my_confirmed", data)
+        self.assertIn("my_current_price", data)
+        self.assertIn("actual_performance", data)
+
+    def test_empty_states_return_zero_counts_not_error(self):
+        """8: 資金/NAV等を一切使わないため、空データでもn=0として正常に
+        返る(エラーにならない)。"""
+        self._portfolio_state = None
+        self._q5_state = None
+        resp, data = self._get()
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(data["ok"])
+        for window_key in ("5", "20", "60", "120", "180"):
+            self.assertEqual(data["actual_performance"][window_key]["q5"]["n"], 0)
+            self.assertEqual(data["actual_performance"][window_key]["mine"]["n"], 0)
 
 
 if __name__ == "__main__":

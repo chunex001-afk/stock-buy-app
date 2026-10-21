@@ -354,5 +354,417 @@ class MomentumReportTests(unittest.TestCase):
         self.assertEqual(report_before_like, report_after)
 
 
+def _purchase_trade(ticker, entry_date, entry_price, exit_date=None, exit_price=None):
+    """Day0対応付けテスト専用: trade_history形式の購入記録(売却済み)を作る。
+    return_pctは実際のconfirm_sellと同じ計算式でその場で入れておく。"""
+    return_pct = None
+    if exit_price is not None and entry_price:
+        return_pct = (exit_price / entry_price - 1) * 100
+    return {"ticker": ticker, "entry_date": entry_date, "entry_price": entry_price,
+            "exit_date": exit_date, "exit_price": exit_price, "return_pct": return_pct}
+
+
+class TradingDaysHeldTests(unittest.TestCase):
+    def test_basic_elapsed_business_days(self):
+        self.assertEqual(cmp._trading_days_held(CAL[10], CAL[15], CAL), 5)
+
+    def test_zero_when_same_day(self):
+        self.assertEqual(cmp._trading_days_held(CAL[10], CAL[10], CAL), 0)
+
+    def test_none_when_date_not_in_calendar(self):
+        self.assertIsNone(cmp._trading_days_held(CAL[10], "not-a-date", CAL))
+        self.assertIsNone(cmp._trading_days_held("not-a-date", CAL[10], CAL))
+
+
+class MyConfirmedReturnsTests(unittest.TestCase):
+    """①保有確定: 実際の購入日起算、経過営業日数がthreshold以上の取引を
+    対象にする(「20営業日保有を基本運用として扱う」という考え方)。"""
+
+    def test_sold_trade_reaching_threshold_included_with_real_return(self):
+        trade = _purchase_trade("AAA", CAL[0], 100.0, exit_date=CAL[20], exit_price=130.0)
+        returns = cmp.my_confirmed_returns([trade], {}, {}, CAL, CAL[25], threshold_days=20)
+        self.assertEqual(len(returns), 1)
+        self.assertAlmostEqual(returns[0], 30.0)
+
+    def test_sold_trade_below_threshold_excluded(self):
+        """保有期間がthreshold未満で売却した取引は、そのthresholdの
+        確定運用結果とは言えないため対象外。"""
+        trade = _purchase_trade("AAA", CAL[0], 100.0, exit_date=CAL[10], exit_price=130.0)
+        returns = cmp.my_confirmed_returns([trade], {}, {}, CAL, CAL[25], threshold_days=20)
+        self.assertEqual(returns, [])
+
+    def test_open_position_past_threshold_uses_current_price(self):
+        """保有中で、基本運用期間(threshold)を超えて保有が続いている場合、
+        現在価格を暫定の確定値として使う。"""
+        positions = {"AAA": {"entry_date": CAL[0], "entry_price": 100.0}}
+        returns = cmp.my_confirmed_returns([], positions, {"AAA": 120.0}, CAL, CAL[25], threshold_days=20)
+        self.assertEqual(len(returns), 1)
+        self.assertAlmostEqual(returns[0], 20.0)
+
+    def test_open_position_before_threshold_excluded(self):
+        """まだthreshold営業日に達していない保有中ポジションは、まだ
+        確定的に評価できないため対象外。"""
+        positions = {"AAA": {"entry_date": CAL[0], "entry_price": 100.0}}
+        returns = cmp.my_confirmed_returns([], positions, {"AAA": 120.0}, CAL, CAL[10], threshold_days=20)
+        self.assertEqual(returns, [])
+
+    def test_open_position_missing_current_price_excluded_not_crash(self):
+        positions = {"AAA": {"entry_date": CAL[0], "entry_price": 100.0}}
+        returns = cmp.my_confirmed_returns([], positions, {}, CAL, CAL[25], threshold_days=20)
+        self.assertEqual(returns, [])
+
+    def test_5_and_60_thresholds_use_same_rule_as_20(self):
+        trade5 = _purchase_trade("AAA", CAL[0], 100.0, exit_date=CAL[5], exit_price=105.0)
+        trade60 = _purchase_trade("BBB", CAL[0], 100.0, exit_date=CAL[60], exit_price=160.0)
+        returns5 = cmp.my_confirmed_returns([trade5], {}, {}, CAL, CAL[65], threshold_days=5)
+        returns60 = cmp.my_confirmed_returns([trade60], {}, {}, CAL, CAL[65], threshold_days=60)
+        self.assertEqual(len(returns5), 1)
+        self.assertAlmostEqual(returns5[0], 5.0)
+        self.assertEqual(len(returns60), 1)
+        self.assertAlmostEqual(returns60[0], 60.0)
+
+
+class BuildMyConfirmedReportTests(unittest.TestCase):
+    def test_report_has_5_20_60_keys(self):
+        report = cmp.build_my_confirmed_report([], {}, {}, CAL, CAL[100])
+        self.assertEqual(set(report.keys()), {"5", "20", "60"})
+
+    def test_mixed_sold_and_open_aggregated_together(self):
+        trade = _purchase_trade("AAA", CAL[0], 100.0, exit_date=CAL[25], exit_price=130.0)  # +30%
+        positions = {"BBB": {"entry_date": CAL[0], "entry_price": 100.0}}  # +10%(保有中)
+        report = cmp.build_my_confirmed_report([trade], positions, {"BBB": 110.0}, CAL, CAL[30])
+        self.assertEqual(report["20"]["n"], 2)
+        self.assertAlmostEqual(report["20"]["mean"], 20.0)
+
+
+class MyRecentPurchasesSelectionTests(unittest.TestCase):
+    """②現在価格: 実際の購入日が直近N営業日以内の購入を、保有中(open)と
+    売却済み(sold)に分けて選別する(混ぜない)。"""
+
+    def test_open_position_within_window_selected(self):
+        positions = {"AAA": {"entry_date": CAL[98], "entry_price": 100.0}}
+        open_list, sold_list = cmp.my_recent_purchases([], positions, CAL, CAL[100], window_days=5)
+        self.assertEqual(len(open_list), 1)
+        self.assertEqual(sold_list, [])
+
+    def test_open_position_outside_window_excluded(self):
+        positions = {"AAA": {"entry_date": CAL[50], "entry_price": 100.0}}
+        open_list, sold_list = cmp.my_recent_purchases([], positions, CAL, CAL[100], window_days=5)
+        self.assertEqual(open_list, [])
+
+    def test_sold_trade_within_window_goes_to_sold_list_not_open(self):
+        trade = _purchase_trade("AAA", CAL[98], 100.0, exit_date=CAL[99], exit_price=110.0)
+        open_list, sold_list = cmp.my_recent_purchases([trade], {}, CAL, CAL[100], window_days=5)
+        self.assertEqual(open_list, [])
+        self.assertEqual(len(sold_list), 1)
+
+    def test_selection_based_on_entry_date_not_exit_date(self):
+        """購入(entry_date)が古くても、最近売却しただけなら選ばれない
+        (確定成績ブロックの「購入日起算」と対称に、現在価格ブロックも
+        購入日で選ぶ)。"""
+        trade = _purchase_trade("AAA", CAL[50], 100.0, exit_date=CAL[99], exit_price=110.0)
+        open_list, sold_list = cmp.my_recent_purchases([trade], {}, CAL, CAL[100], window_days=5)
+        self.assertEqual(sold_list, [])
+
+
+class BuildMyCurrentPriceReportTests(unittest.TestCase):
+    def test_report_has_5_20_60_keys_with_open_and_sold(self):
+        report = cmp.build_my_current_price_report([], {}, {}, CAL, CAL[100])
+        for h in ("5", "20", "60"):
+            self.assertEqual(set(report[h].keys()), {"open", "sold"})
+
+    def test_open_uses_mark_to_market_current_price(self):
+        positions = {"AAA": {"entry_date": CAL[98], "entry_price": 100.0}}
+        report = cmp.build_my_current_price_report([], positions, {"AAA": 112.0}, CAL, CAL[100])
+        self.assertAlmostEqual(report["5"]["open"]["mean"], 12.0)
+        self.assertEqual(report["5"]["sold"]["n"], 0)
+
+    def test_sold_kept_separate_from_open_not_blended(self):
+        trade = _purchase_trade("AAA", CAL[98], 100.0, exit_date=CAL[99], exit_price=120.0)  # +20%
+        positions = {"BBB": {"entry_date": CAL[98], "entry_price": 50.0}}  # +4%
+        report = cmp.build_my_current_price_report([trade], positions, {"BBB": 52.0}, CAL, CAL[100])
+        self.assertEqual(report["5"]["open"]["n"], 1)
+        self.assertAlmostEqual(report["5"]["open"]["mean"], 4.0)
+        self.assertEqual(report["5"]["sold"]["n"], 1)
+        self.assertAlmostEqual(report["5"]["sold"]["mean"], 20.0)
+
+    def test_open_missing_current_price_excluded(self):
+        positions = {"AAA": {"entry_date": CAL[98], "entry_price": 100.0}}
+        report = cmp.build_my_current_price_report([], positions, {}, CAL, CAL[100])
+        self.assertEqual(report["5"]["open"]["n"], 0)
+
+
+class NewBlocksDoNotAffectExistingLogicTests(unittest.TestCase):
+    """12: 既存のQ5直近勢い・Q5確定成績に影響しないことの確認
+    (BUY/SELL/Risk-off等は既存テストスイート全体の実行で別途確認する)。"""
+
+    def test_momentum_and_confirmed_report_unchanged_when_new_blocks_also_computed(self):
+        anchor = CAL[100]
+        trades = [_trade(CAL[95], 30.0)]
+        entries = [_q5_entry(day0_price=100.0, day20=(CAL[95], 110.0))]
+        positions = {"BBB": {"entry_date": CAL[90], "entry_price": 50.0}}
+
+        momentum_before = cmp.build_momentum_report(entries, {"AAA": 999.0}, CAL, anchor)
+        confirmed_before = cmp.build_comparison_report(trades, entries, CAL, anchor)
+
+        # 新しい2ブロックを呼んでも、既存の計算結果に全く影響しないことを確認する。
+        cmp.build_my_confirmed_report(trades, positions, {"BBB": 999.0}, CAL, anchor)
+        cmp.build_my_current_price_report(trades, positions, {"BBB": 999.0}, CAL, anchor)
+
+        momentum_after = cmp.build_momentum_report(entries, {"AAA": 999.0}, CAL, anchor)
+        confirmed_after = cmp.build_comparison_report(trades, entries, CAL, anchor)
+        self.assertEqual(momentum_before, momentum_after)
+        self.assertEqual(confirmed_before, confirmed_after)
+
+
+class Q5ActualPerformanceReturnTests(unittest.TestCase):
+    """①②③④: Q5側の個別リターン計算。20営業日SELLルール厳守のため、
+    day20_price未確定のまま20営業日以上経過したentryは、現在価格を
+    代用せずNone(未確定、集計から除外)として扱う(2026-10-21改訂)。"""
+
+    def test_requirement1_under_20_business_days_uses_current_price(self):
+        """1. Day0から10営業日、day20_priceなし、latest_priceあり
+        → 現在価格を使用する。"""
+        entry = _q5_entry(day0_price=100.0)  # day0_date=CAL[0]固定(ヘルパー既定値)
+        r = cmp._q5_actual_performance_return(entry, {"AAA": 108.0}, CAL, CAL[10])
+        self.assertAlmostEqual(r, 8.0)
+
+    def test_requirement2_20_business_days_or_more_with_day20_price_uses_it(self):
+        """2. Day0から20営業日以上、day20_priceあり → day20_priceを使用する。"""
+        entry = _q5_entry(day0_price=100.0, day20=(CAL[20], 130.0))
+        r = cmp._q5_actual_performance_return(entry, {"AAA": 999.0}, CAL, CAL[25])
+        self.assertAlmostEqual(r, 30.0)
+
+    def test_current_price_never_used_once_day20_fixed(self):
+        """20営業日後に+30%、現在+60%でもQ5側は+30%(固定後は現在価格を
+        絶対に使わない)。"""
+        entry = _q5_entry(day0_price=100.0, day20=(CAL[20], 130.0))
+        r = cmp._q5_actual_performance_return(entry, {"AAA": 160.0}, CAL, CAL[100])
+        self.assertAlmostEqual(r, 30.0)
+
+    def test_requirement3_20_business_days_or_more_without_day20_price_returns_none(self):
+        """3. Day0から20営業日以上、day20_priceなし、latest_priceあり
+        → None(未確定として除外)。latest_priceを絶対に使わない。"""
+        entry = _q5_entry(day0_price=100.0)  # day20_date/day20_priceは未確定のまま
+        entry["day0_date"] = CAL[0]
+        r = cmp._q5_actual_performance_return(entry, {"AAA": 108.0}, CAL, CAL[40])  # 40営業日経過
+        self.assertIsNone(r)
+
+    def test_requirement4_extreme_current_price_not_used_when_unconfirmed(self):
+        """4. 20営業日以上経過してday20_price未確定の場合、現在価格が
+        +100%など極端に高くても、その値がQ5成績に入らないこと。"""
+        entry = _q5_entry(day0_price=100.0)
+        entry["day0_date"] = CAL[0]
+        r = cmp._q5_actual_performance_return(entry, {"AAA": 200.0}, CAL, CAL[40])  # +100%相当
+        self.assertIsNone(r)
+
+    def test_missing_day0_price_returns_none(self):
+        entry = _q5_entry(day0_price=None)
+        self.assertIsNone(cmp._q5_actual_performance_return(entry, {"AAA": 100.0}, CAL, CAL[10]))
+
+    def test_missing_current_price_before_day20_returns_none(self):
+        entry = _q5_entry(day0_price=100.0)
+        self.assertIsNone(cmp._q5_actual_performance_return(entry, {}, CAL, CAL[10]))
+
+    def test_exactly_20_business_days_is_treated_as_elapsed_not_under(self):
+        """境界値: ちょうど20営業日経過はunder-20ではなくelapsed>=20側として
+        扱う(day20_price未確定なら現在価格を使わずNone)。"""
+        entry = _q5_entry(day0_price=100.0)
+        entry["day0_date"] = CAL[0]
+        r = cmp._q5_actual_performance_return(entry, {"AAA": 108.0}, CAL, CAL[20])  # ちょうど20営業日
+        self.assertIsNone(r)
+
+
+class Q5ActualPerformanceReturnsWindowTests(unittest.TestCase):
+    """4・5・6・7: 観測ウィンドウはday0_date起算で、保有完了かどうかを
+    問わない。戻り値は(returns, total, unconfirmed)のタプル。"""
+
+    def test_scenario4_immature_day0_within_window_included(self):
+        """4. 直近180営業日の中にある未成熟Day0(まだ20営業日未経過)も集計対象。"""
+        entry = _q5_entry(day0_price=100.0)  # day20未確定
+        entry["day0_date"] = CAL[170]
+        returns, total, unconfirmed = cmp.q5_actual_performance_returns(
+            [entry], {"AAA": 110.0}, CAL, CAL[180], 180)
+        self.assertEqual(len(returns), 1)
+        self.assertAlmostEqual(returns[0], 10.0)
+        self.assertEqual(total, 1)
+        self.assertEqual(unconfirmed, 0)
+
+    def test_scenario7_window_is_observation_not_holding_period(self):
+        """7. 5/20/60/120/180は保有期間ではなく観測期間。10営業日前のDay0は
+        20/60/120/180には入るが5には入らない。"""
+        entry = _q5_entry(day0_price=100.0)
+        entry["day0_date"] = CAL[90]
+        anchor = CAL[100]
+        returns5, total5, _ = cmp.q5_actual_performance_returns([entry], {"AAA": 108.0}, CAL, anchor, 5)
+        self.assertEqual(returns5, [])
+        self.assertEqual(total5, 0)
+        for window_days in (20, 60, 120, 180):
+            returns, total, unconfirmed = cmp.q5_actual_performance_returns(
+                [entry], {"AAA": 108.0}, CAL, anchor, window_days)
+            self.assertEqual(len(returns), 1, f"window={window_days}")
+            self.assertEqual(total, 1, f"window={window_days}")
+            self.assertEqual(unconfirmed, 0, f"window={window_days}")
+
+    def test_exactly_window_days_ago_excluded(self):
+        entry = _q5_entry(day0_price=100.0)
+        entry["day0_date"] = CAL[80]
+        returns, total, unconfirmed = cmp.q5_actual_performance_returns(
+            [entry], {"AAA": 108.0}, CAL, CAL[100], 20)
+        self.assertEqual(returns, [])
+        self.assertEqual(total, 0)
+        self.assertEqual(unconfirmed, 0)
+
+    def test_requirement5_unconfirmed_count_tracked_when_day20_price_missing(self):
+        """5. 未確定件数が正しくカウントされること。"""
+        confirmed_entry = _q5_entry(day0_price=100.0, day20=(CAL[20], 110.0))
+        confirmed_entry["ticker"], confirmed_entry["day0_date"] = "AAA", CAL[0]
+        unconfirmed_entry = _q5_entry(day0_price=50.0)  # day20未確定、20営業日以上経過させる
+        unconfirmed_entry["ticker"], unconfirmed_entry["day0_date"] = "BBB", CAL[0]
+        returns, total, unconfirmed = cmp.q5_actual_performance_returns(
+            [confirmed_entry, unconfirmed_entry], {"BBB": 999.0}, CAL, CAL[40], 60)
+        self.assertEqual(total, 2)
+        self.assertEqual(len(returns), 1)
+        self.assertEqual(unconfirmed, 1)
+
+    def test_requirement6_window_distinguishes_immature_vs_unconfirmed(self):
+        """6. 観測期間内のDay0は対象件数として認識され、そのうち20営業日
+        以上経過してday20_priceが無いものだけ未確定になる(まだ20営業日
+        未経過のものは未確定にカウントしない)。"""
+        immature = _q5_entry(day0_price=100.0)  # 10営業日経過、day20未確定→mark-to-market(確定扱い)
+        immature["ticker"], immature["day0_date"] = "AAA", CAL[30]
+        overdue = _q5_entry(day0_price=50.0)  # 40営業日経過、day20未確定→未確定
+        overdue["ticker"], overdue["day0_date"] = "BBB", CAL[0]
+        anchor = CAL[40]
+        returns, total, unconfirmed = cmp.q5_actual_performance_returns(
+            [immature, overdue], {"AAA": 108.0, "BBB": 999.0}, CAL, anchor, 60)
+        self.assertEqual(total, 2)
+        self.assertEqual(len(returns), 1)
+        self.assertAlmostEqual(returns[0], 8.0)
+        self.assertEqual(unconfirmed, 1)
+
+
+class MyActualPerformanceReturnsTests(unittest.TestCase):
+    """5・6・7: 私側は実際の購入日(entry_date)を起点に、売却済みは実売却
+    価格、保有中は現在価格を使う。観測ウィンドウは保有期間ではない。"""
+
+    def test_scenario5_open_position_uses_current_price(self):
+        """5. 私側の保有中銘柄は現在価格を使う。"""
+        positions = {"AAA": {"entry_date": CAL[90], "entry_price": 100.0}}
+        returns = cmp.my_actual_performance_returns([], positions, {"AAA": 108.0}, CAL, CAL[100], 20)
+        self.assertEqual(len(returns), 1)
+        self.assertAlmostEqual(returns[0], 8.0)
+
+    def test_scenario6_sold_trade_uses_actual_exit_price_return(self):
+        """6. 私側の売却済みは実売却価格(既存のreturn_pct)を使う。"""
+        trade = _purchase_trade("AAA", CAL[90], 100.0, exit_date=CAL[95], exit_price=150.0)
+        returns = cmp.my_actual_performance_returns([trade], {}, {}, CAL, CAL[100], 20)
+        self.assertEqual(len(returns), 1)
+        self.assertAlmostEqual(returns[0], 50.0)
+
+    def test_scenario7_entry_10_days_ago_included_in_180_not_in_5(self):
+        """7. 10営業日前に購入して現在+8%の銘柄は、直近180営業日の集計には
+        含まれるが、直近5営業日の集計には含まれない。"""
+        positions = {"AAA": {"entry_date": CAL[90], "entry_price": 100.0}}
+        anchor = CAL[100]
+        self.assertEqual(cmp.my_actual_performance_returns([], positions, {"AAA": 108.0}, CAL, anchor, 5), [])
+        for window_days in (20, 60, 120, 180):
+            returns = cmp.my_actual_performance_returns([], positions, {"AAA": 108.0}, CAL, anchor, window_days)
+            self.assertEqual(len(returns), 1, f"window={window_days}")
+
+    def test_selection_is_entry_date_anchored_for_sold_too_not_exit_date(self):
+        """売却済みも売却日ではなく購入日でウィンドウ判定する(私側は保有中・
+        売却済みともentry_date起算で統一するdesign最終仕様)。"""
+        trade = _purchase_trade("AAA", CAL[10], 100.0, exit_date=CAL[95], exit_price=150.0)
+        returns = cmp.my_actual_performance_returns([trade], {}, {}, CAL, CAL[100], 20)
+        self.assertEqual(returns, [])
+
+    def test_blends_sold_and_open_together(self):
+        trade = _purchase_trade("AAA", CAL[90], 100.0, exit_date=CAL[95], exit_price=110.0)  # +10%
+        positions = {"BBB": {"entry_date": CAL[90], "entry_price": 50.0}}  # +4%
+        returns = cmp.my_actual_performance_returns([trade], positions, {"BBB": 52.0}, CAL, CAL[100], 20)
+        self.assertEqual(len(returns), 2)
+        self.assertAlmostEqual(sorted(returns)[0], 4.0)
+        self.assertAlmostEqual(sorted(returns)[1], 10.0)
+
+
+class BuildActualPerformanceReportTests(unittest.TestCase):
+    """8・9: NAV/資金/複利が入っていないこと、既存機能に影響しないこと。"""
+
+    def test_report_has_5_20_60_120_180_keys(self):
+        report = cmp.build_actual_performance_report([], [], {}, {}, {}, CAL, CAL[100])
+        self.assertEqual(set(report.keys()), {"5", "20", "60", "120", "180"})
+
+    def test_each_window_has_q5_mine_and_diff_fields(self):
+        report = cmp.build_actual_performance_report([], [], {}, {}, {}, CAL, CAL[100])
+        for window_key in report:
+            row = report[window_key]
+            self.assertEqual(set(row.keys()),
+                              {"q5", "mine", "mean_diff", "median_diff", "win_rate_diff"})
+            self.assertEqual(set(row["q5"].keys()),
+                              {"n", "mean", "median", "win_rate", "total", "unconfirmed"})
+            self.assertEqual(set(row["mine"].keys()), {"n", "mean", "median", "win_rate"})
+
+    def test_q5_total_equals_n_plus_unconfirmed(self):
+        """total(対象) = n(確定) + unconfirmed(未確定)の関係を確認する。"""
+        confirmed_entry = _q5_entry(day0_price=100.0, day20=(CAL[20], 110.0))
+        unconfirmed_entry = {"ticker": "BBB", "day0_date": CAL[0], "day0_price": 50.0,
+                              "day5_date": None, "day5_price": None,
+                              "day20_date": None, "day20_price": None,
+                              "day60_date": None, "day60_price": None}
+        report = cmp.build_actual_performance_report(
+            [confirmed_entry, unconfirmed_entry], [], {}, {"BBB": 999.0}, {}, CAL, CAL[40])
+        row = report["60"]["q5"]
+        self.assertEqual(row["total"], 2)
+        self.assertEqual(row["n"], 1)
+        self.assertEqual(row["unconfirmed"], 1)
+        self.assertEqual(row["total"], row["n"] + row["unconfirmed"])
+
+    def test_mean_diff_is_mine_minus_q5(self):
+        entry = _q5_entry(day0_price=100.0, day20=(CAL[20], 110.0))  # Q5 +10%
+        trade = _purchase_trade("BBB", CAL[0], 100.0, exit_date=CAL[20], exit_price=130.0)  # 私 +30%
+        report = cmp.build_actual_performance_report([entry], [trade], {}, {}, {}, CAL, CAL[25])
+        self.assertAlmostEqual(report["60"]["mean_diff"], 20.0)
+
+    def test_scenario8_no_nav_capital_compounding_fields_anywhere(self):
+        """8. 資金/NAV/複利などが計算に入っていないことの確認(_aggregateが
+        平均・中央値・勝率のみを返し、合算も株数・資金額も一切登場しない)。"""
+        entry = _q5_entry(day0_price=100.0, day20=(CAL[20], 150.0))
+        trade = _purchase_trade("BBB", CAL[0], 100.0, exit_date=CAL[20], exit_price=120.0)
+        report = cmp.build_actual_performance_report([entry], [trade], {}, {}, {}, CAL, CAL[25])
+        for window_key, row in report.items():
+            self.assertEqual(set(row["q5"].keys()),
+                              {"n", "mean", "median", "win_rate", "total", "unconfirmed"})
+            self.assertEqual(set(row["mine"].keys()), {"n", "mean", "median", "win_rate"})
+        # 単純合計していないことの確認: +10% +30%の合計(+40%)がどこにも出ない。
+        self.assertNotEqual(report["60"]["q5"]["mean"], 40.0)
+        self.assertNotEqual(report["60"]["mine"]["mean"], 40.0)
+
+    def test_scenario9_existing_reports_unchanged_when_actual_performance_also_computed(self):
+        """9. 既存のQ5直近勢い・Q5確定成績・①②ブロックに影響がないこと。"""
+        anchor = CAL[100]
+        trades = [_trade(CAL[95], 30.0)]
+        entries = [_q5_entry(day0_price=100.0, day20=(CAL[95], 110.0))]
+        positions = {"BBB": {"entry_date": CAL[90], "entry_price": 50.0}}
+
+        momentum_before = cmp.build_momentum_report(entries, {"AAA": 999.0}, CAL, anchor)
+        confirmed_before = cmp.build_comparison_report(trades, entries, CAL, anchor)
+        my_confirmed_before = cmp.build_my_confirmed_report(trades, positions, {"BBB": 999.0}, CAL, anchor)
+        my_current_before = cmp.build_my_current_price_report(trades, positions, {"BBB": 999.0}, CAL, anchor)
+
+        cmp.build_actual_performance_report(entries, trades, positions, {"AAA": 999.0},
+                                             {"BBB": 999.0}, CAL, anchor)
+
+        momentum_after = cmp.build_momentum_report(entries, {"AAA": 999.0}, CAL, anchor)
+        confirmed_after = cmp.build_comparison_report(trades, entries, CAL, anchor)
+        my_confirmed_after = cmp.build_my_confirmed_report(trades, positions, {"BBB": 999.0}, CAL, anchor)
+        my_current_after = cmp.build_my_current_price_report(trades, positions, {"BBB": 999.0}, CAL, anchor)
+
+        self.assertEqual(momentum_before, momentum_after)
+        self.assertEqual(confirmed_before, confirmed_after)
+        self.assertEqual(my_confirmed_before, my_confirmed_after)
+        self.assertEqual(my_current_before, my_current_after)
+
+
 if __name__ == "__main__":
     unittest.main()

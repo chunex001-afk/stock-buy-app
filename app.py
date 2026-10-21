@@ -1670,6 +1670,105 @@ function cmpHeadlineHtml(data){
   return `<div class="cmp-headline">${confirmedRow}${momentumRow}</div>
   <div class="cmp-note">「Q5確定成績」はDay0から5/20/60営業日後に確定した成績、「Q5直近勢い」は直近にQ5 Day0になった銘柄が現在まで(未経過含む)どれだけ動いているかを示す、別の指標です。</div>`;
 }
+// 【保有確定】【現在価格】の2ブロック比較(design 2026-10-21確定仕様)。
+// Q5側はQ5 Day0起算(既存のrecent_window=確定成績・momentum=直近勢いを
+// そのまま再利用、新しい計算はしない)、私側は実際の購入日起算(意図的な
+// 違い)。既存のcmpHeadlineHtml・既存の詳細テーブルには一切影響しない。
+function cmpBlockRowHtml(label, q5Agg, mineAgg, extraHtml){
+  const diff = (q5Agg.mean != null && mineAgg.mean != null) ? (mineAgg.mean - q5Agg.mean) : null;
+  const diffCls = (diff === null) ? "" : (diff >= 0 ? "pfstatus-gain-up" : "pfstatus-gain-down");
+  return `<tr>
+    <td>${esc(label)}</td>
+    <td>${fmtPctSigned(q5Agg.mean)}<span class="cmp-side-label">(n=${q5Agg.n})</span></td>
+    <td>${fmtPctSigned(mineAgg.mean)}<span class="cmp-side-label">(n=${mineAgg.n})</span>${extraHtml || ""}</td>
+    <td class="${diffCls}">${fmtPctSigned(diff)}</td>
+  </tr>`;
+}
+function cmpConfirmedBlockHtml(data){
+  const rw = data.recent_window || {};
+  const mc = data.my_confirmed || {};
+  const emptyAgg = {n: 0, mean: null};
+  const rows = ["5", "20", "60"].map(h =>
+    cmpBlockRowHtml(`${h}日`, (rw[h] || {}).q5 || emptyAgg, mc[h] || emptyAgg)
+  ).join("");
+  return `<div class="pfstatus-head">【保有確定】</div>
+  <div style="overflow-x:auto">
+  <table class="cmp-table">
+    <thead><tr><th>期間</th><th>Q5 48仮想</th><th>私の実績</th><th>差</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  </div>
+  <div class="cmp-note">Q5側はDay0から5/20/60営業日後の確定リターン(既存の「Q5確定成績」と同じ値、Day0起算)。私側は実際の購入日から5/20/60営業日以上経過した取引(売却済みは実際の売却価格、保有中はまだ経過済みの場合のみ現在価格を暫定値として使用、購入日起算)。</div>`;
+}
+function cmpCurrentPriceBlockHtml(data){
+  const mom = data.momentum || {};
+  const mcp = data.my_current_price || {};
+  const emptyAgg = {n: 0, mean: null};
+  const rows = ["5", "20", "60"].map(h => {
+    const mine = (mcp[h] || {}).open || emptyAgg;
+    const sold = (mcp[h] || {}).sold || emptyAgg;
+    const soldHtml = sold.n > 0
+      ? `<div class="cmp-side-label">参考(直近購入で既に売却済み) ${fmtPctSigned(sold.mean)}(n=${sold.n})</div>` : "";
+    return cmpBlockRowHtml(`${h}日`, mom[h] || emptyAgg, mine, soldHtml);
+  }).join("");
+  return `<div class="pfstatus-head">【現在価格】</div>
+  <div style="overflow-x:auto">
+  <table class="cmp-table">
+    <thead><tr><th>期間</th><th>Q5 48仮想</th><th>私の実績(保有中)</th><th>差</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  </div>
+  <div class="cmp-note">Q5側は直近5/20/60営業日以内のQ5 Day0(未経過含む、既存の「Q5直近勢い」と同じ値、Day0起算)。私側は直近5/20/60営業日以内に実際に購入し、まだ保有中のものを取得価格→現在価格でmark-to-market評価(購入日起算)。直近購入で既に売却済みのものは、別途参考値として表示します。</div>`;
+}
+// 「③実運用成績」(design 2026-10-21最終確定仕様)。Q5 48銘柄を「Day0→
+// 原則20営業日保有→20営業日後に仮想売却」という既存運用ルールと同じ
+// 基準で評価した成績と、私が実際に購入した銘柄群の成績を、5/20/60/120/
+// 180営業日の観測期間ごとに比較する。株数・資金額・NAV等は一切表示しない。
+function actualPerfRowHtml(label, row){
+  const q5 = row.q5, mine = row.mine;
+  const diffCls = (row.mean_diff === null || row.mean_diff === undefined) ? "" : (row.mean_diff >= 0 ? "pfstatus-gain-up" : "pfstatus-gain-down");
+  const subDiff = `<div class="cmp-side-label">中央値差 ${fmtPctSigned(row.median_diff)} / 勝率差 ${row.win_rate_diff==null?"—":(row.win_rate_diff>=0?"+":"")+row.win_rate_diff.toFixed(0)+"pt"}</div>`;
+  // Q5側の件数セルには対象/未確定の内訳を添える(未確定=20営業日以上経過
+  // したのにday20_priceが無く、現在価格を代用せず集計から除外した件数)。
+  const q5Unconfirmed = q5.unconfirmed || 0;
+  const q5CountHtml = q5Unconfirmed > 0
+    ? `${fmtCount(q5.n)}<div class="cmp-side-label">対象${fmtCount(q5.total)}・未確定${fmtCount(q5Unconfirmed)}</div>`
+    : fmtCount(q5.n);
+  return `<tr>
+    <td>${esc(label)}</td>
+    <td>${q5CountHtml}</td><td>${fmtPctSigned(q5.mean)}</td><td>${fmtPctSigned(q5.median)}</td><td>${fmtWinRate(q5.win_rate)}</td>
+    <td>${fmtCount(mine.n)}</td><td>${fmtPctSigned(mine.mean)}</td><td>${fmtPctSigned(mine.median)}</td><td>${fmtWinRate(mine.win_rate)}</td>
+    <td class="${diffCls}">${fmtPctSigned(row.mean_diff)}${subDiff}</td>
+  </tr>`;
+}
+function actualPerformanceBlockHtml(data){
+  const ap = data.actual_performance || {};
+  const emptyAgg = {n: 0, mean: null, median: null, win_rate: null};
+  const emptyQ5Agg = {n: 0, mean: null, median: null, win_rate: null, total: 0, unconfirmed: 0};
+  const emptyRow = {q5: emptyQ5Agg, mine: emptyAgg, mean_diff: null, median_diff: null, win_rate_diff: null};
+  const rows = ["5", "20", "60", "120", "180"].map(h =>
+    actualPerfRowHtml(`直近${h}営業日`, ap[h] || emptyRow)
+  ).join("");
+  return `<div class="cmp-head">③ 実運用成績</div>
+  <div class="cmp-note" style="margin-top:0">直近期間の銘柄パフォーマンス比較</div>
+  <div style="overflow-x:auto">
+  <table class="cmp-table">
+    <thead><tr>
+      <th>期間</th>
+      <th colspan="4">Q5 48（Day0→20営業日運用）</th>
+      <th colspan="4">私の実運用</th>
+      <th>差（私−Q5）</th>
+    </tr><tr>
+      <th></th>
+      <th>件数</th><th>平均</th><th>中央値</th><th>勝率</th>
+      <th>件数</th><th>平均</th><th>中央値</th><th>勝率</th>
+      <th></th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  </div>
+  <div class="cmp-note">Q5側はQ5 Day0を仮想購入日とし、20営業日未満は現在価格、20営業日以上は20営業日後の価格で固定した成績です(固定後は値動きを反映しません)。20営業日以上経過してもまだ20営業日後価格が取得できていない銘柄は、現在価格を代用せず「未確定」として集計から除外します(対象件数・未確定件数は件数欄に表示)。私側は実際の購入日を基準に、売却済みは実売却価格、保有中は現在価格を使います。5/20/60/120/180営業日は保有期間ではなく、直近どの期間に発生したDay0・購入かという観測ウィンドウです(まだ20営業日経過していない銘柄も対象に含みます)。株数・資金額・NAV等は使用していません。</div>`;
+}
 function renderComparison(data){
   const el = document.getElementById("comparePanel");
   if(!el) return;
@@ -1687,6 +1786,9 @@ function renderComparison(data){
   el.innerHTML = `<div class="cmp-panel">
     <div class="cmp-head">📈 実績比較：私 vs Q5 Day0 48銘柄</div>
     ${cmpHeadlineHtml(data)}
+    ${cmpConfirmedBlockHtml(data)}
+    ${cmpCurrentPriceBlockHtml(data)}
+    ${actualPerformanceBlockHtml(data)}
     <div style="overflow-x:auto">
     <table class="cmp-table">
       <thead><tr>
@@ -2590,6 +2692,7 @@ def compare_q5universe():
     try:
         portfolio_state = store.get_portfolio_state() or {}
         trade_history = portfolio_state.get("trade_history") or []
+        positions = portfolio_state.get("positions") or {}
 
         q5_state = store.get_q5universe_state() or {}
         q5_entries = q5_state.get("entries") or []
@@ -2605,12 +2708,43 @@ def compare_q5universe():
         # 含める。既存のrecent_window/all_time_by_horizonのキー・値には
         # 一切影響しない(完全に追加のキー)。
         momentum = comparison_logic.build_momentum_report(q5_entries, latest_price, trading_calendar, anchor_date)
+
+        # 「①保有確定」「②現在価格」の2ブロック(design 2026-10-21確定仕様)。
+        # Q5側はQ5 Day0起算(既存のrecent_window[...].q5=確定成績、
+        # momentum=直近勢いをそのまま再利用、新しい計算はしない)。
+        # 私側は実際の購入日(entry_date)起算(この違いは意図的な仕様)。
+        # 保有中ポジションの現在価格は、既存の保有銘柄一覧
+        # (_build_portfolio_view)と同じstore.get_ticker_recordをそのまま
+        # 使うだけで、新しい取得経路は増やさない。株数は使わない。
+        current_price_by_ticker = {
+            ticker: (store.get_ticker_record(ticker) or {}).get("price")
+            for ticker in positions
+        }
+        my_confirmed = comparison_logic.build_my_confirmed_report(
+            trade_history, positions, current_price_by_ticker, trading_calendar, anchor_date)
+        my_current_price = comparison_logic.build_my_current_price_report(
+            trade_history, positions, current_price_by_ticker, trading_calendar, anchor_date)
+
+        # 「③実運用成績」(design 2026-10-21最終確定仕様): Q5 48銘柄を
+        # 「Day0→原則20営業日保有→20営業日後に仮想売却」という既存運用
+        # ルールと同じ基準で評価した成績と、私が実際に購入した銘柄群の
+        # 成績を、5/20/60/120/180営業日の観測期間ごとに比較する。株数・
+        # 資金額・NAV等は一切使わない(銘柄ごとのリターン%の平均・中央値・
+        # 勝率のみ)。既存のrecent_window(確定成績)・momentum(直近勢い)・
+        # my_confirmed・my_current_priceにはいずれも影響しない(別計算)。
+        actual_performance = comparison_logic.build_actual_performance_report(
+            q5_entries, trade_history, positions, latest_price, current_price_by_ticker,
+            trading_calendar, anchor_date)
+
         return jsonify({
             "ok": True,
             "recent_window": report["recent_window"],
             "all_time_by_horizon": report["all_time_by_horizon"],
             "q5_entries": comparison_logic.enrich_entries_with_returns(q5_entries),
             "momentum": momentum,
+            "my_confirmed": my_confirmed,
+            "my_current_price": my_current_price,
+            "actual_performance": actual_performance,
             "latest_price_date": latest_price_date,
         })
     except Exception as e:
