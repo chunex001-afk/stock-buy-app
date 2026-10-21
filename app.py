@@ -7,6 +7,7 @@ from flask import Flask, jsonify, request, render_template_string
 
 import beta_logic
 import comparison_logic
+import push_notify
 import quintile_logic
 import redis_store as store
 import stock_logic as logic
@@ -14,6 +15,14 @@ import refresh
 import twelvedata_client as td
 
 app = Flask(__name__)
+
+# Web Push通知(design 2026-10-22): Renderで新しいcommitが実際にLiveになった
+# (=このプロセスが起動した)ことを検知し、Windowsデスクトップへ通知する機能。
+# バックグラウンドスレッドで実行し、Flaskのリクエスト処理開始を一切ブロック
+# しない。例外はpush_notify内部で握るため、ここで失敗してもアプリ起動には
+# 影響しない。Q1〜Q5・Q5シグナル・BUY/SELL・Risk-off・実績比較・株価API取得
+# ・GitHub Actionsには一切関与しない。
+push_notify.run_deploy_check_async(store)
 
 # 2026-09-17: Alpha Vantage完全撤去・Twelve Data一本化。app.pyからTwelve Data
 # へ直接アクセスすることはなく、常にrefresh.backfill_quintile_history_for_new_ticker
@@ -1239,6 +1248,8 @@ details.cmp-details .cmp-note:first-child{margin-top:6px}
 <div id="tickerCount" class="tickercount"></div>
 <div class="sub">実データ版｜最大20銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
 
+<div id="pushNotifyBar"></div>
+
 <div class="card">
   <div class="controls">
     <input id="ticker" placeholder="例 NVDA" maxlength="10" onkeydown="if(event.key==='Enter')addTicker()">
@@ -2226,6 +2237,103 @@ loadComparison();
 if("serviceWorker" in navigator){
   window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js"));
 }
+
+// Web Push通知(design 2026-10-22)。「🔔 更新通知を有効にする」ボタンの
+// 表示・購読登録と、Push未到達時のフォールバック通知のみを行う。
+// Q1〜Q5・Q5シグナル・BUY/SELL・Risk-off・実績比較・株価APIの取得回数には
+// 一切関与しない(完全に独立した追加UI)。
+function _b64ToUint8Array(b64) {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const base64 = (b64 + pad).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base64);
+  const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
+function _renderPushBar(html) {
+  const el = document.getElementById("pushNotifyBar");
+  if (el) el.innerHTML = html;
+}
+
+async function enablePushNotify(vapidKey) {
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") {
+      _renderPushBar('<div class="small">通知は許可されませんでした(ブラウザ設定から変更できます)</div>');
+      return;
+    }
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: _b64ToUint8Array(vapidKey),
+    });
+    await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({subscription: sub.toJSON()}),
+    });
+    _renderPushBar('<div class="small">🔔 更新通知: 有効</div>');
+  } catch (e) {
+    _renderPushBar('<div class="small">通知の設定に失敗しました</div>');
+  }
+}
+
+async function initPushNotifyUI() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+    return;
+  }
+  try {
+    const r = await fetch("/api/push/public-key");
+    const j = await r.json();
+    if (!j.ok || !j.enabled || !j.key) return;
+
+    if (Notification.permission === "granted") {
+      _renderPushBar('<div class="small">🔔 更新通知: 有効</div>');
+    } else if (Notification.permission === "denied") {
+      _renderPushBar('<div class="small">通知がブロックされています(ブラウザ設定で許可すると有効化できます)</div>');
+    } else {
+      _renderPushBar('<button class="secondary" onclick="enablePushNotify(' + JSON.stringify(j.key) + ')">🔔 更新通知を有効にする</button>');
+    }
+  } catch (e) {
+    // 取得できなくても既存機能には影響させない。
+  }
+}
+
+// フォールバック: Web Pushが端末に届かなかった場合に備え、アプリを開いた
+// (ページ読み込み)時点でも未通知の新commitがないか確認し、あればその場で
+// 同じ内容のデスクトップ通知を表示する(last_notified_commitが既に最新なら
+// 何もしない=二重通知しない)。
+async function checkPushFallback() {
+  if (!("serviceWorker" in navigator) || Notification.permission !== "granted") return;
+  try {
+    const r = await fetch("/api/push/status");
+    const j = await r.json();
+    if (!j.ok || !j.pending_notification || !j.current_commit) return;
+
+    const reg = await navigator.serviceWorker.ready;
+    const commit = j.current_commit;
+    await reg.showNotification("Stock Buy App", {
+      body: "アプリが最新版に更新されました。\ncommit: " + commit.slice(0, 7),
+      icon: "/static/icon-192.png",
+      badge: "/static/icon-192.png",
+      tag: "stock-buy-app-update",
+      data: {commit: commit},
+    });
+    await fetch("/api/push/ack", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({commit: commit}),
+    });
+  } catch (e) {
+    // フォールバック自体の失敗は既存機能に影響させない。
+  }
+}
+
+window.addEventListener("load", () => {
+  initPushNotifyUI();
+  checkPushFallback();
+});
 </script>
 </body>
 </html>
@@ -2286,6 +2394,55 @@ self.addEventListener("fetch", (event) => {
         return res;
       })
       .catch(() => caches.match(event.request))
+  );
+});
+
+// Web Push通知(design 2026-10-22)。Renderで新しいcommitがLiveになった時、
+// アプリを閉じていてもこのpushイベントが届く。Q1〜Q5等の判定・キャッシュ
+// 戦略には一切影響しない(上のfetchハンドラとは完全に独立)。
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch (e) {
+    payload = {};
+  }
+  const title = payload.title || "Stock Buy App";
+  const commit = payload.commit || "";
+  const body = payload.body
+    ? (commit ? payload.body + "\ncommit: " + commit : payload.body)
+    : "アプリが最新版に更新されました。";
+
+  const show = self.registration.showNotification(title, {
+    body: body,
+    icon: "/static/icon-192.png",
+    badge: "/static/icon-192.png",
+    tag: "stock-buy-app-update",
+    data: {commit: commit},
+  }).then(() => {
+    // 実際に表示できたことをサーバーへ通知する(last_notified_commitの更新)。
+    // 失敗してもshowNotification自体には影響させない(fire-and-forget)。
+    if (commit) {
+      return fetch("/api/push/ack", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({commit: commit}),
+      }).catch(() => {});
+    }
+  });
+
+  event.waitUntil(show);
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(
+    self.clients.matchAll({type: "window", includeUncontrolled: true}).then((clientsArr) => {
+      for (const c of clientsArr) {
+        if ("focus" in c) return c.focus();
+      }
+      if (self.clients.openWindow) return self.clients.openWindow("/");
+    })
   );
 });
 """
@@ -2824,6 +2981,60 @@ def health():
         "api_key_configured": bool(TD_API_KEY),
         "redis_configured": store.is_configured(),
     })
+
+
+# ---------------------------------------------------------------------------
+# Web Push通知(design 2026-10-22)。Q1〜Q5・Q5シグナル・BUY/SELL・Risk-off・
+# 実績比較・株価API取得・GitHub Actionsには一切関与しない、表示層の追加のみ。
+# ---------------------------------------------------------------------------
+
+@app.get("/api/push/public-key")
+def push_public_key():
+    return jsonify({"ok": True, "enabled": push_notify.is_configured(), "key": push_notify.get_vapid_public_key()})
+
+
+@app.post("/api/push/subscribe")
+def push_subscribe():
+    try:
+        body = request.get_json(silent=True) or {}
+        sub = body.get("subscription")
+        ok, err = push_notify.add_subscription(store, sub)
+        if not ok:
+            return jsonify({"ok": False, "error": err or "購読情報が不正です"}), 400
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/push/unsubscribe")
+def push_unsubscribe():
+    try:
+        body = request.get_json(silent=True) or {}
+        endpoint = body.get("endpoint")
+        push_notify.remove_subscription(store, endpoint)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/push/status")
+def push_status():
+    try:
+        return jsonify({"ok": True, **push_notify.get_push_status(store)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/push/ack")
+def push_ack():
+    try:
+        body = request.get_json(silent=True) or {}
+        commit = body.get("commit")
+        push_notify.ack_notified(store, commit)
+        # ack自体の成否(commit不一致など)で画面側の処理を失敗させる必要はない。
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":

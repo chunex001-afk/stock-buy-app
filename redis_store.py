@@ -77,6 +77,21 @@ def expire(key, seconds):
     return res is not None
 
 
+def set_nx(key, value, ex=None):
+    """SET key value NX(キーが未設定の場合のみ書き込む)。
+    戻り値: 書き込みに成功した(=キーが未設定だった)ならTrue、
+    既にキーが存在して書き込まれなかった場合はFalse。
+    Upstash/Redisに到達できない場合もFalse(呼び出し元を待たせない・
+    誤って「ロックを取れた」と判定しないためのフェイルセーフ)。"""
+    path = f"set/{key}?NX=true"
+    if ex:
+        path += f"&EX={ex}"
+    res = _request("POST", path, data=value.encode("utf-8"))
+    if res is None:
+        return False
+    return res.get("result") == "OK"
+
+
 # ---------------------------------------------------------------------------
 # JSON値のget/set
 # ---------------------------------------------------------------------------
@@ -282,3 +297,45 @@ def get_q5universe_state():
 
 def set_q5universe_state(data):
     return set_json("q5universe:state", data)
+
+
+# ---------------------------------------------------------------------------
+# Web Push通知(design 2026-10-22: Renderデプロイ検知→Windowsデスクトップ通知)。
+# push_notify.pyからのみ使用する。Q1〜Q5・Q5シグナル・株価API・既存の
+# watchlist/portfolio/riskoff等のキーには一切関与しない、完全に独立した
+# 名前空間(push:*)。
+# ---------------------------------------------------------------------------
+
+def get_push_dispatched_commit():
+    """サーバーが最後にpush送信を試みた(dispatchした)commit。
+    multi-worker/再起動時の「同じcommitへの二重送信」防止に使う。"""
+    return get("push:dispatched_commit")
+
+
+def set_push_dispatched_commit(commit):
+    return set_("push:dispatched_commit", commit)
+
+
+def try_acquire_push_dispatch_lock(commit, ttl_seconds=120):
+    """同一commitに対する同時dispatchを1ワーカーだけに限定するための短命ロック。"""
+    return set_nx(f"push:dispatch_lock:{commit}", "1", ex=ttl_seconds)
+
+
+def get_push_notified_commit():
+    """ユーザーが実際に通知を目にした(と確認できた)最後のcommit。
+    Service Workerのpushイベント確認(ack)、またはフォアグラウンド起動時の
+    フォールバック通知のどちらかが発生した時点で更新される。dispatchedとは
+    別の値(送信を試みた≠実際に表示された、を区別するため)。"""
+    return get("push:notified_commit")
+
+
+def set_push_notified_commit(commit):
+    return set_("push:notified_commit", commit)
+
+
+def get_push_subscriptions():
+    return get_json("push:subscriptions", default=[])
+
+
+def set_push_subscriptions(subs):
+    return set_json("push:subscriptions", subs)
