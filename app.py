@@ -1455,14 +1455,18 @@ function renderDailyActions(da, portfolio){
 // 一切変更しない(/api/portfolio/edit_entryがpositions[ticker]を更新する
 // だけで、再計算は既存のentry_date参照ロジックがそのまま行う)。
 let lastPortfolioData = null;
-let pfEditingTicker = null;
+// 「取得情報を編集」と「売却を記録」(design 2026-10-21)は同一ticker行で
+// 同時に開かない(排他制御)。どちらのパネルが開いているかを1つの変数
+// {ticker, mode:"edit"|"sell"}で管理する(null = どちらも閉じている)。
+let pfOpenPanel = null;
 
-function pfToggleEdit(ticker){
-  pfEditingTicker = (pfEditingTicker === ticker) ? null : ticker;
+function pfTogglePanel(ticker, mode){
+  pfOpenPanel = (pfOpenPanel && pfOpenPanel.ticker === ticker && pfOpenPanel.mode === mode)
+    ? null : {ticker, mode};
   renderPortfolioStatus(lastPortfolioData);
 }
-function pfCancelEdit(){
-  pfEditingTicker = null;
+function pfClosePanel(){
+  pfOpenPanel = null;
   renderPortfolioStatus(lastPortfolioData);
 }
 async function savePfEntryEdit(ticker){
@@ -1477,7 +1481,29 @@ async function savePfEntryEdit(ticker){
     const r = await fetch("/api/portfolio/edit_entry", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
     const j = await r.json();
     if(!j.ok) throw new Error(j.error || "保存に失敗しました");
-    pfEditingTicker = null;
+    pfOpenPanel = null;
+    await updateRanking();
+  }catch(e){
+    if(msgEl) msgEl.textContent = "エラー："+e.message;
+  }
+}
+
+// 任意売却を記録(design 2026-10-21)。20営業日SELLカード(dactionSellCard)と
+// 同じ既存API(/api/portfolio/confirm_sell)を呼ぶだけで、新しいAPI・新しい
+// バックエンドロジックは追加しない。株数は入力・送信しない(design確定仕様)。
+async function saveManualSell(ticker){
+  const msgEl = document.getElementById(`pfsell-msg-${ticker}`);
+  const priceEl = document.getElementById(`pfsell-price-${ticker}`);
+  const dateEl = document.getElementById(`pfsell-date-${ticker}`);
+  const body = {ticker};
+  if(priceEl && priceEl.value !== "") body.exit_price = parseFloat(priceEl.value);
+  if(dateEl && dateEl.value !== "") body.exit_date = dateEl.value;
+  if(msgEl) msgEl.textContent = "保存中…";
+  try{
+    const r = await fetch("/api/portfolio/confirm_sell", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.error || "保存に失敗しました");
+    pfOpenPanel = null;
     await updateRanking();
   }catch(e){
     if(msgEl) msgEl.textContent = "エラー："+e.message;
@@ -1504,8 +1530,10 @@ function renderPortfolioStatus(portfolio){
       const cls = d >= holdDays ? "pfstatus-hold-sell" : (d >= holdDays - 5 ? "pfstatus-hold-warn" : "pfstatus-hold-normal");
       holdPeriodHtml = `<span>保有期間 <b class="${cls}">${esc(d)}/${esc(holdDays)}営業日</b></span>`;
     }
-    const isEditing = (pfEditingTicker === h.ticker);
-    const editToggleBtn = `<button class="pfedit-togglebtn" onclick="pfToggleEdit('${esc(h.ticker)}')">${isEditing ? "編集を閉じる" : "取得情報を編集"}</button>`;
+    const isEditing = !!(pfOpenPanel && pfOpenPanel.ticker === h.ticker && pfOpenPanel.mode === "edit");
+    const isSelling = !!(pfOpenPanel && pfOpenPanel.ticker === h.ticker && pfOpenPanel.mode === "sell");
+    const editToggleBtn = `<button class="pfedit-togglebtn" onclick="pfTogglePanel('${esc(h.ticker)}','edit')">${isEditing ? "編集を閉じる" : "取得情報を編集"}</button>`;
+    const sellToggleBtn = `<button class="pfedit-togglebtn" onclick="pfTogglePanel('${esc(h.ticker)}','sell')">${isSelling ? "売却記録を閉じる" : "売却を記録"}</button>`;
     const editForm = isEditing ? `<div class="pfedit-form">
       <label class="pfedit-label">取得単価
         <input type="number" step="0.01" min="0.01" class="pfedit-input" id="pfedit-price-${esc(h.ticker)}" value="${esc(h.entry_price != null ? h.entry_price : "")}">
@@ -1515,9 +1543,24 @@ function renderPortfolioStatus(portfolio){
       </label>
       <div class="pfedit-actions">
         <button class="pfedit-savebtn" onclick="savePfEntryEdit('${esc(h.ticker)}')">保存</button>
-        <button class="pfedit-cancelbtn" onclick="pfCancelEdit()">キャンセル</button>
+        <button class="pfedit-cancelbtn" onclick="pfClosePanel()">キャンセル</button>
       </div>
       <div class="pfedit-msg" id="pfedit-msg-${esc(h.ticker)}"></div>
+    </div>` : "";
+    const suggestedExit = (h.current_price===null||h.current_price===undefined) ? "" : Number(h.current_price).toFixed(2);
+    const sellForm = isSelling ? `<div class="pfedit-form">
+      <div class="small" style="width:100%">20営業日未満でも、実際に売却した場合はこちらで記録できます(保有期限の自動SELLとは別の、手動の記録です)</div>
+      <label class="pfedit-label">売却価格
+        <input type="number" step="0.01" min="0.01" class="pfedit-input" id="pfsell-price-${esc(h.ticker)}" value="${esc(suggestedExit)}">
+      </label>
+      <label class="pfedit-label">売却日(任意・省略時は本日)
+        <input type="date" class="pfedit-input" id="pfsell-date-${esc(h.ticker)}">
+      </label>
+      <div class="pfedit-actions">
+        <button class="pfedit-savebtn" onclick="saveManualSell('${esc(h.ticker)}')">保存</button>
+        <button class="pfedit-cancelbtn" onclick="pfClosePanel()">キャンセル</button>
+      </div>
+      <div class="pfedit-msg" id="pfsell-msg-${esc(h.ticker)}"></div>
     </div>` : "";
     return `<div class="pfstatus-row">
       <span class="pfstatus-ticker">${esc(h.ticker)}</span>
@@ -1529,7 +1572,8 @@ function renderPortfolioStatus(portfolio){
       ${sharesInfo}
       ${h.profit_taken ? `<span class="pfstatus-taken">PROFIT済み(原本のみ保有中)</span>` : ""}
       ${editToggleBtn}
-    </div>${editForm}`;
+      ${sellToggleBtn}
+    </div>${editForm}${sellForm}`;
   }).join("");
   el.innerHTML = `<div class="pfstatus">
     <div class="pfstatus-head">保有：${esc(portfolio.held_count)} / ${esc(portfolio.max_positions)}</div>
