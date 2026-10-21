@@ -1651,24 +1651,21 @@ function momentumCellHtml(label, agg){
   const sub = agg.n > 0 ? `(n=${agg.n},${agg.unique_day0_dates}日)` : "";
   return `<span class="cmp-headline-item">${esc(label)} <b>${fmtPctSigned(agg.mean)}</b><span class="cmp-side-label">${sub}</span></span>`;
 }
+// 「① Q5直近勢い」(design 2026-10-22改訂: 画面を①Q5直近勢い/②実績比較の
+// 2本構成に整理。旧「Q5確定成績」の見出し表示はここでは廃止するが、
+// recent_window自体はAPIレスポンスに残したまま(バックエンドのロジック・
+// データは変更しない、今回の画面で表示しないだけ)。
 function cmpHeadlineHtml(data){
-  const rw = data.recent_window;
   const mom = data.momentum || {};
-  const confirmedRow = `<div class="cmp-headline-row">
-    <span class="cmp-headline-label">Q5確定成績</span>
-    <span class="cmp-headline-item">5日後 <b>${fmtPctSigned(rw["5"].q5.mean)}</b></span>
-    <span class="cmp-headline-item">20日後 <b>${fmtPctSigned(rw["20"].q5.mean)}</b></span>
-    <span class="cmp-headline-item">60日後 <b>${fmtPctSigned(rw["60"].q5.mean)}</b></span>
-  </div>`;
   const dateLabel = data.latest_price_date ? `（${esc(fmtDate(data.latest_price_date))}時点）` : "";
   const momentumRow = `<div class="cmp-headline-row">
-    <span class="cmp-headline-label">Q5直近勢い${dateLabel}</span>
+    <span class="cmp-headline-label">① Q5直近勢い${dateLabel}</span>
     ${momentumCellHtml("直近5日", mom["5"] || {n:0})}
     ${momentumCellHtml("直近20日", mom["20"] || {n:0})}
     ${momentumCellHtml("直近60日", mom["60"] || {n:0})}
   </div>`;
-  return `<div class="cmp-headline">${confirmedRow}${momentumRow}</div>
-  <div class="cmp-note">「Q5確定成績」はDay0から5/20/60営業日後に確定した成績、「Q5直近勢い」は直近にQ5 Day0になった銘柄が現在まで(未経過含む)どれだけ動いているかを示す、別の指標です。</div>`;
+  return `<div class="cmp-headline">${momentumRow}</div>
+  <div class="cmp-note">「Q5直近勢い」は、直近にQ5 Day0になった銘柄が現在まで(20営業日を超えても)どれだけ動いているかを示す「騰落・勢い」の指標です(運用成績ではありません)。20営業日運用した場合の確定成績は、下の「② 実績比較」で確認できます。同じ「5日」でも②とは意味が異なります(①＝現在までの騰落、②＝20営業日運用ルールでの実績)。</div>`;
 }
 // 【保有確定】【現在価格】の2ブロック比較(design 2026-10-21確定仕様)。
 // Q5側はQ5 Day0起算(既存のrecent_window=確定成績・momentum=直近勢いを
@@ -1749,8 +1746,8 @@ function actualPerformanceBlockHtml(data){
   const rows = ["5", "20", "60", "120", "180"].map(h =>
     actualPerfRowHtml(`直近${h}営業日`, ap[h] || emptyRow)
   ).join("");
-  return `<div class="cmp-head">③ 実運用成績</div>
-  <div class="cmp-note" style="margin-top:0">直近期間の銘柄パフォーマンス比較</div>
+  return `<div class="cmp-head">② 実績比較</div>
+  <div class="cmp-note" style="margin-top:0">Q5 48銘柄を20営業日運用した場合 vs 私の実運用</div>
   <div style="overflow-x:auto">
   <table class="cmp-table">
     <thead><tr>
@@ -1767,52 +1764,20 @@ function actualPerformanceBlockHtml(data){
     <tbody>${rows}</tbody>
   </table>
   </div>
-  <div class="cmp-note">Q5側はQ5 Day0を仮想購入日とし、20営業日未満は現在価格、20営業日以上は20営業日後の価格で固定した成績です(固定後は値動きを反映しません)。20営業日以上経過してもまだ20営業日後価格が取得できていない銘柄は、現在価格を代用せず「未確定」として集計から除外します(対象件数・未確定件数は件数欄に表示)。私側は実際の購入日を基準に、売却済みは実売却価格、保有中は現在価格を使います。5/20/60/120/180営業日は保有期間ではなく、直近どの期間に発生したDay0・購入かという観測ウィンドウです(まだ20営業日経過していない銘柄も対象に含みます)。株数・資金額・NAV等は使用していません。</div>`;
+  <div class="cmp-note">Q5側はQ5 Day0を仮想購入日とし、20営業日未満は現在価格、20営業日以上は20営業日後の価格で固定した成績です(固定後は値動きを反映しません)。20営業日以上経過してもまだ20営業日後価格が取得できていない銘柄は、現在価格を代用せず「未確定」として集計から除外します(対象件数・未確定件数は件数欄に表示)。私側は実際の購入日を基準に、売却済みは実売却価格、保有中は現在価格を使います。5/20/60/120/180営業日は保有期間ではなく、直近どの期間に発生したDay0・購入かという観測ウィンドウです(まだ20営業日経過していない銘柄も対象に含みます)。株数・資金額・NAV等は使用していません。上の「① Q5直近勢い」と同じ「5日」等の数字でも、①は現在までの騰落、②は20営業日運用ルールでの実績比較という別の意味です。</div>`;
 }
+// design 2026-10-22改訂: 比較画面を「① Q5直近勢い」「② 実績比較」の2本
+// 構成に整理。旧「Q5確定成績」見出し・【保有確定】【現在価格】ブロック・
+// 私 vs Q5 Day0 48銘柄の詳細テーブルは、今回の画面では表示しない(各JS
+// 関数・バックエンドのロジック/データ自体は削除せず残してある)。
 function renderComparison(data){
   const el = document.getElementById("comparePanel");
   if(!el) return;
   if(!data){ el.innerHTML = ""; return; }
-  const rw = data.recent_window;
-  const rows = [
-    cmpRowHtml("直近5営業日", rw["5"]),
-    cmpRowHtml("直近20営業日", rw["20"]),
-    cmpRowHtml("直近60営業日", rw["60"]),
-    cmpRowHtml("累計", rw["cumulative"]),
-  ].join("");
-  const detail = (data.q5_entries || [])
-    .slice().reverse()  // 新しいDay0から表示
-    .map(cmpDetailRowHtml).join("");
   el.innerHTML = `<div class="cmp-panel">
-    <div class="cmp-head">📈 実績比較：私 vs Q5 Day0 48銘柄</div>
+    <div class="cmp-head">📈 実績比較：私 vs Q5</div>
     ${cmpHeadlineHtml(data)}
-    ${cmpConfirmedBlockHtml(data)}
-    ${cmpCurrentPriceBlockHtml(data)}
     ${actualPerformanceBlockHtml(data)}
-    <div style="overflow-x:auto">
-    <table class="cmp-table">
-      <thead><tr>
-        <th>期間</th>
-        <th colspan="4">私</th>
-        <th colspan="4">Q5 Day0 48銘柄</th>
-        <th>差</th>
-      </tr><tr>
-        <th></th>
-        <th>件数</th><th>平均</th><th>中央値</th><th>勝率</th>
-        <th>件数</th><th>平均</th><th>中央値</th><th>勝率</th>
-        <th></th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
-    </div>
-    <div class="cmp-note">
-      「累計」のQ5側は、本番運用(Q5 Day0→20営業日保有)と一致させるためDay20リターンのみを使用しています。
-      5/20/60営業日の各行は、その期間に判定が確定した直近分だけを表示しています(保有中のポジションは含みません)。
-    </div>
-    <div class="cmp-detail">
-      <div class="pfstatus-head">Q5 Day0 個別実績</div>
-      ${detail || `<div class="pfstatus-empty">まだDay0の記録がありません</div>`}
-    </div>
   </div>`;
 }
 async function loadComparison(){
