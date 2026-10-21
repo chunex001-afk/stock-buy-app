@@ -245,3 +245,33 @@ def get_portfolio_state():
 
 def set_portfolio_state(data):
     return set_json("portfolio:state", data)
+
+
+# ---------------------------------------------------------------------------
+# Q5 48銘柄(quintile_logic.ROTATION_UNIVERSE)の将来成績をforward-onlyで
+# 蓄積する専用機能(design 2026-10-21)。既存のQ1〜Q5判定・BUY/SELL判定・
+# +50%利確・Risk-off・AI一斉調整・portfolio:state・watchlistとは完全に
+# 独立した別キーで、ここに追加する関数も既存関数には一切影響しない。
+# 新しい別ジョブ(refresh_q5_universe.py)専用の読み書きのみ。
+# ---------------------------------------------------------------------------
+
+def get_q5universe_state():
+    """48銘柄の将来成績蓄積状態を取得する。
+    戻り値: {"prev_q": {"<TICKER>": "Q4", ...}(前回判定時のQ、Day0検出の
+    起点。未知のティッカーはキー自体が存在しない=過去を推定しない),
+    "entries": [{"ticker","day0_date","day0_price",
+    "day5_date","day5_price","day20_date","day20_price",
+    "day60_date","day60_price"}, ...](Day0イベントの配列、株数は持たない。
+    同一tickerでも(ticker,day0_date)ごとに別イベント),
+    "last_processed_date": "YYYY-MM-DD"(この日付までの処理が完全に成功した
+    ことを示す。未完了日はこの値を更新しない)} または None(未初期化時)。
+
+    prev_q・entries・last_processed_dateを1つのJSONにまとめているのは、
+    48銘柄全件の取得・判定が完全に成功した場合だけ、この3つを同時に
+    (1回のRedis書き込みで)確定させるため(design: 「全件取得・判定→検証→
+    一括確定」、途中書き込みによる不整合を避ける)。"""
+    return get_json("q5universe:state")
+
+
+def set_q5universe_state(data):
+    return set_json("q5universe:state", data)

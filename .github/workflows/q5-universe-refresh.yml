@@ -1,0 +1,45 @@
+name: Q5 universe (48 tickers) forward-only tracking
+
+# 既存の daily-refresh.yml / refresh.py とは完全に分離した専用ワークフロー
+# (design 2026-10-21)。既存のQ1〜Q5判定・BUY/SELL判定・+50%利確・Risk-off・
+# AI一斉調整・portfolio・trade_history・watchlistには一切関与しない。
+#
+# cron時刻だけで「本体のdaily-refreshが今日の分を処理済みか」を保証しない。
+# refresh_q5_universe.py側がquintile:pool_historyの最終日を確認し、本体が
+# まだ今日の分を処理していなければTwelve Dataを一切呼ばずに終了する
+# (API credits消費ゼロでスキップできる安全策)。そのため、このワークフローの
+# 実行タイミングが本体より早くても遅くても、正しさには影響しない
+# (早すぎた場合は毎回スキップされ、次の実行で安全に処理される)。
+
+on:
+  schedule:
+    # UTC 23:30 = JST 8:30(daily-refreshの最初の実行 UTC22:00/JST7:00の
+    # 30分後を目安にした、あくまで「だいたい後」という目安の時刻。
+    # 正しさの保証はrefresh_q5_universe.py側のpool_history確認が担う)。
+    - cron: "30 23 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: q5-universe-refresh
+  cancel-in-progress: false
+
+jobs:
+  q5-universe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Q5 universe forward-only tracking
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python refresh_q5_universe.py
