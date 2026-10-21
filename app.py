@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from flask import Flask, jsonify, request, render_template_string
 
 import beta_logic
+import comparison_logic
 import quintile_logic
 import redis_store as store
 import stock_logic as logic
@@ -1192,6 +1193,23 @@ details.logicinfo .small{margin-top:10px}
 .pfedit-cancelbtn{background:#eef1f5;color:#172033;border:0;border-radius:10px;padding:9px 14px;font-weight:800;font-size:13px;cursor:pointer}
 .pfedit-msg{font-size:11.5px;color:#b42318;min-height:14px;width:100%}
 
+/* 自分の実績 vs Q5 48銘柄 比較パネル(design 2026-10-21)。読み取り専用の
+   表示のみで、Q1〜5判定・BUY/SELL判定・20営業日保有・+50%利確・Risk-off
+   等の既存ロジックには一切関与しない。 */
+.cmp-panel{background:white;border-radius:16px;padding:14px 16px;margin-bottom:16px;box-shadow:0 2px 14px #0000000c}
+.cmp-head{font-weight:900;font-size:14px;margin-bottom:10px}
+.cmp-table{width:100%;border-collapse:collapse;font-size:12px}
+.cmp-table th,.cmp-table td{padding:7px 6px;text-align:right;border-top:1px solid #eef1f5;white-space:nowrap}
+.cmp-table th:first-child,.cmp-table td:first-child{text-align:left}
+.cmp-table thead th{color:#758096;font-weight:700;border-top:none}
+.cmp-side-label{font-size:10px;color:#98a2b3;display:block}
+.cmp-empty{color:#98a2b3}
+.cmp-note{font-size:11px;color:#758096;margin-top:8px;line-height:1.6}
+.cmp-detail{margin-top:14px;border-top:1px dashed #dde2e8;padding-top:10px}
+.cmp-detail-row{display:flex;gap:12px;flex-wrap:wrap;align-items:baseline;padding:6px 0;border-top:1px solid #eef1f5;font-size:12px;color:#475467}
+.cmp-detail-row:first-of-type{border-top:none}
+.cmp-detail-ticker{font-weight:900;color:#172033;min-width:52px}
+
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}
   .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}
   .riskoff-alert{padding:14px 16px}.riskoff-alert-title{font-size:19px}.riskoff-ratio-value{font-size:28px}
@@ -1203,6 +1221,7 @@ details.logicinfo .small{margin-top:10px}
 <div id="riskoff"></div>
 <div id="dailyActions"></div>
 <div id="portfolioStatus"></div>
+<div id="comparePanel"></div>
 <div class="title">📊 保有銘柄のQ1〜Q5状態</div>
 <div id="tickerCount" class="tickercount"></div>
 <div class="sub">実データ版｜最大20銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
@@ -1579,6 +1598,98 @@ function renderPortfolioStatus(portfolio){
     <div class="pfstatus-head">保有：${esc(portfolio.held_count)} / ${esc(portfolio.max_positions)}</div>
     ${rows || `<div class="pfstatus-empty">現在保有している銘柄はありません</div>`}
   </div>`;
+}
+
+// 自分の実績 vs Q5 48銘柄 比較パネル(design 2026-10-21)。読み取り専用の
+// 新規API(/api/compare/q5universe)を1回呼ぶだけで、既存のQ1〜5判定・
+// BUY/SELL判定・20営業日保有・+50%利確・Risk-off・既存のupdateRanking()の
+// ポーリングには一切関与しない(完全に独立したfetch)。
+function fmtWinRate(v){
+  return (v===null||v===undefined) ? "—" : v.toFixed(0) + "%";
+}
+function fmtCount(v){
+  return (v===null||v===undefined) ? "—" : String(v);
+}
+function cmpRowHtml(label, row){
+  const mine = row.mine, q5 = row.q5;
+  const diffCls = (row.diff === null || row.diff === undefined) ? "" : (row.diff >= 0 ? "pfstatus-gain-up" : "pfstatus-gain-down");
+  return `<tr>
+    <td>${esc(label)}</td>
+    <td>${fmtCount(mine.n)}</td>
+    <td>${fmtPctSigned(mine.mean)}</td>
+    <td>${fmtPctSigned(mine.median)}</td>
+    <td>${fmtWinRate(mine.win_rate)}</td>
+    <td>${fmtCount(q5.n)}</td>
+    <td>${fmtPctSigned(q5.mean)}</td>
+    <td>${fmtPctSigned(q5.median)}</td>
+    <td>${fmtWinRate(q5.win_rate)}</td>
+    <td class="${diffCls}">${fmtPctSigned(row.diff)}</td>
+  </tr>`;
+}
+function cmpDetailRowHtml(e){
+  const dayCell = (dateVal, priceVal, retVal) => dateVal
+    ? `<span>${esc(fmtDate(dateVal))} ${fmtPrice(priceVal)} <b>${fmtPctSigned(retVal)}</b></span>`
+    : `<span class="cmp-empty">未確定</span>`;
+  return `<div class="cmp-detail-row">
+    <span class="cmp-detail-ticker">${esc(e.ticker)}</span>
+    <span>Day0 ${esc(fmtDate(e.day0_date))} ${fmtPrice(e.day0_price)}</span>
+    ${dayCell(e.day5_date, e.day5_price, e.day5_return_pct)}
+    ${dayCell(e.day20_date, e.day20_price, e.day20_return_pct)}
+    ${dayCell(e.day60_date, e.day60_price, e.day60_return_pct)}
+  </div>`;
+}
+function renderComparison(data){
+  const el = document.getElementById("comparePanel");
+  if(!el) return;
+  if(!data){ el.innerHTML = ""; return; }
+  const rw = data.recent_window;
+  const rows = [
+    cmpRowHtml("直近5営業日", rw["5"]),
+    cmpRowHtml("直近20営業日", rw["20"]),
+    cmpRowHtml("直近60営業日", rw["60"]),
+    cmpRowHtml("累計", rw["cumulative"]),
+  ].join("");
+  const detail = (data.q5_entries || [])
+    .slice().reverse()  // 新しいDay0から表示
+    .map(cmpDetailRowHtml).join("");
+  el.innerHTML = `<div class="cmp-panel">
+    <div class="cmp-head">📈 実績比較：私 vs Q5 Day0 48銘柄</div>
+    <div style="overflow-x:auto">
+    <table class="cmp-table">
+      <thead><tr>
+        <th>期間</th>
+        <th colspan="4">私</th>
+        <th colspan="4">Q5 Day0 48銘柄</th>
+        <th>差</th>
+      </tr><tr>
+        <th></th>
+        <th>件数</th><th>平均</th><th>中央値</th><th>勝率</th>
+        <th>件数</th><th>平均</th><th>中央値</th><th>勝率</th>
+        <th></th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    </div>
+    <div class="cmp-note">
+      「累計」のQ5側は、本番運用(Q5 Day0→20営業日保有)と一致させるためDay20リターンのみを使用しています。
+      5/20/60営業日の各行は、その期間に判定が確定した直近分だけを表示しています(保有中のポジションは含みません)。
+    </div>
+    <div class="cmp-detail">
+      <div class="pfstatus-head">Q5 Day0 個別実績</div>
+      ${detail || `<div class="pfstatus-empty">まだDay0の記録がありません</div>`}
+    </div>
+  </div>`;
+}
+async function loadComparison(){
+  try{
+    const r = await fetch("/api/compare/q5universe");
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.error || "取得失敗");
+    renderComparison(j);
+  }catch(e){
+    const el = document.getElementById("comparePanel");
+    if(el) el.innerHTML = `<div class="cmp-panel cmp-empty">実績比較の取得に失敗しました: ${esc(e.message)}</div>`;
+  }
 }
 
 async function updateRanking(extraMsg){
@@ -1965,6 +2076,7 @@ function render(rows){
 }
 
 updateRanking();
+loadComparison();
 
 // PWA化(design 2026-09-17): ホーム画面追加・スタンドアロン起動のためのSW登録のみ。
 // /sw.js側でAPI(/api/*)は明示的にキャッシュ対象外にしており、株価・Q1〜Q5・
@@ -2431,6 +2543,34 @@ def edit_entry():
             return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
 
         return jsonify({"ok": True, "ticker": ticker, "position": new_pos})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/compare/q5universe")
+def compare_q5universe():
+    """自分の実績(trade_history)とQ5 48銘柄の仮想実績(q5universe:entries)の
+    比較集計(design 2026-10-21)。読み取り専用で、trade_history・
+    q5universe:state・positions・Q1〜5判定等、既存のどのキーにも一切
+    書き込まない。集計ロジック自体はcomparison_logic.py(純粋関数)に
+    委ねるだけで、ここでは既存データを読んで渡すだけ。"""
+    try:
+        portfolio_state = store.get_portfolio_state() or {}
+        trade_history = portfolio_state.get("trade_history") or []
+
+        q5_state = store.get_q5universe_state() or {}
+        q5_entries = q5_state.get("entries") or []
+
+        trading_calendar = _trading_days_calendar()
+        anchor_date = trading_calendar[-1] if trading_calendar else None
+
+        report = comparison_logic.build_comparison_report(trade_history, q5_entries, trading_calendar, anchor_date)
+        return jsonify({
+            "ok": True,
+            "recent_window": report["recent_window"],
+            "all_time_by_horizon": report["all_time_by_horizon"],
+            "q5_entries": comparison_logic.enrich_entries_with_returns(q5_entries),
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
