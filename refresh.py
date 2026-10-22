@@ -29,6 +29,7 @@ import sys
 from datetime import datetime, timezone
 
 import beta_logic
+import push_notify
 import quintile_logic
 import redis_store as store
 import stock_logic as logic
@@ -1368,6 +1369,7 @@ def main():
     # この呼び出しの中で監視銘柄のTwelve Data取得も行われ、その生データが
     # 戻り値のraw_watchlist_dataに含まれる。
     legacy_result = {"success": [], "failed": []}
+    td_result = None
     try:
         td_result = run_quintile_refresh(td_api_key, tickers)
         if td_result is not None:
@@ -1404,6 +1406,18 @@ def main():
         f"[DONE] 成功 {len(legacy_result['success'])}件 / 失敗 {len(legacy_result['failed'])}件 / "
         f"本日のTwelve Data使用 {td_used_after}回"
     )
+
+    # 日次株価更新 完了通知(design 2026-10-22)。SPY取得も含め取引日自体が
+    # 特定できなかった回(APIキー未設定・SPY取得失敗等でtrading_date=None)は
+    # 呼ばない=通知しない。同じ取引日内の2回目以降の実行・送信済みかどうかの
+    # 判定はpush_notify.notify_refresh_success内のRedis上の状態で行う(ここでは
+    # 判定しない)。例外は呼び出し先で握られるが、万一のため二重に保護する。
+    # Q1〜Q5判定ロジック・上記までの日次更新処理には一切影響しない、完全に
+    # 独立した追加呼び出し。
+    try:
+        push_notify.notify_refresh_success(store, td_result.get("trading_date") if td_result else None)
+    except Exception as e:
+        print(f"[WARN] 株価更新通知(push)の処理で予期しないエラーが発生しました: {e}", file=sys.stderr)
 
     # 一部失敗があってもプロセス自体は正常終了させる（他銘柄は正常に更新済みのため）
     return 0

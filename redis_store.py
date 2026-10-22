@@ -339,3 +339,21 @@ def get_push_subscriptions():
 
 def set_push_subscriptions(subs):
     return set_json("push:subscriptions", subs)
+
+
+# 日次株価更新 完了通知(design 2026-10-22、push_notify.notify_refresh_success
+# からのみ使用)。デプロイ検知用のdispatched_commit/notified_commitとは別の
+# 名前空間(日付ベース)で、同じ取引日への重複送信だけを防ぐためのもの。
+def get_push_refresh_notified_date():
+    """最後に「株価更新完了」通知を実際に送信し終えた取引日(YYYY-MM-DD)。"""
+    return get("push:refresh_notified_date")
+
+
+def set_push_refresh_notified_date(trading_date):
+    return set_("push:refresh_notified_date", trading_date)
+
+
+def try_acquire_push_refresh_notify_lock(trading_date, ttl_seconds=120):
+    """同一取引日に対する同時送信を1プロセスだけに限定するための短命ロック
+    (try_acquire_push_dispatch_lockと同じSET NXパターン)。"""
+    return set_nx(f"push:refresh_notify_lock:{trading_date}", "1", ex=ttl_seconds)

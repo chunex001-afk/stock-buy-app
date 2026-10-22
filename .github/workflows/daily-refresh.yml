@@ -33,4 +33,10 @@ jobs:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          # 株価データ更新完了通知(design 2026-10-22)用。Renderに設定済みの
+          # VAPID_PRIVATE_KEYと同じ値をGitHub Actions Secretsにも登録したもの。
+          # 未設定(空文字)の場合はpush_notify.is_configured()がFalseになり、
+          # 通知機能だけが無効化される(daily-refresh本体には影響しない)。
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+          VAPID_CLAIMS_EMAIL: ${{ secrets.VAPID_CLAIMS_EMAIL }}
         run: python refresh.py

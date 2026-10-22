@@ -30,6 +30,8 @@ class FakeStore:
         self.notified_commit = None
         self.subscriptions = []
         self._locks = set()
+        self.refresh_notified_date = None
+        self._refresh_locks = set()
 
     def get_push_dispatched_commit(self):
         return self.dispatched_commit
@@ -56,6 +58,19 @@ class FakeStore:
 
     def set_push_subscriptions(self, subs):
         self.subscriptions = list(subs)
+        return True
+
+    def get_push_refresh_notified_date(self):
+        return self.refresh_notified_date
+
+    def set_push_refresh_notified_date(self, trading_date):
+        self.refresh_notified_date = trading_date
+        return True
+
+    def try_acquire_push_refresh_notify_lock(self, trading_date, ttl_seconds=120):
+        if trading_date in self._refresh_locks:
+            return False
+        self._refresh_locks.add(trading_date)
         return True
 
 
@@ -165,6 +180,123 @@ class DeployDetectionTests(unittest.TestCase):
             push_notify.check_and_dispatch_deploy_notification(self.store)
         m.assert_not_called()
         self.assertIsNone(self.store.dispatched_commit)
+
+
+def _refresh_env():
+    """GitHub Actions側を想定した環境(design 2026-10-22)。VAPID_PUBLIC_KEYは
+    意図的に含めない(送信にはVAPID_PRIVATE_KEYだけで足りることの確認を兼ねる、
+    GitHub Actions SecretsにVAPID_PUBLIC_KEYを置かずに済ませる設計のため)。"""
+    return {"VAPID_PRIVATE_KEY": "priv-key"}
+
+
+class RefreshSuccessNotificationTests(unittest.TestCase):
+    """日次株価更新 完了通知(push_notify.notify_refresh_success)。
+    GitHub Actions(refresh.py)専用で、デプロイ検知(RENDER_GIT_COMMIT)とは
+    完全に独立していることを確認する。"""
+
+    def setUp(self):
+        self.store = FakeStore()
+        self.store.subscriptions = [SUB_A]
+
+    def test_new_trading_date_sends_notification(self):
+        """新しい取引日が特定できた回は通知する。VAPID_PUBLIC_KEY無しでも
+        送信できる(GitHub Actionsの想定環境)ことを合わせて確認する。"""
+        with mock.patch.dict(os.environ, _refresh_env(), clear=True), \
+             mock.patch.object(push_notify, "webpush") as m:
+            push_notify.notify_refresh_success(self.store, "2026-10-22")
+        m.assert_called_once()
+        sent_payload = json.loads(m.call_args.kwargs["data"])
+        self.assertEqual(sent_payload["title"], "📈 Stock Buy App")
+        self.assertEqual(sent_payload["body"], "株価データを更新しました")
+        self.assertEqual(self.store.refresh_notified_date, "2026-10-22")
+
+    def test_same_trading_date_rerun_does_not_notify_twice(self):
+        """同じ取引日の2回目・3回目の実行(cronのリトライ枠)では通知しない。"""
+        with mock.patch.dict(os.environ, _refresh_env(), clear=True), \
+             mock.patch.object(push_notify, "webpush") as m:
+            push_notify.notify_refresh_success(self.store, "2026-10-22")  # 1回目(07:00想定)
+            push_notify.notify_refresh_success(self.store, "2026-10-22")  # 2回目(10:00想定)
+            push_notify.notify_refresh_success(self.store, "2026-10-22")  # 3回目(13:00想定)
+        m.assert_called_once()
+
+    def test_missing_trading_date_does_not_notify(self):
+        """trading_date=None(SPY取得失敗などで取引日が特定できなかった=
+        全体失敗)の場合は通知しない。"""
+        with mock.patch.dict(os.environ, _refresh_env(), clear=True), \
+             mock.patch.object(push_notify, "webpush") as m:
+            push_notify.notify_refresh_success(self.store, None)
+        m.assert_not_called()
+        self.assertIsNone(self.store.refresh_notified_date)
+
+    def test_send_failure_allows_retry_on_next_run(self):
+        """1回目のPush送信処理自体が予期しない例外で失敗した場合、
+        notified_dateが更新されないため、後続実行(同じtrading_date)で
+        再送を試みられる。"""
+        with mock.patch.dict(os.environ, _refresh_env(), clear=True):
+            with mock.patch.object(push_notify, "_dispatch_push_to_all", side_effect=RuntimeError("down")):
+                try:
+                    push_notify.notify_refresh_success(self.store, "2026-10-22")  # 1回目: 失敗
+                except Exception as e:  # pragma: no cover
+                    self.fail(f"例外が外へ伝播した: {e}")
+            self.assertIsNone(self.store.refresh_notified_date)
+
+            # 実際の運用では1回目と2回目の実行(cronのリトライ枠)の間は数時間空く
+            # ため、try_acquire_push_refresh_notify_lockの短命ロック(ttl_seconds)
+            # は2回目の実行時には自然に失効している。FakeStoreはTTLを再現しない
+            # ため、ここでは「ロックが失効した状態」を明示的に再現する。
+            self.store._refresh_locks.clear()
+
+            with mock.patch.object(push_notify, "webpush") as m:
+                push_notify.notify_refresh_success(self.store, "2026-10-22")  # 2回目: 再送成功
+        m.assert_called_once()
+        self.assertEqual(self.store.refresh_notified_date, "2026-10-22")
+
+    def test_partial_ticker_failure_still_notifies(self):
+        """一部銘柄の取得失敗があっても、取引日更新自体が成功していれば
+        (呼び出し元がtrading_dateを渡す限り)通知する(既存のrefresh.py方針を
+        変更しない設計のため、この関数自体は成功/部分失敗を区別しない)。"""
+        with mock.patch.dict(os.environ, _refresh_env(), clear=True), \
+             mock.patch.object(push_notify, "webpush") as m:
+            push_notify.notify_refresh_success(self.store, "2026-10-22")
+        m.assert_called_once()
+
+    def test_not_configured_does_nothing(self):
+        """VAPID_PRIVATE_KEY未設定(=機能オフ)の場合は何もしない。"""
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(push_notify, "webpush") as m:
+            push_notify.notify_refresh_success(self.store, "2026-10-22")
+        m.assert_not_called()
+        self.assertIsNone(self.store.refresh_notified_date)
+
+    def test_no_subscribers_still_marks_notified(self):
+        """購読者がいない場合でも送信処理自体は正常完了したとみなし、
+        notified_dateは更新する(_dispatch_push_to_allの既存挙動をそのまま
+        踏襲、デプロイ通知側と同じ考え方)。"""
+        self.store.subscriptions = []
+        with mock.patch.dict(os.environ, _refresh_env(), clear=True), \
+             mock.patch.object(push_notify, "webpush") as m:
+            push_notify.notify_refresh_success(self.store, "2026-10-22")
+        m.assert_not_called()
+        self.assertEqual(self.store.refresh_notified_date, "2026-10-22")
+
+    def test_concurrent_processes_only_one_sends(self):
+        """同じtrading_dateに対する同時実行は、Redisの原子的なNXロック
+        (try_acquire_push_refresh_notify_lock)により1プロセストだけが送信する。"""
+        store = self.store
+        with mock.patch.dict(os.environ, _refresh_env(), clear=True), \
+             mock.patch.object(push_notify, "webpush") as m:
+            push_notify.notify_refresh_success(store, "2026-10-22")  # worker 1
+            push_notify.notify_refresh_success(store, "2026-10-22")  # worker 2(同時実行を想定)
+        m.assert_called_once()
+
+    def test_deploy_notification_unaffected_by_refresh_notification(self):
+        """株価更新通知を送っても、デプロイ通知(dispatched_commit/
+        notified_commit)の状態には一切影響しない(完全に独立したキーであることの確認)。"""
+        with mock.patch.dict(os.environ, _refresh_env(), clear=True), \
+             mock.patch.object(push_notify, "webpush"):
+            push_notify.notify_refresh_success(self.store, "2026-10-22")
+        self.assertIsNone(self.store.dispatched_commit)
+        self.assertIsNone(self.store.notified_commit)
 
 
 class SendFailureResilienceTests(unittest.TestCase):

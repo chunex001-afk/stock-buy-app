@@ -60,8 +60,19 @@ def _vapid_claims():
 
 
 def is_configured():
-    """push通知機能が使える状態か(鍵未設定・依存未インストールなら無効)。"""
+    """push通知機能が使える状態か(鍵未設定・依存未インストールなら無効)。
+    ブラウザの購読登録フロー(/api/push/public-key)にはVAPID_PUBLIC_KEYが
+    必須なため、ここではVAPID_PUBLIC_KEYの有無も見る。送信(webpush呼び出し)
+    自体はVAPID_PRIVATE_KEYだけで行えるため、それだけで足りる箇所は
+    _can_send_push()を使う(design 2026-10-22、GitHub Actions側に
+    VAPID_PUBLIC_KEYを置かずに済ませるため)。"""
     return bool(_PYWEBPUSH_AVAILABLE and get_vapid_public_key() and _vapid_private_key())
+
+
+def _can_send_push():
+    """実際にpush送信(webpush呼び出し)ができる最小条件。is_configured()とは
+    異なりVAPID_PUBLIC_KEYの有無は見ない(送信そのものには使わないため)。"""
+    return bool(_PYWEBPUSH_AVAILABLE and _vapid_private_key())
 
 
 def get_current_commit():
@@ -127,23 +138,35 @@ def check_and_dispatch_deploy_notification(store):
 
 
 def _send_push_to_all(store, commit):
-    subs = store.get_push_subscriptions() or []
-    if not subs:
-        logger.info("push_notify: 購読者がいないため送信をスキップします commit=%s", short_commit(commit))
-        return
-
-    payload = json.dumps({
+    payload = {
         "title": "Stock Buy App",
         "body": "アプリが最新版に更新されました。",
         "commit": short_commit(commit),
-    }, ensure_ascii=False)
+    }
+    _dispatch_push_to_all(store, payload, log_context=f"commit={short_commit(commit)}")
+
+
+def _dispatch_push_to_all(store, payload, log_context=""):
+    """購読者全員へのpush送信の共通処理(取得→送信→無効購読の削除)。
+    デプロイ通知(_send_push_to_all)・日次株価更新完了通知
+    (notify_refresh_success)の両方から呼ばれる、payload非依存の送信処理のみを
+    担当する部分(2026-10-22の日次株価更新通知追加に伴い、元々
+    _send_push_to_all内にあった処理をそのまま切り出したもので、送信ロジック・
+    404/410時の購読削除・それ以外の失敗時に購読を保持する挙動は一切変更して
+    いない)。"""
+    subs = store.get_push_subscriptions() or []
+    if not subs:
+        logger.info("push_notify: 購読者がいないため送信をスキップします %s", log_context)
+        return
+
+    data = json.dumps(payload, ensure_ascii=False)
 
     still_valid = []
     for sub in subs:
         try:
             webpush(
                 subscription_info=sub,
-                data=payload,
+                data=data,
                 vapid_private_key=_vapid_private_key(),
                 vapid_claims=dict(_vapid_claims()),
                 timeout=_SEND_TIMEOUT,
@@ -162,6 +185,66 @@ def _send_push_to_all(store, commit):
 
     if still_valid != subs:
         store.set_push_subscriptions(still_valid)
+
+
+# ---------------------------------------------------------------------------
+# 日次株価更新 完了通知(design 2026-10-22、refresh.py専用)。
+#
+# 「GitHub Actionsがpushされた」でも「Renderにデプロイされた」でもなく、
+# 「daily-refresh.ymlが実際に新しい取引日の株価データをRedisへ反映できた」
+# ことを基準に送る、上のデプロイ検知とは完全に独立した通知。
+#
+# 呼び出し側(refresh.py)は、SPY取得も含め取引日そのものが特定できなかった
+# 回(APIキー未設定・SPY取得失敗等)はtrading_date=Noneでこの関数を呼ばない
+# 設計にする(Q1〜Q5判定ロジック・既存のdaily-refresh処理・一部銘柄のみの
+# 取得失敗を許容する既存方針には一切影響しない、読み取り専用の追加呼び出し)。
+#
+# 同じtrading_dateへの重複送信は、Redisの原子的なSET NXロック
+# (push:refresh_notify_lock:<trading_date>、try_acquire_push_refresh_notify_lock)
+# で同時実行を1プロセスに限定したうえで、push:refresh_notified_dateと
+# 比較して防ぐ。notified_dateは「実際に送信処理(_dispatch_push_to_all)が
+# 完了した後」にだけ更新するため、送信処理自体が例外で失敗した場合は
+# notified_dateが更新されず、次回の実行(同じtrading_date)で再送を試みる
+# ことができる(デプロイ通知側のdispatched_commitとは異なり、こちらは
+# 「送信を試みた」ではなく「送信処理が完了した」ことを基準にする設計。
+# 個々の購読者への送信失敗は_dispatch_push_to_all内で既に握られて次の
+# 購読者へ処理を継続するため、それだけでは再送対象にならない)。
+# ---------------------------------------------------------------------------
+
+def notify_refresh_success(store, trading_date):
+    """refresh.pyのmain()から、取引日が特定できた回にだけ呼ぶ想定。
+    例外は一切外へ伝播させない(daily-refresh本体の終了コード・既存処理には
+    絶対に影響させないため)。"""
+    try:
+        _notify_refresh_success(store, trading_date)
+    except Exception:
+        logger.exception(
+            "push_notify: 株価更新通知処理で予期しない例外が発生しました"
+            "(通知機能のみ影響、daily-refresh本体には影響しません)"
+        )
+
+
+def _notify_refresh_success(store, trading_date):
+    if not _can_send_push():
+        return
+    if not trading_date:
+        return
+
+    notified = store.get_push_refresh_notified_date()
+    if notified == trading_date:
+        return  # この取引日は既に通知済み(同日内の2回目以降の実行)
+
+    if not store.try_acquire_push_refresh_notify_lock(trading_date):
+        return  # 他のプロセス/ワーカーが同時に処理中
+
+    payload = {
+        "title": "📈 Stock Buy App",
+        "body": "株価データを更新しました",
+        "kind": "refresh_success",
+        "trading_date": trading_date,
+    }
+    _dispatch_push_to_all(store, payload, log_context=f"trading_date={trading_date}")
+    store.set_push_refresh_notified_date(trading_date)
 
 
 # ---------------------------------------------------------------------------
