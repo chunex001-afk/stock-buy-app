@@ -3,6 +3,10 @@ import os
 import re
 from datetime import date, datetime, timedelta, timezone
 
+# Web Push実機テスト用マーカー(2026-10-22、コメントのみ・ロジック変更なし):
+# このcommitがRenderにデプロイされた際、RENDER_GIT_COMMIT変化の検知→
+# Web Push→Windowsデスクトップ通知が実際に届くかを確認するためのもの。
+
 from flask import Flask, jsonify, request, render_template_string
 
 import beta_logic
