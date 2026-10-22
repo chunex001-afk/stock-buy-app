@@ -2251,9 +2251,14 @@ function _b64ToUint8Array(b64) {
   return arr;
 }
 
-function _renderPushBar(html) {
+function _renderPushBar(html, onEnableClick) {
   const el = document.getElementById("pushNotifyBar");
-  if (el) el.innerHTML = html;
+  if (!el) return;
+  el.innerHTML = html;
+  if (onEnableClick) {
+    const btn = el.querySelector("#pushEnableBtn");
+    if (btn) btn.addEventListener("click", onEnableClick);
+  }
 }
 
 async function enablePushNotify(vapidKey) {
@@ -2293,7 +2298,10 @@ async function initPushNotifyUI() {
     } else if (Notification.permission === "denied") {
       _renderPushBar('<div class="small">通知がブロックされています(ブラウザ設定で許可すると有効化できます)</div>');
     } else {
-      _renderPushBar('<button class="secondary" onclick="enablePushNotify(' + JSON.stringify(j.key) + ')">🔔 更新通知を有効にする</button>');
+      _renderPushBar(
+        '<button class="secondary" id="pushEnableBtn">🔔 更新通知を有効にする</button>',
+        () => enablePushNotify(j.key)
+      );
     }
   } catch (e) {
     // 取得できなくても既存機能には影響させない。
