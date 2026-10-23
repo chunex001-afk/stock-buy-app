@@ -37,6 +37,13 @@ class RefreshNotifyWiringTests(unittest.TestCase):
         p3 = mock.patch("refresh.store.set_last_refresh", return_value=True)
         p3.start()
         self.addCleanup(p3.stop)
+        # AI市場下落状況パネル(design 2026-10-23)はmain()内でrun_quintile_refresh
+        # とは別に呼ばれる独立した追加処理のため、このテストの対象外として
+        # mockで無効化する(実Twelve Data呼び出しを避けるだけで、push_notify
+        # 配線の検証対象には一切含めない)。
+        p4 = mock.patch("refresh._update_ai_market_decline_state", return_value=None)
+        p4.start()
+        self.addCleanup(p4.stop)
 
     def test_notifies_with_trading_date_when_quintile_updated(self):
         td_result = {

@@ -735,6 +735,60 @@ def _build_riskoff_view():
     }
 
 
+def _ai_market_decline_bucket(pct_down):
+    """pct_down(0〜100)が該当するバックテスト参考区分を返す(design
+    2026-10-23、refresh.AI_MARKET_DECLINE_BACKTEST_BUCKETSをそのまま参照する
+    読み取り専用の純粋関数)。該当区分が無い場合はNone(通常は発生しない、
+    0〜100を5区分で網羅済み)。"""
+    for bucket in refresh.AI_MARKET_DECLINE_BACKTEST_BUCKETS:
+        if bucket["lo"] <= pct_down < bucket["hi"]:
+            return bucket
+    return None
+
+
+def _ai_market_decline_state_label(pct_down):
+    """pct_down(0〜100)を客観的に説明する一行ラベルを返す(design
+    2026-10-23、表示専用の純粋関数)。「買いチャンス」等の勧誘的な表現は
+    使わず、下落銘柄の広がりの程度だけを事実として記述する。"""
+    if pct_down < 20:
+        return "AI市場の大部分は自己最高値に近い状態"
+    if pct_down < 40:
+        return "一部の銘柄で下落が見られる状態"
+    if pct_down < 60:
+        return "半数程度の銘柄で下落が見られる状態"
+    if pct_down < 80:
+        return "AI市場全体で調整が広がっている状態"
+    return "AI市場の大部分が大きく下落している状態"
+
+
+def _build_ai_market_decline_view():
+    """AI市場下落状況パネル(design 2026-10-23、過去検証済み)の表示専用ビューを
+    組み立てる。refresh.py側が書き込むai_market_decline:state(Redis)を読む
+    だけの純粋関数。
+
+    完全に参考情報の表示であり、Q1〜Q5判定・Q5 Day0判定・BUY/SELL判定・
+    Risk-off判定・投資比率・Q5ランキング・銘柄の優先順位には一切関与しない。
+    ここで組み立てた値を他のロジックが参照することも一切ない。未計算
+    (初回デプロイ直後等)の場合はNoneを返し、呼び出し側のJSはパネル自体を
+    表示しない。"""
+    state = store.get_ai_market_decline_state()
+    if not state:
+        return None
+    pct_down = state.get("pct_down")
+    if pct_down is None:
+        return None
+    bucket = _ai_market_decline_bucket(pct_down)
+    return {
+        "n_down": state.get("n_down"),
+        "n_pop": state.get("n_pop"),
+        "pct_down": pct_down,
+        "threshold_pct": refresh.AI_MARKET_DECLINE_THRESHOLD_PCT,
+        "date": state.get("date"),
+        "state_label": _ai_market_decline_state_label(pct_down),
+        "backtest": bucket,
+    }
+
+
 # 日次アクション型UI(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md
 # フェーズ2)。「今日やること」をSELL→PROFIT→空き枠確定→BUYの順で判定する。
 # 既存のQ1〜Q5判定・Day0判定・Risk-off判定・ランキング(sort_rows)には一切
@@ -1151,6 +1205,22 @@ details.logicinfo .small{margin-top:10px}
 .riskoff-exit{font-size:13px;font-weight:700;color:#172033;margin-top:14px;background:#fff;border-radius:10px;padding:10px 12px;line-height:1.6}
 .riskoff-exit b{color:#b42318}
 
+/* AI市場下落状況パネル(design 2026-10-23)。Risk-off表示の直下・BUY候補の
+   直前に入る補助的な参考情報。「買いチャンス」等の勧誘的な表現は使わず、
+   過度に目立たせないニュートラルな配色にする(Risk-offの赤・通常運用の緑
+   とは区別し、注意/推奨のどちらにも見えないグレー基調にする)。 */
+.aimktdecl{background:#f5f6f8;border-radius:14px;padding:14px 16px;margin-bottom:18px}
+.aimktdecl-title{font-weight:800;font-size:14px;color:#475467}
+.aimktdecl-headline{font-weight:800;font-size:17px;color:#172033;margin-top:6px}
+.aimktdecl-sub{font-size:12.5px;color:#667085;margin-top:4px;line-height:1.5}
+.aimktdecl-asof{font-size:10.5px;color:#98a2b3;margin-top:4px}
+.aimktdecl-ref{margin-top:12px;padding-top:12px;border-top:1px dashed #d0d5dd}
+.aimktdecl-ref-title{font-size:12.5px;font-weight:700;color:#475467}
+.aimktdecl-ref-body{font-size:13px;color:#344054;margin-top:4px;line-height:1.7}
+.aimktdecl-ref-body b{color:#172033}
+.aimktdecl-disclaimer{font-size:10.5px;color:#98a2b3;margin-top:8px;line-height:1.5}
+.aimktdecl-riskoff-note{font-size:12px;font-weight:700;color:#b42318;margin-top:10px;background:#fdeceb;border-radius:8px;padding:8px 10px;line-height:1.6}
+
 /* 今日のアクション(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md
    フェーズ4)。daily_actions(SELL→PROFIT→BUYの優先順でサーバー側が計算済み)を
    そのままカードとして描画するだけ。Q1〜Q5判定・Day0判定・Risk-off判定には
@@ -1239,12 +1309,14 @@ details.cmp-details .cmp-note:first-child{margin-top:6px}
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}
   .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}
   .riskoff-alert{padding:14px 16px}.riskoff-alert-title{font-size:19px}.riskoff-ratio-value{font-size:28px}
+  .aimktdecl{padding:12px 14px}.aimktdecl-headline{font-size:15.5px}
   .daction{padding:12px 14px}.daction-ticker{font-size:16px}.daction-price-input{width:90px}}
 </style>
 </head>
 <body>
 <div class="wrap">
 <div id="riskoff"></div>
+<div id="aimarketdecline"></div>
 <div id="dailyActions"></div>
 <div id="portfolioStatus"></div>
 <div id="comparePanel"></div>
@@ -1337,6 +1409,40 @@ function renderRiskOff(d){
       🔴 Risk-off継続中　解除進捗：<b>${esc(d.above_streak)} / ${esc(d.exit_days)}営業日</b>
       ${remain > 0 ? `<br>→ あと${esc(remain)}営業日で通常運用へ` : ""}
     </div>
+  </div>`;
+}
+
+// AI市場下落状況パネル(design 2026-10-23)。app._build_ai_market_decline_viewが
+// 組み立てた値をそのまま描画するだけの表示専用関数。あくまで参考情報であり、
+// BUY判定・Q5 Day0判定・Risk-off判定・投資比率・売却判定・利益確定判定・
+// Q5ランキング・銘柄の優先順位には一切使用しない(売買結果は本パネルの追加
+// 前と完全に同じ)。「買いチャンス」「上昇期待」等の勧誘的な表現は使わない。
+// riskOff(j.risk_off)はRisk-off発動中かどうかの注記を出すためだけに参照する
+// (このパネル自体がRisk-offの判定・投資比率を変更することはない。優先順位は
+// 常に ①Risk-off → ②Q5 Day0 → ③本パネル(参考情報)の順)。
+function renderAiMarketDecline(d, riskOff){
+  const el = document.getElementById("aimarketdecline");
+  if(!el) return;
+  if(!d){ el.innerHTML = ""; return; }
+  const bt = d.backtest;
+  const refBlock = bt ? `<div class="aimktdecl-ref">
+      <div class="aimktdecl-ref-title">📊 過去検証による参考情報</div>
+      <div class="aimktdecl-ref-body">
+        現在と同じ「${esc(bt.label)}」の環境でQ5 Day0が発生したケースでは<br>
+        20日後平均：<b>${bt.mean_ret20>=0?"+":""}${esc(bt.mean_ret20)}%</b>　勝率：<b>${esc(bt.win_rate)}%</b>
+      </div>
+    </div>` : "";
+  const riskOffNote = (riskOff && riskOff.active)
+    ? `<div class="aimktdecl-riskoff-note">⚠️ Risk-off発動中のため、投資比率はRisk-offの表示に従ってください。</div>`
+    : "";
+  el.innerHTML = `<div class="aimktdecl">
+    <div class="aimktdecl-title">AI市場の下落状況</div>
+    <div class="aimktdecl-headline">${esc(d.threshold_pct)}%以上下落：${esc(d.n_down)} / ${esc(d.n_pop)}銘柄（${esc(d.pct_down)}%）</div>
+    <div class="aimktdecl-sub">→ ${esc(d.state_label)}</div>
+    <div class="aimktdecl-asof">時点：${esc(fmtDate(d.date))}</div>
+    ${refBlock}
+    ${riskOffNote}
+    <div class="aimktdecl-disclaimer">※過去データに基づく参考値であり、今回の20日後のリターンを保証するものではありません。</div>
   </div>`;
 }
 
@@ -1857,6 +1963,7 @@ async function updateRanking(extraMsg){
     if(!j.ok) throw new Error(j.error||"取得失敗");
     render(j.rows);
     renderRiskOff(j.risk_off);
+    renderAiMarketDecline(j.ai_market_decline, j.risk_off);
     renderDailyActions(j.daily_actions, j.portfolio);
     renderPortfolioStatus(j.portfolio);
     renderAiMarketEnv(j.ai_market_env);
@@ -2974,6 +3081,7 @@ def ranking():
             "q5_momentum": _compute_q5_momentum_ranking(rows),
             "ai_market_env": _build_ai_market_env_view(),
             "risk_off": _build_riskoff_view(),
+            "ai_market_decline": _build_ai_market_decline_view(),
             "daily_actions": daily_actions,
             "portfolio": _build_portfolio_view(),
             "last_refresh": last_refresh_view,

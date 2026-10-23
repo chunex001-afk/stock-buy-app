@@ -218,6 +218,130 @@ def _update_riskoff_state(spy_dates, spy_closes, date_key):
     return new_state
 
 
+# AI市場下落状況パネル(design 2026-10-23、過去検証済み: AI_UNIVERSE41銘柄中、
+# 自己最高値(ATH)から30%以上下落している銘柄の割合を0〜20/20〜40/40〜60/
+# 60〜80/80〜100%の5区分に分け、各区分でのQ5 Day0→20営業日後リターンを
+# バックテストした結果を参考表示する)。完全に表示専用で、Q1〜Q5判定・
+# 購入/売却判定・Risk-off判定・AI一斉調整判定には一切接続しない(どの既存
+# ロジックにもこのパネルの値を読ませない)。
+#
+# ATH算出にはQ1〜5判定用の既存フェッチ(outputsize=300=約14ヶ月)では
+# 不足するため(確立済み銘柄は300日より前に最高値を付けていることが多い)、
+# outputsize=5000(Twelve Data上限、creditsはoutputsizeに依存しないため
+# 1銘柄あたりのAPI消費量自体は既存呼び出しと同じ1credit)での取得が必要。
+#
+# 2026-10-23設計変更: 過去検証(41銘柄を同一営業日の終値で一斉に評価)との
+# 定義のズレ(以前のローテーション方式では最大13日分の価格がバラバラの
+# 取得日になっていた)を無くすため、毎日41銘柄を逐次取得する方式に変更した。
+# 41銘柄×10秒スロットル≒7分が既存Q1〜5処理に追加されるため、daily-refresh.yml
+# のtimeout-minutesを10→20に変更済み(q5-universe-refresh.ymlと同じ値)。
+# 既存のQ1〜5ローテーション・ユーザー監視銘柄取得とは完全に別の、独立した
+# API呼び出し(同じ銘柄が同日に偶然重なっても二重取得にはならない、別目的の
+# 別呼び出しのため)。
+#
+# 【重要】41銘柄中1つでも取得に失敗した日は、その日の試行結果を一切保存せず
+# (前回の「全銘柄同日取得済み」のスナップショットをそのまま維持する)。
+# 古い銘柄の価格と新しい銘柄の価格を混在させて「本日time_series」として
+# 表示することは絶対にしない(過去検証の「同一日評価」という前提を守るため)。
+# ATHはmax(前回ATH, 今回の終値最大値)で累積保存するが、これも「全銘柄取得
+# 成功」の回だけ保存する(部分成功の日は何も書き込まない、Redisの状態を
+# 不確定な中間状態にしないため)。
+AI_MARKET_DECLINE_THRESHOLD_PCT = 30.0
+AI_MARKET_DECLINE_ATH_OUTPUTSIZE = 5000
+# 全41銘柄のうち、何銘柄取得成功したら「本日分として確定」とみなすか。
+# 既定ではlen(AI_UNIVERSE)=41(完全一致)を要求する、最も厳格な設定。
+AI_MARKET_DECLINE_REQUIRED_SUCCESS = len(AI_UNIVERSE)
+
+
+# バックテスト参考値(2026-10-23、過去検証済み: 2007-08〜2026-10の全期間、
+# 既存Q5 Day0イベントn=5,848件。「AI_UNIVERSE41銘柄中、自己ATHから30%以上
+# 下落している銘柄の割合」が各区分だった時点でのQ5 Day0→20営業日後リターン。
+# TRAIN(2007-17)/TEST(2018-26)/2007-13/2014-19/2020-26の5期間すべてで
+# 「割合が高いほど成績が良い」方向が閾値30〜80%でおおむね一致することを
+# 確認済み(別セッションでのバックテスト、本リポジトリ外)。この数値は
+# 固定の参考値であり、日次で再計算しない・Q5判定ロジックには一切接続しない。
+AI_MARKET_DECLINE_BACKTEST_BUCKETS = [
+    {"lo": 0, "hi": 20, "label": "0〜20%", "mean_ret20": 4.84, "win_rate": 56.4, "n": 188},
+    {"lo": 20, "hi": 40, "label": "20〜40%", "mean_ret20": 1.81, "win_rate": 50.4, "n": 2172},
+    {"lo": 40, "hi": 60, "label": "40〜60%", "mean_ret20": 3.48, "win_rate": 55.9, "n": 2422},
+    {"lo": 60, "hi": 80, "label": "60〜80%", "mean_ret20": 3.80, "win_rate": 56.3, "n": 774},
+    {"lo": 80, "hi": 101, "label": "80〜100%", "mean_ret20": 10.46, "win_rate": 56.8, "n": 292},
+]
+
+
+def _update_ai_market_decline_state(api_key, date_key):
+    """AI_UNIVERSE41銘柄を毎日逐次取得し、各銘柄の自己ATH(取得できた全期間の
+    終値の最大値)からの下落率を計算して、AI_MARKET_DECLINE_THRESHOLD_PCT
+    (30%)以上下落している銘柄の数・割合をRedisに保存する(表示専用、
+    design 2026-10-23)。
+
+    既存のQ1〜Q5判定(quintile_logic.py)・購入/売却判定・Risk-off判定・
+    AI一斉調整判定(_update_ai_market_env)には一切接続しない、完全に独立した
+    追加計算。これらの既存ロジックが本関数の結果を参照することも一切ない。
+
+    冪等性: 当日分の「全銘柄同日取得済み」スナップショットが既に存在する
+    場合は再取得しない(prev["date"]==date_keyで判定)。まだ無い場合は
+    (前回が未達成だった場合を含む)毎回フルに41銘柄の取得を試みる
+    ("取りこぼし対策"の再実行cronが同日に複数回走っても、前回が不完全なら
+    再挑戦できるようにするため)。
+
+    AI_MARKET_DECLINE_REQUIRED_SUCCESS(既定41、全銘柄)に届かなかった日は、
+    取得できた分も含めて一切Redisに書き込まない(古い値と新しい値が混在した
+    不確定な状態を作らないため)。その場合は前回の完全なスナップショットを
+    そのまま返す。生の株価履歴はRedisに保存しない(ATH・最新終値という
+    軽量な計算結果のみ)。"""
+    prev = store.get_ai_market_decline_state() or {}
+    if prev.get("date") == date_key:
+        return prev  # 当日分は既に全銘柄取得済み、再取得不要
+
+    existing_tickers = prev.get("tickers") or {}
+    tickers_today = {}
+    for ticker in AI_UNIVERSE:
+        budget_left, _ = remaining_td_budget()
+        if budget_left <= 0:
+            print("[AI_DECLINE][WARN] Twelve Data予算切れのため、取得を中断します。")
+            break
+        result, hit_rate_limit, _error_type, _message, _lows = _td_fetch_one(
+            ticker, api_key, date_key, outputsize=AI_MARKET_DECLINE_ATH_OUTPUTSIZE,
+        )
+        if hit_rate_limit:
+            print("[AI_DECLINE][WARN] Twelve DataがRATE_LIMITを返したため、取得を中断します。")
+            break
+        if result is None:
+            continue
+        _dates, closes, _volumes = result
+        if not closes:
+            continue
+        prev_ath = (existing_tickers.get(ticker) or {}).get("ath") or 0
+        tickers_today[ticker] = {
+            "ath": max(prev_ath, max(closes)),
+            "current_price": closes[-1],
+            "last_updated": date_key,
+        }
+
+    if len(tickers_today) < AI_MARKET_DECLINE_REQUIRED_SUCCESS:
+        print(f"[AI_DECLINE][WARN] 本日分の取得が不完全({len(tickers_today)}/{len(AI_UNIVERSE)}銘柄、"
+              f"必要数{AI_MARKET_DECLINE_REQUIRED_SUCCESS})のため、保存せず前回の完全なスナップショットを保持します。")
+        return prev
+
+    n_down = sum(
+        1 for t in tickers_today.values()
+        if (t["current_price"] / t["ath"] - 1) * 100 <= -AI_MARKET_DECLINE_THRESHOLD_PCT
+    )
+    n_pop = len(tickers_today)
+    pct_down = round(n_down / n_pop * 100, 1)
+    new_state = {
+        "date": date_key,
+        "n_down": n_down,
+        "n_pop": n_pop,
+        "pct_down": pct_down,
+        "tickers": tickers_today,
+    }
+    store.set_ai_market_decline_state(new_state)
+    print(f"[AI_DECLINE][OK] {n_down}/{n_pop}銘柄が自己ATHから{AI_MARKET_DECLINE_THRESHOLD_PCT:.0f}%以上下落 ({pct_down}%)")
+    return new_state
+
+
 def _q_on_date(history, date_key):
     """quintile:state の history(Qが変化した日だけを記録したコンパクト形式)
     から、date_key時点で有効だったQを返す(design 2026-10-15、
@@ -433,7 +557,7 @@ def remaining_td_budget():
     return td.DAILY_API_BUDGET - used, used
 
 
-def _td_fetch_one(ticker, api_key, date_key):
+def _td_fetch_one(ticker, api_key, date_key, outputsize=td.OUTPUTSIZE):
     """Twelve Dataから1銘柄取得し、成功なら(dates, closes, volumes)、
     失敗ならNoneを返す。RATE_LIMIT発生時は第2戻り値をTrueにする
     (以降の新規Twelve Data呼び出しを中断すべきというシグナル)。第3戻り値は
@@ -445,9 +569,15 @@ def _td_fetch_one(ticker, api_key, date_key):
 
     2026-10-14追加: 第5戻り値lowsを追加した(AI一斉調整パネル表示専用、
     既存のQ1〜Q5判定が使う第1戻り値(dates, closes, volumes)の形は無変更)。
-    失敗時はNone。"""
+    失敗時はNone。
+
+    2026-10-23追加: outputsize引数を追加した(AI市場下落状況パネル専用、
+    自己最高値(ATH)算出には既存のQ1〜5判定用300日分では不足するため)。
+    省略時はtd.OUTPUTSIZE(既存の全呼び出し元と完全に同じ挙動、300日分)。
+    Twelve Dataはoutputsizeでcreditsが変わらないため(twelvedata_client.py
+    冒頭のコメント参照)、既存呼び出し元のAPI消費量には影響しない。"""
     try:
-        dates, closes, volumes, lows, attempts = td.fetch_daily_series(ticker, api_key)
+        dates, closes, volumes, lows, attempts = td.fetch_daily_series(ticker, api_key, outputsize=outputsize)
         store.incr_td_api_budget(date_key, attempts)
         return (dates, closes, volumes), False, None, None, lows
     except td.TdApiError as e:
@@ -1385,6 +1515,13 @@ def main():
             legacy_result = _update_legacy_records(td_result.get("raw_watchlist_data", {}), tickers)
     except Exception as e:
         print(f"[Q1-5][WARN] Q1〜Q5処理で予期しないエラーが発生しました: {e}", file=sys.stderr)
+
+    # AI市場下落状況パネル(design 2026-10-23)。Q1〜Q5処理とは完全に独立した
+    # 表示専用の追加計算で、失敗してもQ1〜5側の結果には一切影響しない。
+    try:
+        _update_ai_market_decline_state(td_api_key, _today_str())
+    except Exception as e:
+        print(f"[AI_DECLINE][WARN] 予期しないエラーが発生しました: {e}", file=sys.stderr)
 
     update_rank_snapshot(tickers)
 

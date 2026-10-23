@@ -17,7 +17,10 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 2026-10-23: AI市場下落状況パネル(design)がAI_UNIVERSE41銘柄を毎日
+    # 逐次取得するようになり(+約7分)、既存処理との合計が10分を超える
+    # リスクがあるため、q5-universe-refresh.ymlと同じ20分に変更した。
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

@@ -243,6 +243,19 @@ def set_riskoff_state(data):
     return set_json("riskoff:state", data)
 
 
+def get_ai_market_decline_state():
+    """AI市場下落状況パネル(design 2026-10-23、過去検証済み)の状態を取得する。
+    戻り値: {"date": "YYYY-MM-DD", "n_down": int, "n_pop": int, "pct_down": float,
+    "last_updated": ...} または None(未計算時)。既存のQ1〜Q5判定・購入/売却判定・
+    Risk-off判定・AI一斉調整判定とは完全に独立した表示専用データで、他のキー
+    とは別キーに保存する(銘柄ごとの生の株価履歴は保存しない)。"""
+    return get_json("ai_market_decline:state")
+
+
+def set_ai_market_decline_state(data):
+    return set_json("ai_market_decline:state", data)
+
+
 def get_portfolio_state():
     """日次アクション型UI(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md)
     のポートフォリオ記録(ユーザーが「購入を記録」した結果)を取得する。
