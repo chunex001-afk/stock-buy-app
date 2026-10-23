@@ -191,8 +191,8 @@ class FullLifecycleTests(PortfolioApiTestCase):
 
 class RankingResponseTests(PortfolioApiTestCase):
     """/api/rankingへの追加キーが既存の挙動を壊していないことの確認。
-    (既存のrows・q5_momentum・ai_market_env・risk_off等の計算自体は、
-    既存の重いQ5パイプライン依存のため、watchlist=[]にして軽量に確認する。)"""
+    (既存のrows・q5_momentum・risk_off等の計算自体は、既存の重いQ5パイプ
+    ライン依存のため、watchlist=[]にして軽量に確認する。)"""
 
     def test_ranking_includes_new_keys_without_touching_existing_ones(self):
         # _get_watchlist自体をmockして空の監視銘柄にする(store.get_watchlist()が
@@ -200,7 +200,6 @@ class RankingResponseTests(PortfolioApiTestCase):
         # それを経由せず「監視銘柄0件」の状態を直接作る)。
         with mock.patch.object(app, "_get_watchlist", return_value=[]), \
              mock.patch.object(app, "_build_riskoff_view", return_value={"active": False}), \
-             mock.patch.object(app, "_build_ai_market_env_view", return_value=None), \
              mock.patch.object(app.store, "get_last_refresh", return_value=None), \
              mock.patch.object(app.refresh, "remaining_td_budget", return_value=(10, 0)):
             resp = self.client.get("/api/ranking")

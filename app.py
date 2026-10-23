@@ -651,61 +651,6 @@ def _compute_q5_momentum_ranking(rows):
     return candidates[:8]
 
 
-def _ai_market_env_longterm_note(continuation_days):
-    """継続日数(既存のcontinuation_days、無改変)から「長期化傾向」の
-    参考情報(表示専用)を組み立てる純粋関数(design 2026-10-14、追加検証の
-    バックテスト結果に基づく)。AI一斉調整の開始/終了判定・Fスコア計算・
-    Q1〜Q5判定・購入/利確/売却判定には一切関与しない。
-
-    バックテスト結果(356件の完了済み一斉調整イベント、ブートストラップ
-    95%信頼区間で確認済み):
-    - Day8時点で最終的に15営業日以上継続した割合は63.2%(95%CI [51.5,75.0])。
-      Day9時点でも66.2%だが、Day8→9の差(+2.9pt)はペアブートストラップで
-      95%CIが0を含み統計的に有意でないため、Day9も63%のまま更新しない。
-    - Day10時点では74.1%(95%CI [62.3,85.1])。Day9→10の差(+8.0pt)は
-      95%CIが0を含まず統計的に有意なため、Day10でのみ数字を更新する。
-    - Day11以降は、サンプル数が減少し続ける(n=54→29)ことと、「15営業日
-      以上」という固定閾値にNが近づくほど定義上100%に収束していく
-      (Day15時点で必然的に100%になる)影響が強くなるため、具体的な
-      パーセンテージは表示せず「長期化傾向が継続中」のみとする。
-
-    戻り値: Day1-7はNone。Day8以降は{"suffix": ..., "note": ... or None}。"""
-    if continuation_days < 8:
-        return None
-    if continuation_days <= 9:
-        return {"suffix": "⚠️ 長期化傾向",
-                "note": "過去データでは、8日目まで継続した調整の約63%が15営業日以上継続"}
-    if continuation_days == 10:
-        return {"suffix": "⚠️ 長期化傾向",
-                "note": "過去データでは、10日目まで継続した調整の約74%が15営業日以上継続"}
-    return {"suffix": "⚠️ 長期化傾向が継続中", "note": None}
-
-
-def _build_ai_market_env_view():
-    """AI関連一斉調整パネル(design 2026-10-14)の表示専用ビューを組み立てる。
-    refresh.py側が書き込むai_market_env:state(Redis)を読むだけの純粋関数。
-
-    「売買シグナル」ではなく注意情報の表示に限定する(ユーザー確定仕様)。
-    Q1〜Q5判定・購入判定・売却判定には一切関与せず、ここで組み立てた値を
-    他のロジックが参照することもない。一斉調整が非アクティブ、または
-    一度も計算されていない場合はNoneを返し、呼び出し側のJSはパネル自体を
-    表示しない。"""
-    state = store.get_ai_market_env_state()
-    if not state or not state.get("active"):
-        return None
-    f_history = state.get("f_history") or []
-    if not f_history:
-        return None
-    continuation_days = len(f_history)
-    return {
-        "f_score": round(f_history[-1]["f_score"]),
-        "continuation_days": continuation_days,
-        "f_history": [round(e["f_score"]) for e in f_history],
-        "start_date": state.get("start_date"),
-        "longterm": _ai_market_env_longterm_note(continuation_days),
-    }
-
-
 def _build_riskoff_view():
     """Risk-off判定(design 2026-10-16)の表示専用ビューを組み立てる。
     refresh.py側が書き込むriskoff:state(Redis)を読むだけの純粋関数。
@@ -1171,21 +1116,6 @@ details.logicinfo .small{margin-top:10px}
 .q5halttop{font-weight:800;color:#b42318;font-size:13px}
 .q5haltsub{color:#8a3a30;font-size:11px;margin-top:4px;line-height:1.6}
 
-/* AI関連一斉調整パネル(design 2026-10-14、表示リニューアル2026-10-15)。
-   .q5warn系(他のQ5警告表示と共用)とは別クラスにして、このパネルだけ
-   サイズ・優先順位を調整できるようにした。優先順位: タイトル>開始日・
-   継続日数>F値推移>長期化傾向>説明文(ユーザー確定仕様)。購入不可・売却・
-   Q1〜Q5判定には一切関与しない、表示専用。 */
-.aimarketenv{background:#fdeceb;border-radius:14px;padding:14px 16px;margin-top:6px}
-.aimarketenv-title{font-weight:800;color:#b42318;font-size:17px;line-height:1.3}
-.aimarketenv-headline{font-weight:700;color:#8a3a30;font-size:15px;margin-top:8px;line-height:1.4}
-.aimarketenv-fhistory{margin-top:10px}
-.aimarketenv-fhistory-label{color:#8a3a30;font-size:12px;font-weight:600}
-.aimarketenv-fhistory-value{font-weight:700;color:#172033;font-size:16px;margin-top:2px;line-height:1.5;letter-spacing:0.02em}
-.aimarketenv-longterm{font-weight:700;color:#9a6a00;font-size:13.5px;margin-top:10px;line-height:1.4}
-.aimarketenv-longtermnote{font-weight:400;color:#8a3a30;font-size:12px;margin-top:2px;line-height:1.5}
-.aimarketenv-desc{color:#a3827c;font-size:10.5px;margin-top:10px;line-height:1.6}
-
 /* Risk-off表示(design 2026-10-16)。アプリを開いた瞬間に「今は通常運用か
    Risk-offか」「投資比率をどうすべきか」が一目で分かることを最優先する、
    画面最上部固定の最重要アラート。既存のQ1〜Q5判定・購入/売却判定・
@@ -1307,7 +1237,6 @@ details.cmp-details .cmp-note:first-child{margin-top:6px}
 .cmp-headline-item b{color:#172033}
 
 @media(max-width:480px){.wrap{padding:12px}.title{font-size:20px}.tcard{padding:14px 16px}.tickerbig{font-size:18px}.statrow{gap:14px}.heroticker{font-size:26px}
-  .aimarketenv{padding:12px 14px}.aimarketenv-title{font-size:15.5px}.aimarketenv-headline{font-size:13.5px}.aimarketenv-fhistory-value{font-size:14.5px}.aimarketenv-longterm{font-size:12.5px}.aimarketenv-desc{font-size:10px}
   .riskoff-alert{padding:14px 16px}.riskoff-alert-title{font-size:19px}.riskoff-ratio-value{font-size:28px}
   .aimktdecl{padding:12px 14px}.aimktdecl-headline{font-size:15.5px}
   .daction{padding:12px 14px}.daction-ticker{font-size:16px}.daction-price-input{width:90px}}
@@ -1338,7 +1267,6 @@ details.cmp-details .cmp-note:first-child{margin-top:6px}
   <details class="opinfo"><summary>運用情報</summary><div id="opinfo" class="opbody"></div></details>
 </div>
 
-<div id="aimarketenv"></div>
 <div id="q5momentum"></div>
 <div id="hero"></div>
 <div class="list" id="list"></div>
@@ -1359,33 +1287,13 @@ function fmtDate(s){
   if(!s) return "—";
   return s.replaceAll("-","/");
 }
-// 「M/D」形式(先頭ゼロなし)。AI一斉調整パネルの「初回確認」表示専用。
-function fmtMD(s){
-  if(!s) return "—";
-  const p = s.split("-");
-  if(p.length !== 3) return s;
-  return `${parseInt(p[1],10)}/${parseInt(p[2],10)}`;
-}
 
-// AI関連一斉調整パネル(design 2026-10-14、表示リニューアル2026-10-15)。
-// app._build_ai_market_env_viewが組み立てた値をそのまま描画するだけの
-// 表示専用関数(売買シグナルではない、既存のQ1〜Q5判定・購入/売却判定には
-// 一切関与しない注意情報)。非アクティブならセクション自体を非表示にする。
-// 専用の.aimarketenv*スタイルを使う(.q5warn系は他のQ5警告表示と共用の
-// ため、このパネルだけサイズ調整するために分離した)。
-//
-// 2026-10-15変更: 「調整度:NN/100」という表示は、底打ち確率や進捗率と
-// 誤解されやすいため削除した(ユーザー確定仕様)。Fスコア自体の計算式・
-// 一斉調整の判定ロジックは変更していない、表示からの削除のみ。
-// start_dateは「アプリが最初にactiveを確認した日」ではなく「一斉調整が
-// 実際に始まった日」(refresh._find_ai_market_env_backfillが既存データから
-// 遡って特定した値)。
 // Risk-off表示(design 2026-10-16)。app._build_riskoff_viewが組み立てた値を
-// そのまま描画するだけの表示専用関数(既存のQ1〜Q5判定・購入/売却判定・
-// AI一斉調整判定には一切関与しない)。常に表示する(AI一斉調整パネルと違い、
-// 非アクティブでもセクション自体を消さない。「今は通常運用かRisk-offか」を
-// 常に一目で分かるようにする仕様のため)。本番には実際の購入・ポジション
-// 管理機能が存在しないため、「投資比率」はユーザーへの推奨表示。
+// そのまま描画するだけの表示専用関数(既存のQ1〜Q5判定・購入/売却判定には
+// 一切関与しない)。常に表示する(非アクティブでもセクション自体を消さない。
+// 「今は通常運用かRisk-offか」を常に一目で分かるようにする仕様のため)。
+// 本番には実際の購入・ポジション管理機能が存在しないため、「投資比率」は
+// ユーザーへの推奨表示。
 function renderRiskOff(d){
   const el = document.getElementById("riskoff");
   if(!el) return;
@@ -1443,31 +1351,6 @@ function renderAiMarketDecline(d, riskOff){
     ${refBlock}
     ${riskOffNote}
     <div class="aimktdecl-disclaimer">※過去データに基づく参考値であり、今回の20日後のリターンを保証するものではありません。</div>
-  </div>`;
-}
-
-function renderAiMarketEnv(d){
-  const el = document.getElementById("aimarketenv");
-  if(!el) return;
-  if(!d){ el.innerHTML = ""; return; }
-  const fPath = (d.f_history||[]).join(" → ");
-  // 継続日数に応じた「長期化傾向」参考情報(design 2026-10-14追加検証)。
-  // d.longtermはapp._ai_market_env_longterm_noteが組み立てた値をそのまま
-  // 描画するだけ(Day1-7はnull=表示なし)。AI一斉調整の開始/終了判定・
-  // Fスコア計算には一切関与しない、表示専用の追加行。
-  const lt = d.longterm;
-  const longtermBlock = lt
-    ? `<div class="aimarketenv-longterm">${esc(lt.suffix)}${lt.note ? `<div class="aimarketenv-longtermnote">${esc(lt.note)}</div>` : ""}</div>`
-    : "";
-  el.innerHTML = `<div class="aimarketenv">
-    <div class="aimarketenv-title">⚠️ AI関連 一斉調整</div>
-    <div class="aimarketenv-headline">${esc(fmtMD(d.start_date))}から継続中（${esc(d.continuation_days)}営業日目）</div>
-    <div class="aimarketenv-fhistory">
-      <div class="aimarketenv-fhistory-label">F値の推移：</div>
-      <div class="aimarketenv-fhistory-value">${esc(fPath)}</div>
-    </div>
-    ${longtermBlock}
-    <div class="aimarketenv-desc">AI関連銘柄の調整の広がり・強さを示す指標です。<br>※底打ちを示す指標ではありません</div>
   </div>`;
 }
 
@@ -1966,7 +1849,6 @@ async function updateRanking(extraMsg){
     renderAiMarketDecline(j.ai_market_decline, j.risk_off);
     renderDailyActions(j.daily_actions, j.portfolio);
     renderPortfolioStatus(j.portfolio);
-    renderAiMarketEnv(j.ai_market_env);
     renderQ5Momentum(j.q5_momentum);
     renderOpInfo(j);
     renderTickerCount(j);
@@ -3079,7 +2961,6 @@ def ranking():
             "ok": True,
             "rows": rows,
             "q5_momentum": _compute_q5_momentum_ranking(rows),
-            "ai_market_env": _build_ai_market_env_view(),
             "risk_off": _build_riskoff_view(),
             "ai_market_decline": _build_ai_market_decline_view(),
             "daily_actions": daily_actions,

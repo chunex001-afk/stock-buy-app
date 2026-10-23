@@ -476,13 +476,8 @@ class ExistingLogicUnaffectedTests(unittest.TestCase):
         self.assertEqual(refresh.RISKOFF_EXIT_DAYS, 10)
         self.assertEqual(refresh.RISKOFF_RATIO, 0.70)
 
-    def test_ai_market_env_constants_unchanged(self):
-        self.assertEqual(refresh.AI_MARKET_ENV_MIN_POP, 5)
-        self.assertEqual(refresh.AI_MARKET_ENV_ADJUSTMENT_THRESHOLD, 50.0)
-
-    def test_new_constants_independent_from_existing_ones(self):
+    def test_decline_threshold_constant_unchanged(self):
         self.assertEqual(refresh.AI_MARKET_DECLINE_THRESHOLD_PCT, 30.0)
-        self.assertNotEqual(refresh.AI_MARKET_DECLINE_THRESHOLD_PCT, refresh.AI_MARKET_ENV_ADJUSTMENT_THRESHOLD)
 
     def test_required_success_defaults_to_all_41(self):
         self.assertEqual(refresh.AI_MARKET_DECLINE_REQUIRED_SUCCESS, len(refresh.AI_UNIVERSE))

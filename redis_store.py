@@ -217,19 +217,6 @@ def set_quintile_state(ticker, data):
     return set_json(f"quintile:state:{ticker.upper()}", data)
 
 
-def get_ai_market_env_state():
-    """AI関連一斉調整パネル(design 2026-10-14、バックテスト検証済み)の状態を
-    取得する。戻り値: {"active": bool, "start_date": "YYYY-MM-DD",
-    "f_history": [{"date":..., "f_score":...}, ...], "last_updated": ...} または
-    None(未計算時)。既存のQ1〜Q5判定・購入/売却判定とは完全に独立した表示専用
-    データで、quintile:state:<TICKER>とは別キーに保存する。"""
-    return get_json("ai_market_env:state")
-
-
-def set_ai_market_env_state(data):
-    return set_json("ai_market_env:state", data)
-
-
 def get_riskoff_state():
     """Risk-off判定(design 2026-10-16、バックテスト検証済み)の状態を取得する。
     戻り値: {"active": bool, "below_streak": int, "above_streak": int,

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Risk-off判定(design 2026-10-16、refresh._update_riskoff_state)のテスト。
 
-Twelve Data・Redisへは一切アクセスしない(test_ai_market_env_start_date.pyと
-同じ方針)。_update_riskoff_stateはRedisアクセスをstore経由で行うだけの
-純粋ロジックなので、refresh.storeをmock.Mockに差し替えて直接呼び出す。
+Twelve Data・Redisへは一切アクセスしない(他のテストファイルと同じ方針)。
+_update_riskoff_stateはRedisアクセスをstore経由で行うだけの純粋ロジック
+なので、refresh.storeをmock.Mockに差し替えて直接呼び出す。
 """
 import unittest
 from datetime import date, timedelta
@@ -177,11 +177,11 @@ class ExistingQuintileLogicUnaffectedTests(unittest.TestCase):
         self.assertEqual(len(refresh.AI_UNIVERSE), 41)
 
     def test_riskoff_module_level_constants_independent(self):
-        # Risk-off用の定数がAI一斉調整用の定数と混線していないことの確認。
+        # Risk-off用の定数がAI市場下落状況パネル用の定数と混線していないことの確認。
         self.assertEqual(refresh.RISKOFF_ENTRY_DAYS, 10)
         self.assertEqual(refresh.RISKOFF_EXIT_DAYS, 10)
         self.assertEqual(refresh.RISKOFF_RATIO, 0.70)
-        self.assertNotEqual(refresh.RISKOFF_ENTRY_DAYS, refresh.AI_MARKET_ENV_MIN_POP)
+        self.assertNotEqual(refresh.RISKOFF_ENTRY_DAYS, refresh.AI_MARKET_DECLINE_THRESHOLD_PCT)
 
 
 if __name__ == "__main__":

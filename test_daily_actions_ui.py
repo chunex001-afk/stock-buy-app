@@ -51,7 +51,6 @@ class DailyActionsUiTestCase(unittest.TestCase):
             mock.patch.object(app.store, "get_quintile_state", side_effect=lambda t: self._quintile.get(t)),
             mock.patch.object(app, "_trading_days_calendar", side_effect=lambda: self._calendar),
             mock.patch.object(app, "_build_riskoff_view", return_value={"active": False}),
-            mock.patch.object(app, "_build_ai_market_env_view", return_value=None),
             mock.patch.object(app.store, "get_last_refresh", return_value=None),
             mock.patch.object(app.refresh, "remaining_td_budget", return_value=(10, 0)),
         ]

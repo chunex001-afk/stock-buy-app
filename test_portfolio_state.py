@@ -60,8 +60,8 @@ class PortfolioStateTests(unittest.TestCase):
         self.assertTrue(args[1].startswith("set/portfolio:state"))
 
     def test_independent_from_other_state_keys(self):
-        """portfolio:stateがriskoff:state/ai_market_env:state等と別キーである
-        ことを確認する(既存データに一切触れないことの最低限の保証)。"""
+        """portfolio:stateがriskoff:state/ai_market_decline:state等と別キーで
+        あることを確認する(既存データに一切触れないことの最低限の保証)。"""
         calls = []
 
         def fake_request(method, path, **kwargs):
@@ -71,13 +71,13 @@ class PortfolioStateTests(unittest.TestCase):
         with mock.patch.object(store, "_request", side_effect=fake_request):
             store.set_portfolio_state({"positions": {}, "last_updated": "2026-10-16"})
             store.get_riskoff_state()
-            store.get_ai_market_env_state()
+            store.get_ai_market_decline_state()
 
         self.assertTrue(any(c.startswith("set/portfolio:state") for c in calls))
         self.assertTrue(any(c.startswith("get/riskoff:state") for c in calls))
-        self.assertTrue(any(c.startswith("get/ai_market_env:state") for c in calls))
+        self.assertTrue(any(c.startswith("get/ai_market_decline:state") for c in calls))
         # それぞれ別キーであること(文字列として重複がない)
-        self.assertEqual(len({"portfolio:state", "riskoff:state", "ai_market_env:state"}), 3)
+        self.assertEqual(len({"portfolio:state", "riskoff:state", "ai_market_decline:state"}), 3)
 
 
 if __name__ == "__main__":

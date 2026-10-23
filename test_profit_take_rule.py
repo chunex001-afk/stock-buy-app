@@ -220,7 +220,6 @@ class ConfirmProfitTakeApiTests(unittest.TestCase):
         self._records["AAA"] = {"price": 150.0}
 
         with mock.patch.object(app, "_build_riskoff_view", return_value={"active": False}), \
-             mock.patch.object(app, "_build_ai_market_env_view", return_value=None), \
              mock.patch.object(app.store, "get_last_refresh", return_value=None), \
              mock.patch.object(app.refresh, "remaining_td_budget", return_value=(10, 0)):
             r1 = self.client.get("/api/ranking").get_json()
@@ -229,7 +228,6 @@ class ConfirmProfitTakeApiTests(unittest.TestCase):
         self._post("/api/portfolio/confirm_profit", {"ticker": "AAA"})
 
         with mock.patch.object(app, "_build_riskoff_view", return_value={"active": False}), \
-             mock.patch.object(app, "_build_ai_market_env_view", return_value=None), \
              mock.patch.object(app.store, "get_last_refresh", return_value=None), \
              mock.patch.object(app.refresh, "remaining_td_budget", return_value=(10, 0)):
             # 何度リロード(再計算)しても、同じエピソードでは二度と出ない
