@@ -12,6 +12,7 @@ from flask import Flask, jsonify, request, render_template_string
 import beta_logic
 import comparison_logic
 import push_notify
+import q5_prior_mean_logic
 import quintile_logic
 import redis_store as store
 import stock_logic as logic
@@ -793,7 +794,10 @@ def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, tr
                "profit_value","sell_shares","sell_value","remaining_shares",
                "remaining_value"}](+50%利益100%利確ルール、design 2026-10-18。
                sharesが未入力の銘柄は金額系が全てNone)],
-             "buy": [{"ticker","suggested_price"}](free_slots件まで), "buy_candidates_total": int,
+             "buy": [{"ticker","suggested_price","prior_mean"(参考情報、design
+               2026-10-23、q5_prior_mean_logic.get_prior_meanの戻り値そのまま。
+               Q5判定・購入可否には一切関与しない表示専用の過去実績統計)}]
+               (free_slots件まで), "buy_candidates_total": int,
              "free_slots": int(SELL確定後・BUY判定に使う値),
              "held_count": int(現在の実際の保有数),
              "risk_off_active": bool, "recommended_ratio": float}
@@ -858,7 +862,14 @@ def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, tr
         yesterday_q = _resolve_q_for_date(history, yesterday) if yesterday else None
         is_day0 = (today_q == "Q5") and (yesterday_q != "Q5")
         if is_day0:
-            buy_candidates.append({"ticker": ticker, "suggested_price": row.get("price")})
+            # prior_mean(design 2026-10-23、ticker-reliability研究Phase1〜3で
+            # 検証済みの定義)は表示専用の参考情報であり、is_day0判定・
+            # buy_candidatesへの採否・この後のbuy_list=buy_candidates[:free_slots]
+            # の順序には一切影響しない(ここで追加するのは辞書の1キーのみ)。
+            prior_mean = q5_prior_mean_logic.get_prior_mean(ticker, anchor_date)
+            buy_candidates.append({
+                "ticker": ticker, "suggested_price": row.get("price"), "prior_mean": prior_mean,
+            })
 
     buy_list = buy_candidates[:free_slots]
 
@@ -1170,6 +1181,7 @@ details.logicinfo .small{margin-top:10px}
 .daction-rows{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:#475467;margin-bottom:10px}
 .daction-rows b{color:#172033;font-size:13.5px}
 .daction-note{font-size:12px;font-weight:700;color:#9a6a00;margin-bottom:8px}
+.daction-priormean{font-size:11.5px;font-weight:400;color:#8a94a6;margin-bottom:8px;cursor:help}
 .daction-row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .daction-price-input{width:110px;padding:8px 10px;border:1px solid #ccd2db;border-radius:10px;font-size:14px}
 .daction-btn{border:0;border-radius:10px;padding:9px 14px;font-weight:800;font-size:13px;cursor:pointer;color:#fff}
@@ -1448,11 +1460,27 @@ function dactionProfitCard(p, h){
   </div>`;
 }
 
+// 「Q5過去平均」(design 2026-10-23、ticker-reliability研究Phase1〜3で検証済みの
+// prior_mean、validation_ticker_reliability_q5メモリ参照)の表示専用ヘルパー。
+// あくまで参考情報であり、Q5判定・BUY判定そのものではないことが分かるように、
+// BUYバッジ・ティッカー名より目立たせない控えめな見た目(.daction-priormean、
+// グレー系)にする。prior_meanが未定義(古いキャッシュ応答等)の場合は何も出さない。
+function dactionPriorMeanHtml(pm){
+  if(!pm || !pm.status) return "";
+  const title = "過去のQ5 Day0後20営業日間の平均リターン(参考情報、Q5判定そのものではありません)";
+  if(pm.status === "insufficient"){
+    return `<div class="daction-priormean" title="${esc(title)}">Q5過去平均：データ不足${pm.n ? `(過去${pm.n}件)` : ""}</div>`;
+  }
+  const sign = pm.mean >= 0 ? "+" : "";
+  return `<div class="daction-priormean" title="${esc(title)}">Q5過去平均：${sign}${pm.mean}%（n=${pm.n}）</div>`;
+}
+
 function dactionBuyCard(b){
   const suggested = (b.suggested_price===null||b.suggested_price===undefined) ? "" : Number(b.suggested_price).toFixed(2);
   return `<div class="daction daction-buy">
     <div class="daction-head"><span class="daction-badge">🟢 BUY</span><span class="daction-ticker">${esc(b.ticker)}</span></div>
     <div class="daction-note">Q5 Day0</div>
+    ${dactionPriorMeanHtml(b.prior_mean)}
     <div class="daction-row-actions">
       <input class="daction-price-input" type="number" step="0.01" min="0.01"
              placeholder="取得価格" value="${esc(suggested)}" id="daction-price-${esc(b.ticker)}">

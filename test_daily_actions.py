@@ -286,5 +286,93 @@ class BoundaryValueTests(DailyActionsTestCase):
         self.assertTrue(any(s["ticker"] == "SELL2" and s["profit_eligible_too"] for s in result["sell"]))
 
 
+class PriorMeanDisplayIntegrationTests(DailyActionsTestCase):
+    """「Q5過去平均」追加表示(design 2026-10-23)の統合テスト。
+
+    prior_meanは表示専用の参考情報であり、is_day0判定・BUY候補の採否・
+    採用順序には一切影響しないことを検証する(絶対条件)。
+    q5_prior_mean_logic.get_prior_meanをmockして、どんな値が返っても
+    BUY判定そのものが変わらないことを確認する。
+    """
+
+    def _run_with_prior_mean(self, rows, positions, anchor_idx, prior_mean_by_ticker, riskoff_state=None):
+        portfolio_state = {"positions": positions, "last_updated": CAL[anchor_idx]}
+        patcher = mock.patch.object(
+            app.q5_prior_mean_logic, "get_prior_mean",
+            side_effect=lambda ticker, day0_date: prior_mean_by_ticker.get(
+                ticker, {"status": "insufficient", "n": 0, "mean": None}),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return app._compute_daily_actions(rows, portfolio_state, riskoff_state, CAL[anchor_idx], CAL)
+
+    def test_buy_candidate_includes_prior_mean_field_as_is(self):
+        anchor = 30
+        today = CAL[anchor]
+        rows = [_row("AAA", 100.0, _day0_history(today))]
+        pm_value = {"status": "ok", "n": 23, "mean": 4.2}
+        result = self._run_with_prior_mean(rows, {}, anchor, {"AAA": pm_value})
+        self.assertEqual(len(result["buy"]), 1)
+        self.assertEqual(result["buy"][0]["prior_mean"], pm_value)
+
+    def test_insufficient_prior_mean_is_passed_through_not_zero_filled(self):
+        anchor = 30
+        today = CAL[anchor]
+        rows = [_row("NEWTICKER", 100.0, _day0_history(today))]
+        result = self._run_with_prior_mean(
+            rows, {}, anchor, {"NEWTICKER": {"status": "insufficient", "n": 2, "mean": None}})
+        self.assertEqual(result["buy"][0]["prior_mean"]["status"], "insufficient")
+        self.assertIsNone(result["buy"][0]["prior_mean"]["mean"])
+
+    def test_negative_prior_mean_does_not_exclude_or_reorder_candidate(self):
+        """prior_meanがマイナスでもQ5 Day0は無効にならず、watchlist順も
+        変わらないことの確認(design絶対条件)。"""
+        anchor = 30
+        today = CAL[anchor]
+        rows = [_row("GOOD", 100.0, _day0_history(today)), _row("BAD", 100.0, _day0_history(today))]
+        # BADの方がprior_meanは大きくマイナスだが、watchlist順(GOOD→BAD)がそのまま採用順
+        prior_means = {
+            "GOOD": {"status": "ok", "n": 50, "mean": 20.0},
+            "BAD": {"status": "ok", "n": 50, "mean": -30.0},
+        }
+        result = self._run_with_prior_mean(rows, {}, anchor, prior_means)
+        self.assertEqual([b["ticker"] for b in result["buy"]], ["GOOD", "BAD"])  # 両方採用、順序も不変
+        self.assertEqual(result["buy_candidates_total"], 2)
+
+    def test_extremely_negative_prior_mean_does_not_shrink_free_slots_or_buy_list(self):
+        anchor = 30
+        today = CAL[anchor]
+        tickers = [f"T{i}" for i in range(8)]
+        rows = [_row(t, 100.0, _day0_history(today)) for t in tickers]
+        prior_means = {t: {"status": "ok", "n": 50, "mean": -99.0} for t in tickers}
+        result = self._run_with_prior_mean(rows, {}, anchor, prior_means)
+        # 既存のtest_case1と同じ結果(先頭6件採用)になること = prior_meanがどれだけ
+        # 悪くてもBUY候補の採否・件数・空き枠には一切影響しない
+        self.assertEqual(len(result["buy"]), 6)
+        self.assertEqual([b["ticker"] for b in result["buy"]], tickers[:6])
+        self.assertEqual(result["buy_candidates_total"], 8)
+
+    def test_prior_mean_lookup_receives_anchor_date_as_day0_date(self):
+        """get_prior_meanに渡すdate引数が、将来情報を含まない「今日(anchor_date)」
+        であることの確認(未来日付や過去の別日付を渡していないこと)。"""
+        anchor = 30
+        today = CAL[anchor]
+        rows = [_row("AAA", 100.0, _day0_history(today))]
+        received = {}
+
+        def _fake_get_prior_mean(ticker, day0_date):
+            received["ticker"] = ticker
+            received["day0_date"] = day0_date
+            return {"status": "ok", "n": 10, "mean": 1.0}
+
+        patcher = mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", side_effect=_fake_get_prior_mean)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        portfolio_state = {"positions": {}, "last_updated": today}
+        app._compute_daily_actions(rows, portfolio_state, None, today, CAL)
+        self.assertEqual(received["ticker"], "AAA")
+        self.assertEqual(received["day0_date"], today)
+
+
 if __name__ == "__main__":
     unittest.main()
