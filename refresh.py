@@ -269,21 +269,35 @@ AI_MARKET_DECLINE_BACKTEST_BUCKETS = [
 ]
 
 
-def _update_ai_market_decline_state(api_key, date_key):
+def _update_ai_market_decline_state(api_key, date_key, trading_date):
     """AI_UNIVERSE41銘柄を毎日逐次取得し、各銘柄の自己ATH(取得できた全期間の
     終値の最大値)からの下落率を計算して、AI_MARKET_DECLINE_THRESHOLD_PCT
     (30%)以上下落している銘柄の数・割合をRedisに保存する(表示専用、
-    design 2026-10-23)。
+    design 2026-10-23、2026-10-23に冪等判定を実取引日ベースへ修正)。
 
     既存のQ1〜Q5判定(quintile_logic.py)・購入/売却判定・Risk-off判定・
     AI一斉調整判定(_update_ai_market_env)には一切接続しない、完全に独立した
     追加計算。これらの既存ロジックが本関数の結果を参照することも一切ない。
 
-    冪等性: 当日分の「全銘柄同日取得済み」スナップショットが既に存在する
-    場合は再取得しない(prev["date"]==date_keyで判定)。まだ無い場合は
-    (前回が未達成だった場合を含む)毎回フルに41銘柄の取得を試みる
-    ("取りこぼし対策"の再実行cronが同日に複数回走っても、前回が不完全なら
-    再挑戦できるようにするため)。
+    date_key: Twelve Data予算カウンタ(incr_td_api_budget)用の壁時計日付
+    (_today_str())。Twelve Data側の予算リセットも暦日単位のため、これは
+    従来通り壁時計日付を使う。
+
+    trading_date: 本パネルのスナップショットの「実際の取引日」。run_quintile_refresh
+    が毎日必ず取得するSPYから導出済みの値(td_result["trading_date"])をmain()
+    からそのまま渡してもらう、追加のAPI呼び出しは発生しない。AI_UNIVERSE各銘柄も
+    SPYと同じ米国市場で取引されるため、「今日はもう同じ取引日のデータを
+    取得済みか」をSPYの取引日だけで判定できる。
+
+    2026-10-23修正(design): 以前は冪等判定にdate_key(壁時計日付)を使っていた
+    ため、UTC22:00の実行とUTC1:00の実行で日付がずれ、実際の取引日が進んで
+    いなくても41銘柄を無駄に再取得し、「時点」の表示も実データの取引日より
+    1日先に進んでしまう問題があった(2026-10-23の本番実行で確認済み)。
+    trading_date(prev["date"]との比較・保存とも)を使うことで、同じ取引日の
+    間は41銘柄を1件も取得せずに即座に前回のスナップショットを返せるようになり、
+    「時点」も実際の取引日と一致する。trading_dateがNone(SPY含め1件も取得
+    できなかった等、取引日を特定できない)場合は安全側に倒し、新規取得・保存を
+    一切行わず前回の状態をそのまま返す(架空の判定はしない)。
 
     AI_MARKET_DECLINE_REQUIRED_SUCCESS(既定41、全銘柄)に届かなかった日は、
     取得できた分も含めて一切Redisに書き込まない(古い値と新しい値が混在した
@@ -291,8 +305,10 @@ def _update_ai_market_decline_state(api_key, date_key):
     そのまま返す。生の株価履歴はRedisに保存しない(ATH・最新終値という
     軽量な計算結果のみ)。"""
     prev = store.get_ai_market_decline_state() or {}
-    if prev.get("date") == date_key:
-        return prev  # 当日分は既に全銘柄取得済み、再取得不要
+    if trading_date is None:
+        return prev  # 取引日を特定できない(SPY等が1件も取得できなかった)ため何もしない
+    if prev.get("date") == trading_date:
+        return prev  # 既に同じ実取引日のスナップショットを取得済み、41銘柄の再取得は不要
 
     existing_tickers = prev.get("tickers") or {}
     tickers_today = {}
@@ -316,7 +332,7 @@ def _update_ai_market_decline_state(api_key, date_key):
         tickers_today[ticker] = {
             "ath": max(prev_ath, max(closes)),
             "current_price": closes[-1],
-            "last_updated": date_key,
+            "last_updated": trading_date,
         }
 
     if len(tickers_today) < AI_MARKET_DECLINE_REQUIRED_SUCCESS:
@@ -331,7 +347,7 @@ def _update_ai_market_decline_state(api_key, date_key):
     n_pop = len(tickers_today)
     pct_down = round(n_down / n_pop * 100, 1)
     new_state = {
-        "date": date_key,
+        "date": trading_date,
         "n_down": n_down,
         "n_pop": n_pop,
         "pct_down": pct_down,
@@ -1518,8 +1534,14 @@ def main():
 
     # AI市場下落状況パネル(design 2026-10-23)。Q1〜Q5処理とは完全に独立した
     # 表示専用の追加計算で、失敗してもQ1〜5側の結果には一切影響しない。
+    # trading_date: Q1〜5側が毎日必ず取得するSPYから既に算出済みの実取引日
+    # (td_result["trading_date"])をそのまま再利用する(追加のAPI呼び出しは
+    # 発生しない、design 2026-10-23修正: 冪等判定を壁時計日付から実取引日へ)。
     try:
-        _update_ai_market_decline_state(td_api_key, _today_str())
+        _update_ai_market_decline_state(
+            td_api_key, _today_str(),
+            td_result.get("trading_date") if td_result else None,
+        )
     except Exception as e:
         print(f"[AI_DECLINE][WARN] 予期しないエラーが発生しました: {e}", file=sys.stderr)
 
