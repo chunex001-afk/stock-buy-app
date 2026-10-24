@@ -17,6 +17,7 @@ import quintile_logic
 import redis_store as store
 import stock_logic as logic
 import refresh
+import switch_recommendation_logic
 import twelvedata_client as td
 
 app = Flask(__name__)
@@ -775,9 +776,16 @@ def _compute_profit_take_amounts(shares, entry_price, current_price):
             "remaining_shares": remaining_shares, "remaining_value": remaining_value}
 
 
-def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, trading_calendar):
+def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, trading_calendar,
+                            ai_universe_daily_return=None):
     """「今日のアクション」をSELL→PROFIT→空き枠確定→BUYの順で判定する純粋関数。
     Redis・HTTPへのアクセスは一切行わない(呼び出し元が全て読み込んで渡す)。
+
+    ai_universe_daily_return(design 2026-10-24、Q5乗り換え推奨機能で追加した
+    引数): 当日のAI_UNIVERSE当日騰落率(%)。store.get_ai_market_decline_state()
+    の"ai_universe_daily_return"キーをそのまま渡す想定。省略時(None)は
+    switch_recommendation.active=Falseになるだけで、他の判定(SELL/PROFIT/
+    BUY)には一切影響しない(既存の呼び出し・既存テストはそのまま動く)。
 
     rows: _build_rowが組み立てた監視銘柄一覧。**watchlist登録順(sort_rowsで
     並び替える前の順)で渡すこと**(同日に複数Q5 Day0が出て空き枠を超えた場合、
@@ -800,7 +808,9 @@ def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, tr
                (free_slots件まで), "buy_candidates_total": int,
              "free_slots": int(SELL確定後・BUY判定に使う値),
              "held_count": int(現在の実際の保有数),
-             "risk_off_active": bool, "recommended_ratio": float}
+             "risk_off_active": bool, "recommended_ratio": float,
+             "switch_recommendation": switch_recommendation_logic.compute_switch_recommendationの
+               戻り値そのまま(design 2026-10-24、表示専用。自動乗り換えは行わない)}
 
     状態遷移(IMPLEMENTATION_DESIGN_daily_action_ui.md 7節で確認済み):
     - 保有銘柄が再びDay0になってもBUY候補にしない(ticker in positionsで除外)
@@ -876,6 +886,14 @@ def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, tr
     risk_off_active = bool(riskoff_state and riskoff_state.get("active"))
     recommended_ratio = (riskoff_state or {}).get("ratio", 1.0) if risk_off_active else 1.0
 
+    # Q5乗り換え推奨(design 2026-10-24)。free_slots truncation前のbuy_candidates
+    # (=既存のis_day0判定・既存のwatchlist順そのまま)を渡す。乗り換え推奨は
+    # 「空き枠があるかどうか」とは無関係(既存BUY判定・buy_listの中身には
+    # 一切影響しない、完全に別系統の読み取り専用判定)。
+    switch_recommendation = switch_recommendation_logic.compute_switch_recommendation(
+        buy_candidates, positions, ai_universe_daily_return,
+    )
+
     return {
         "sell": sell_list,
         "profit": profit_list,
@@ -885,6 +903,7 @@ def _compute_daily_actions(rows, portfolio_state, riskoff_state, anchor_date, tr
         "held_count": held_count,
         "risk_off_active": risk_off_active,
         "recommended_ratio": recommended_ratio,
+        "switch_recommendation": switch_recommendation,
     }
 
 
@@ -897,7 +916,13 @@ def _build_portfolio_view():
     ベースの計算を再利用しており(design 2026-10-18、保有期間表示機能)、
     値そのものは元から計算済みだった(今回新規に追加した計算ではない)。
     hold_days(=HOLD_DAYS定数)はPF一覧側の表示用に追加しただけで、
-    SELL判定ロジック自体はここでは一切行わない・変更しない。"""
+    SELL判定ロジック自体はここでは一切行わない・変更しない。
+
+    prior_mean(design 2026-10-24、Q5 Day0購入銘柄への参考情報表示拡張):
+    既存のq5_prior_mean_logic.get_prior_mean(ticker, entry_date)をそのまま
+    呼ぶだけ(entry_date=購入時のQ5 Day0日付をカットオフとして使う、新しい
+    prior_mean計算ロジックは作らない)。entry_price・gain_pct等の既存の
+    損益計算には一切影響しない追加フィールド。"""
     state = store.get_portfolio_state()
     positions = (state or {}).get("positions") or {}
     trading_calendar = _trading_days_calendar()
@@ -912,17 +937,50 @@ def _build_portfolio_view():
         days_held = (today_idx - entry_idx) if (today_idx is not None and entry_idx is not None) else None
         shares = pos.get("shares")
         current_value = (shares * price) if (shares and price is not None) else None
+        entry_date = pos.get("entry_date")
+        prior_mean = (q5_prior_mean_logic.get_prior_mean(ticker, entry_date) if entry_date
+                      else {"status": "insufficient", "n": 0, "mean": None})
         holdings.append({
-            "ticker": ticker, "entry_date": pos.get("entry_date"), "entry_price": entry_price,
+            "ticker": ticker, "entry_date": entry_date, "entry_price": entry_price,
             "current_price": price, "gain_pct": gain_pct, "days_held": days_held,
             "profit_taken": bool(pos.get("profit_taken")),
             "shares": shares, "current_value": current_value,
             "profit_take_sold_shares": pos.get("profit_take_sold_shares"),
             "profit_take_sold_value": pos.get("profit_take_sold_value"),
+            "prior_mean": prior_mean,
         })
 
     return {"holdings": holdings, "held_count": len(positions), "max_positions": MAX_POSITIONS,
              "hold_days": HOLD_DAYS}
+
+
+def _build_current_q5_prior_means(rows, anchor_date):
+    """現在Q5状態にある銘柄(保有中かどうかは問わない、watchlist全体が対象)の
+    prior_mean参考情報を組み立てる(design 2026-10-24)。
+
+    「Q5になった日」ではなく、anchor_date(通常は最新の取引日)を基準日として
+    q5_prior_mean_logic.get_prior_meanをそのまま呼ぶ(ユーザー確定仕様:
+    「現在その銘柄に紐づいている最新のprior_mean」)。新しいQ1〜Q5判定・
+    新しいprior_mean計算ロジックは一切作らない。既存のrows構造
+    (row["quintile"]["status"]/["history"])と、_compute_daily_actionsが
+    既に使っている_resolve_q_for_dateをそのまま再利用するだけの読み取り
+    専用関数(既存のQ1〜Q5カードの表示・判定には一切接続しない、別の
+    レスポンスキーとして追加するだけ)。
+
+    戻り値: [{"ticker", "prior_mean": {"status","n","mean"}}, ...]
+    (rowsの順序のまま、現在Q5の銘柄のみ)。"""
+    result = []
+    for row in rows:
+        q = row.get("quintile") or {}
+        if q.get("status") != "ready":
+            continue
+        history = q.get("history") or []
+        current_q = _resolve_q_for_date(history, anchor_date)
+        if current_q != "Q5":
+            continue
+        ticker = row.get("ticker")
+        result.append({"ticker": ticker, "prior_mean": q5_prior_mean_logic.get_prior_mean(ticker, anchor_date)})
+    return result
 
 
 def _get_watchlist():
@@ -1177,6 +1235,15 @@ details.logicinfo .small{margin-top:10px}
 .daction-sell .daction-badge{background:#b42318;color:#fff}
 .daction-profit .daction-badge{background:#9a6a00;color:#fff}
 .daction-buy .daction-badge{background:#087443;color:#fff}
+/* Q5乗り換え推奨(design 2026-10-24)。既存のBUY(緑)・SELL(赤)・PROFIT(黄)
+   とは別系統の表示であることが分かるよう、紫系の配色にする。あくまで表示・
+   提案のみで、自動売買・自動乗り換えは一切行わない。 */
+.daction-switch{background:#f1ecfb;border:1px solid #d9c9f5}
+.daction-switch .daction-badge{background:#6b3fa0;color:#fff}
+.daction-switch-desc{font-size:12.5px;color:#475467;margin-bottom:10px}
+.daction-switch-list{display:flex;flex-direction:column;gap:8px}
+.daction-switch-item{background:#ffffffb3;border-radius:10px;padding:8px 10px;display:flex;gap:12px;flex-wrap:wrap;align-items:baseline}
+.daction-switch-item .daction-ticker{font-size:14px}
 .daction-ticker{font-weight:900;font-size:18px}
 .daction-rows{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:#475467;margin-bottom:10px}
 .daction-rows b{color:#172033;font-size:13.5px}
@@ -1208,6 +1275,16 @@ details.logicinfo .small{margin-top:10px}
 .pfstatus-hold-normal{color:#172033;font-weight:800}
 .pfstatus-hold-warn{color:#9a6a00;font-weight:800}
 .pfstatus-hold-sell{color:#b42318;font-weight:900}
+/* 現在Q5銘柄のprior_mean参考情報パネル(design 2026-10-24)。保有有無を
+   問わない、watchlist全体の「現在Q5」一覧。既存のQ1〜Q5カードとは別の、
+   読み取り専用の追加パネル。 */
+#currentQ5PriorMeans{margin-bottom:18px}
+.currentq5pm{background:white;border-radius:16px;padding:14px 16px;box-shadow:0 2px 14px #0000000c}
+.currentq5pm-head{font-weight:900;font-size:14px;margin-bottom:8px}
+.currentq5pm-row{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;padding:6px 0;border-top:1px solid #eef1f5;font-size:12.5px;color:#475467}
+.currentq5pm-row:first-of-type{border-top:none}
+.currentq5pm-ticker{font-weight:900;font-size:13.5px;color:#172033;min-width:52px}
+.currentq5pm-empty{color:#98a2b3;font-size:12.5px}
 /* 取得情報(取得単価・取得日)の訂正フォーム(design 2026-10-20)。 */
 .pfedit-togglebtn{background:#eef1f5;color:#172033;border:0;border-radius:10px;padding:6px 10px;font-weight:700;font-size:11.5px;cursor:pointer}
 .pfedit-form{display:flex;gap:10px;flex-wrap:wrap;align-items:end;padding:10px 0 12px;border-top:1px dashed #dde2e8}
@@ -1260,6 +1337,7 @@ details.cmp-details .cmp-note:first-child{margin-top:6px}
 <div id="aimarketdecline"></div>
 <div id="dailyActions"></div>
 <div id="portfolioStatus"></div>
+<div id="currentQ5PriorMeans"></div>
 <div id="comparePanel"></div>
 <div class="title">📊 保有銘柄のQ1〜Q5状態</div>
 <div id="tickerCount" class="tickercount"></div>
@@ -1494,6 +1572,29 @@ function dactionBuyCard(b){
   </div>`;
 }
 
+// Q5乗り換え推奨(design 2026-10-24)。既存BUYカードとは完全に別のカードとして
+// 描画する(BUYバッジ・BUY判定・free_slots/buy_listの中身には一切影響しない)。
+// 自動売買・自動乗り換えは一切行わない(ボタン・確認アクションを持たない、
+// 純粋な参考表示)。
+function dactionSwitchCard(sw){
+  const items = (sw.candidates || []).map(c => {
+    const sign = (c.prior_mean >= 0) ? "+" : "";
+    return `<div class="daction-switch-item">
+      <span class="daction-ticker">${esc(c.ticker)}</span>
+      <span>Q5 Day0</span>
+      <span>prior_mean <b>${sign}${esc(c.prior_mean)}%</b></span>
+      <span>prior_n <b>${esc(c.prior_n)}</b></span>
+    </div>`;
+  }).join("");
+  const ret = sw.ai_universe_daily_return;
+  const retTxt = (ret===null||ret===undefined) ? "—" : (ret>=0?"+":"") + Number(ret).toFixed(2) + "%";
+  return `<div class="daction daction-switch">
+    <div class="daction-head"><span class="daction-badge">🔄 乗り換え推奨</span></div>
+    <div class="daction-switch-desc">AI市場が当日${esc(retTxt)}と弱い状況（閾値${esc(sw.threshold_pct)}%以下）で、乗り換え条件を満たす新しいQ5 Day0銘柄があります。</div>
+    <div class="daction-switch-list">${items}</div>
+  </div>`;
+}
+
 function renderDailyActions(da, portfolio){
   const el = document.getElementById("dailyActions");
   if(!el) return;
@@ -1501,8 +1602,13 @@ function renderDailyActions(da, portfolio){
   const holdingsByTicker = {};
   ((portfolio && portfolio.holdings) || []).forEach(h => { holdingsByTicker[h.ticker] = h; });
 
-  // 表示優先順位: SELL → PROFIT → BUY(daily_actions側の計算順をそのまま使う)
+  // 表示優先順位: 乗り換え推奨(参考情報) → SELL → PROFIT → BUY
+  // (daily_actions側の計算順をそのまま使う、switch_recommendationはactiveの
+  // 時だけ先頭に追加するだけで、SELL/PROFIT/BUYの判定・並び順は無変更)
   const cards = [];
+  if(da.switch_recommendation && da.switch_recommendation.active){
+    cards.push(dactionSwitchCard(da.switch_recommendation));
+  }
   (da.sell || []).forEach(s => cards.push(dactionSellCard(s, holdingsByTicker[s.ticker])));
   (da.profit || []).forEach(p => cards.push(dactionProfitCard(p, holdingsByTicker[p.ticker])));
   (da.buy || []).forEach(b => cards.push(dactionBuyCard(b)));
@@ -1510,6 +1616,24 @@ function renderDailyActions(da, portfolio){
   el.innerHTML = cards.length
     ? cards.join("")
     : `<div class="daction daction-none">今日は売買アクションはありません</div>`;
+}
+
+// 現在Q5銘柄のprior_mean参考情報パネル(design 2026-10-24)。既存のQ1〜Q5
+// カード・daily_actionsとは別の、読み取り専用の追加パネル。dactionPriorMeanHtml
+// (既存のBUYカードで使っているヘルパー)をそのまま再利用し、新しい表示ロジックは
+// 作らない。
+function renderCurrentQ5PriorMeans(list){
+  const el = document.getElementById("currentQ5PriorMeans");
+  if(!el) return;
+  if(!list){ el.innerHTML = ""; return; }
+  const rows = list.map(item => `<div class="currentq5pm-row">
+    <span class="currentq5pm-ticker">${esc(item.ticker)}</span>
+    ${dactionPriorMeanHtml(item.prior_mean)}
+  </div>`).join("");
+  el.innerHTML = `<div class="currentq5pm">
+    <div class="currentq5pm-head">現在Q5の銘柄</div>
+    ${rows || `<div class="currentq5pm-empty">現在Q5の銘柄はありません</div>`}
+  </div>`;
 }
 
 // 取得情報(取得単価・取得日)の訂正機能(design 2026-10-20)。実際の購入日/
@@ -1637,6 +1761,7 @@ function renderPortfolioStatus(portfolio){
       ${h.profit_taken ? `<span class="pfstatus-taken">PROFIT済み(原本のみ保有中)</span>` : ""}
       ${editToggleBtn}
       ${sellToggleBtn}
+      ${dactionPriorMeanHtml(h.prior_mean)}
     </div>${editForm}${sellForm}`;
   }).join("");
   el.innerHTML = `<div class="pfstatus">
@@ -1877,6 +2002,7 @@ async function updateRanking(extraMsg){
     renderAiMarketDecline(j.ai_market_decline, j.risk_off);
     renderDailyActions(j.daily_actions, j.portfolio);
     renderPortfolioStatus(j.portfolio);
+    renderCurrentQ5PriorMeans(j.current_q5_prior_means);
     renderQ5Momentum(j.q5_momentum);
     renderOpInfo(j);
     renderTickerCount(j);
@@ -2978,12 +3104,27 @@ def ranking():
         # 一切変更を加えない、読み取り専用の追加キー。trading_calendarが空
         # (初回デプロイ直後等)の場合は判定基準日が無いためdaily_actionsはNone
         # のままとする(架空の判定は作らない)。
+        # Q5乗り換え推奨(design 2026-10-24)が使うAI_UNIVERSE当日騰落率。
+        # refresh._update_ai_market_decline_stateが既存のATH取得データから
+        # 追加計算した値をそのまま読むだけ(新規API呼び出しなし)。未計算
+        # (初回デプロイ直後・取得失敗等)の場合はNoneのままとなり、
+        # switch_recommendation_logicが「条件②を満たさない」として扱う。
+        ai_market_decline_state = store.get_ai_market_decline_state()
+        ai_universe_daily_return = (ai_market_decline_state or {}).get("ai_universe_daily_return")
+
         daily_actions = None
         if trading_calendar:
             daily_actions = _compute_daily_actions(
                 rows_watchlist_order, store.get_portfolio_state(), store.get_riskoff_state(),
-                trading_calendar[-1], trading_calendar,
+                trading_calendar[-1], trading_calendar, ai_universe_daily_return,
             )
+
+        # 現在Q5銘柄のprior_mean参考情報(design 2026-10-24)。既存のQ1〜Q5判定・
+        # rows・ソート順には一切変更を加えない、読み取り専用の追加キー。
+        current_q5_prior_means = (
+            _build_current_q5_prior_means(rows_watchlist_order, trading_calendar[-1])
+            if trading_calendar else None
+        )
 
         return jsonify({
             "ok": True,
@@ -2993,6 +3134,7 @@ def ranking():
             "ai_market_decline": _build_ai_market_decline_view(),
             "daily_actions": daily_actions,
             "portfolio": _build_portfolio_view(),
+            "current_q5_prior_means": current_q5_prior_means,
             "last_refresh": last_refresh_view,
             "budget": {"used": used, "limit": td.DAILY_API_BUDGET, "remaining": budget_left},
             "max_tickers": logic.MAX_TICKERS,

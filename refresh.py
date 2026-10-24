@@ -25,6 +25,7 @@ twelvedata_client経由になり、旧指標(stock_logic.build_result、株価�
 
 import bisect
 import os
+import statistics
 import sys
 from datetime import datetime, timezone
 
@@ -323,10 +324,16 @@ def _update_ai_market_decline_state(api_key, date_key, trading_date):
         if not closes:
             continue
         prev_ath = (existing_tickers.get(ticker) or {}).get("ath") or 0
+        # daily_ret(design 2026-10-24、Q5乗り換え推奨機能で使う「AI_UNIVERSE
+        # 当日騰落率」の元データ)は、この関数が既に取得済みのclosesから
+        # closes[-1]/closes[-2]-1で計算するだけで、追加のAPI呼び出しは発生
+        # しない。ATH・current_priceの既存計算には一切影響しない追加フィールド。
+        daily_ret = (closes[-1] / closes[-2] - 1) * 100 if len(closes) >= 2 and closes[-2] else None
         tickers_today[ticker] = {
             "ath": max(prev_ath, max(closes)),
             "current_price": closes[-1],
             "last_updated": trading_date,
+            "daily_ret": daily_ret,
         }
 
     if len(tickers_today) < AI_MARKET_DECLINE_REQUIRED_SUCCESS:
@@ -340,12 +347,22 @@ def _update_ai_market_decline_state(api_key, date_key, trading_date):
     )
     n_pop = len(tickers_today)
     pct_down = round(n_down / n_pop * 100, 1)
+    # ai_universe_daily_return(design 2026-10-24、Q5乗り換え推奨機能専用の
+    # 追加フィールド): AI_UNIVERSE41銘柄の当日騰落率(daily_ret)の単純平均
+    # (等加重)。市場環境バイアス研究・最終検証(本リポジトリ外のバックテスト)
+    # で使われた定義と同一(当日終値ベース、未来データ不使用)。41銘柄すべて
+    # 成功した日だけ保存される既存のゲート(AI_MARKET_DECLINE_REQUIRED_SUCCESS)
+    # をそのまま使うため、ここでも「全銘柄分のdaily_retが既に揃っている」
+    # 前提で計算できる。n_down/pct_down等の既存フィールドの意味は一切変えない。
+    daily_rets = [t["daily_ret"] for t in tickers_today.values() if t["daily_ret"] is not None]
+    ai_universe_daily_return = round(statistics.mean(daily_rets), 3) if daily_rets else None
     new_state = {
         "date": trading_date,
         "n_down": n_down,
         "n_pop": n_pop,
         "pct_down": pct_down,
         "tickers": tickers_today,
+        "ai_universe_daily_return": ai_universe_daily_return,
     }
     store.set_ai_market_decline_state(new_state)
     print(f"[AI_DECLINE][OK] {n_down}/{n_pop}銘柄が自己ATHから{AI_MARKET_DECLINE_THRESHOLD_PCT:.0f}%以上下落 ({pct_down}%)")
