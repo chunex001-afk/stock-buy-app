@@ -967,8 +967,18 @@ def _build_current_q5_prior_means(rows, anchor_date):
     専用関数(既存のQ1〜Q5カードの表示・判定には一切接続しない、別の
     レスポンスキーとして追加するだけ)。
 
-    戻り値: [{"ticker", "prior_mean": {"status","n","mean"}}, ...]
-    (rowsの順序のまま、現在Q5の銘柄のみ)。"""
+    戻り値: [{"ticker", "prior_mean": {"status","n","mean"},
+              "prior_stats": {"status","n","mean","median","win_rate",
+              "max_dd_mean","max_dd_median"}}, ...]  (rowsの順序のまま、
+    現在Q5の銘柄のみ)。
+
+    prior_stats(design 2026-10-25追加): 中央値・勝率・平均最大DD・中央値最大DD
+    を追加表示するための参考情報。既存のprior_meanフィールド・その計算方法
+    (q5_prior_mean_logic.get_prior_mean、無変更)はそのまま。prior_statsは
+    新規関数q5_prior_mean_logic.get_prior_statsを呼ぶだけで、prior_meanと
+    完全に同じ母集団(同じticker・同じanchor_date)から計算される。Q1〜Q5判定・
+    BUY判定・ranking・20営業日保有ルール・Risk-off・switch_recommendation_logic
+    のいずれにも使われない、表示・研究専用の追加情報。"""
     result = []
     for row in rows:
         q = row.get("quintile") or {}
@@ -979,7 +989,11 @@ def _build_current_q5_prior_means(rows, anchor_date):
         if current_q != "Q5":
             continue
         ticker = row.get("ticker")
-        result.append({"ticker": ticker, "prior_mean": q5_prior_mean_logic.get_prior_mean(ticker, anchor_date)})
+        result.append({
+            "ticker": ticker,
+            "prior_mean": q5_prior_mean_logic.get_prior_mean(ticker, anchor_date),
+            "prior_stats": q5_prior_mean_logic.get_prior_stats(ticker, anchor_date),
+        })
     return result
 
 
@@ -997,8 +1011,15 @@ def _build_watchlist_prior_means(tickers, anchor_date):
     登録順をそのまま維持する)の順序そのまま。
 
     戻り値: [{"ticker", "prior_mean": {"status","n","mean"},
+              "prior_stats": {"status","n","mean","median","win_rate",
+              "max_dd_mean","max_dd_median"},
               "in_reference_universe": bool(q5_prior_mean_reference.jsonの
-              48銘柄に存在するか)}, ...]  (tickersと同じ順序・同じ件数)。"""
+              48銘柄に存在するか)}, ...]  (tickersと同じ順序・同じ件数)。
+
+    prior_stats(design 2026-10-25追加)は_build_current_q5_prior_meansと同様、
+    q5_prior_mean_logic.get_prior_stats(新規関数、get_prior_mean無変更)を
+    呼ぶだけで、prior_meanと完全に同じ母集団から計算される表示・研究専用の
+    追加情報。"""
     data = q5_prior_mean_logic.load_reference_data()
     events_by_ticker = data.get("events_by_ticker", {})
     result = []
@@ -1006,6 +1027,7 @@ def _build_watchlist_prior_means(tickers, anchor_date):
         result.append({
             "ticker": ticker,
             "prior_mean": q5_prior_mean_logic.get_prior_mean(ticker, anchor_date, data=data),
+            "prior_stats": q5_prior_mean_logic.get_prior_stats(ticker, anchor_date, data=data),
             "in_reference_universe": ticker in events_by_ticker,
         })
     return result
@@ -1277,6 +1299,10 @@ details.logicinfo .small{margin-top:10px}
 .daction-rows b{color:#172033;font-size:13.5px}
 .daction-note{font-size:12px;font-weight:700;color:#9a6a00;margin-bottom:8px}
 .daction-priormean{font-size:11.5px;font-weight:400;color:#8a94a6;margin-bottom:8px;cursor:help}
+/* 中央値・勝率・平均最大DD(design 2026-10-25)。daction-priormeanの2行目相当、
+   同じ控えめな見た目(グレー系・小さめ)にする。既存のdaction-priormean自体の
+   スタイルは変更しない。 */
+.daction-priorstats{font-size:11px;font-weight:400;color:#98a2b3;margin-top:-4px;margin-bottom:8px;cursor:help}
 .daction-row-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .daction-price-input{width:110px;padding:8px 10px;border:1px solid #ccd2db;border-radius:10px;font-size:14px}
 .daction-btn{border:0;border-radius:10px;padding:9px 14px;font-weight:800;font-size:13px;cursor:pointer;color:#fff}
@@ -1313,6 +1339,11 @@ details.logicinfo .small{margin-top:10px}
 .currentq5pm-row:first-of-type{border-top:none}
 .currentq5pm-ticker{font-weight:900;font-size:13.5px;color:#172033;min-width:52px}
 .currentq5pm-empty{color:#98a2b3;font-size:12.5px}
+/* 中央値・勝率・平均最大DD(design 2026-10-25)を常に独立した行にする
+   (flex-basis:100%でcurrentq5pm-row内の折り返しを強制、画面幅に依存しない)。
+   daction-priormean/daction-priorstats自体の既定スタイルは変更しない。 */
+.currentq5pm-row .daction-priormean{flex-basis:100%;margin-bottom:0}
+.currentq5pm-row .daction-priorstats{flex-basis:100%;margin-top:0;margin-bottom:0}
 /* watchlist全銘柄のprior_mean一覧(design 2026-10-25)。登録段階での事前確認用、
    読み取り専用パネル。◎○✕等の最終判定しきい値はまだ無く、マイナス/データ不足/
    対象外を目立たせるだけの最小限の配色。 */
@@ -1329,6 +1360,9 @@ details.logicinfo .small{margin-top:10px}
 .wlpm-table .wlpm-flag-warn{color:#b42318;font-weight:700}
 .wlpm-table .wlpm-flag-none{color:#98a2b3}
 .wlpm-empty{color:#98a2b3;font-size:12.5px}
+/* 中央値・勝率・平均最大DD(design 2026-10-25)。1ティッカーにつき1行追加する
+   サブ行(prior_statsがok時のみ描画、insufficient時は行自体が出ない)。 */
+.wlpm-table tr.wlpm-statsrow td{padding-top:0;padding-bottom:8px;color:#98a2b3;font-size:11px}
 /* 取得情報(取得単価・取得日)の訂正フォーム(design 2026-10-20)。 */
 .pfedit-togglebtn{background:#eef1f5;color:#172033;border:0;border-radius:10px;padding:6px 10px;font-weight:700;font-size:11.5px;cursor:pointer}
 .pfedit-form{display:flex;gap:10px;flex-wrap:wrap;align-items:end;padding:10px 0 12px;border-top:1px dashed #dde2e8}
@@ -1598,6 +1632,20 @@ function dactionPriorMeanHtml(pm){
   return `<div class="daction-priormean" title="${esc(title)}">Q5過去平均：${sign}${pm.mean}%（n=${pm.n}）</div>`;
 }
 
+// 中央値・勝率・平均最大DD(design 2026-10-25、表示・研究専用の追加統計、
+// q5_prior_mean_logic.get_prior_stats)の2行目表示ヘルパー。既存の
+// dactionPriorMeanHtml(1行目、prior_mean)のラベル・計算・呼び出し箇所は
+// 一切変更しない、完全に独立した追加関数。prior_statsがinsufficientの場合は
+// 何も出さない(prior_meanが「データ不足」表示になるのと常に同じタイミング、
+// 同一母集団・同一n判定のため)。
+function dactionPriorStatsHtml(stats){
+  if(!stats || !stats.status || stats.status === "insufficient") return "";
+  const msign = stats.median >= 0 ? "+" : "";
+  const dsign = stats.max_dd_mean >= 0 ? "+" : "";
+  const title = "同じQ5 Day0イベント群の中央値・勝率(ret20>0の割合)・平均最大DD(参考情報)";
+  return `<div class="daction-priorstats" title="${esc(title)}">中央値 ${msign}${stats.median}%｜勝率 ${stats.win_rate}%｜平均最大DD ${dsign}${stats.max_dd_mean}%</div>`;
+}
+
 function dactionBuyCard(b){
   const suggested = (b.suggested_price===null||b.suggested_price===undefined) ? "" : Number(b.suggested_price).toFixed(2);
   return `<div class="daction daction-buy">
@@ -1674,6 +1722,7 @@ function renderCurrentQ5PriorMeans(list){
   const rows = list.map(item => `<div class="currentq5pm-row">
     <span class="currentq5pm-ticker">${esc(item.ticker)}</span>
     ${dactionPriorMeanHtml(item.prior_mean)}
+    ${dactionPriorStatsHtml(item.prior_stats)}
   </div>`).join("");
   el.innerHTML = `<div class="currentq5pm">
     <div class="currentq5pm-head">現在Q5の銘柄</div>
@@ -1693,6 +1742,16 @@ function wlpmMeanCellHtml(pm){
   const cls = pm.mean < 0 ? "wlpm-mean-neg" : "wlpm-mean-pos";
   return `<td class="${cls}">${sign}${esc(pm.mean)}%</td><td>${esc(pm.n)}</td>`;
 }
+// 中央値・勝率・平均最大DD(design 2026-10-25)の2行目。prior_statsが
+// insufficientの場合(=prior_meanも常にinsufficient、同一母集団・同一n判定の
+// ため)は何も出さない(1行目のみ、既存表示のまま)。表を崩さないよう、
+// 1ティッカーにつき1行追加する(colspan、既存の4列構成はそのまま)。
+function wlpmStatsRowHtml(stats){
+  if(!stats || !stats.status || stats.status === "insufficient") return "";
+  const msign = stats.median >= 0 ? "+" : "";
+  const dsign = stats.max_dd_mean >= 0 ? "+" : "";
+  return `<tr class="wlpm-statsrow"><td></td><td colspan="3">中央値 ${msign}${stats.median}%｜勝率 ${stats.win_rate}%｜平均最大DD ${dsign}${stats.max_dd_mean}%</td></tr>`;
+}
 function renderWatchlistPriorMeans(list, anchorDate){
   const el = document.getElementById("watchlistPriorMeans");
   if(!el) return;
@@ -1706,7 +1765,7 @@ function renderWatchlistPriorMeans(list, anchorDate){
       <td class="wlpm-ticker">${esc(item.ticker)}</td>
       ${wlpmMeanCellHtml(item.prior_mean)}
       <td>${refFlag}</td>
-    </tr>`;
+    </tr>${wlpmStatsRowHtml(item.prior_stats)}`;
   }).join("");
   el.innerHTML = `<div class="wlpm">
     <div class="wlpm-head">監視銘柄のQ5過去平均(登録段階チェック用)</div>

@@ -46,18 +46,46 @@ def _insufficient_pm(n=3):
     return {"status": "insufficient", "n": n, "mean": None}
 
 
+def _insufficient_stats(n=0):
+    # ticker "AAA"等は実データ(q5_prior_mean_reference.json)に存在しない
+    # ため、get_prior_statsをmockしないテストではこの形がそのまま返る
+    # (design 2026-10-25追加のprior_statsフィールド、get_prior_mean無変更の
+    # 証跡としてここでも実データをそのまま使う)。
+    return {"status": "insufficient", "n": n, "mean": None, "median": None,
+            "win_rate": None, "max_dd_mean": None, "max_dd_median": None}
+
+
 # ---------------------------------------------------------------------------
 # ② 現在Q5となっている銘柄(保有有無を問わない)
 # ---------------------------------------------------------------------------
 
 class BuildCurrentQ5PriorMeansTests(unittest.TestCase):
     def test_ticker_currently_q5_gets_prior_mean(self):
+        # design 2026-10-25: prior_statsフィールドが追加されたが、ticker "AAA"は
+        # 実データに存在しないためinsufficientがそのまま返る(get_prior_mean側は
+        # 従来通りmockで固定値を返すが、get_prior_stats側は本物のq5_prior_mean_
+        # reference.jsonを参照する独立した経路であることの証跡でもある)。
         rows = [_row("AAA", [{"date": CAL[10], "q": "Q5"}])]
         with mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(2.4, 31)) as m:
             result = app._build_current_q5_prior_means(rows, CAL[20])
-        self.assertEqual(result, [{"ticker": "AAA", "prior_mean": _ok_pm(2.4, 31)}])
+        self.assertEqual(result, [{"ticker": "AAA", "prior_mean": _ok_pm(2.4, 31), "prior_stats": _insufficient_stats()}])
         # 「Q5になった日」ではなく、anchor_date(最新取引日)を基準日に使うこと
         m.assert_called_once_with("AAA", CAL[20])
+
+    def test_existing_prior_mean_field_and_label_unchanged_by_stats_addition(self):
+        # 11. 既存prior_mean表示が変わっていないこと: get_prior_meanの呼び出し
+        # 方法・戻り値の扱いは従来通りで、prior_statsは追加フィールドとしてのみ
+        # 存在すること。
+        rows = [_row("AAA", [{"date": CAL[10], "q": "Q5"}])]
+        with mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(2.4, 31)) as mean_mock, \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_stats") as stats_mock:
+            stats_mock.return_value = {"status": "ok", "n": 31, "mean": 2.4, "median": 2.0,
+                                        "win_rate": 60.0, "max_dd_mean": -8.0, "max_dd_median": -7.0}
+            result = app._build_current_q5_prior_means(rows, CAL[20])
+        self.assertEqual(result[0]["prior_mean"], _ok_pm(2.4, 31))
+        self.assertEqual(result[0]["prior_stats"]["median"], 2.0)
+        mean_mock.assert_called_once_with("AAA", CAL[20])
+        stats_mock.assert_called_once_with("AAA", CAL[20])
 
     def test_ticker_currently_not_q5_is_excluded(self):
         rows = [_row("AAA", [{"date": CAL[10], "q": "Q4"}])]

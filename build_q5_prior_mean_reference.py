@@ -19,6 +19,16 @@ Phase1〜3研究(validation_ticker_reliability_q5メモリ参照)で確立した
 イベント一覧)。元データの取得・Q5判定ロジック自体はここでは一切再計算しない
 (既存の計算結果をそのまま抜き出すだけ)。
 
+2026-10-25(design: 中央値・勝率・平均最大DD追加)、同じ研究セッションscratchpad
+のday0_events_full.json(各イベントのfwd_closes=Day0〜Day0+20営業日の21点の
+日次終値)から、各イベントのmax_dd20(Day0終値を基準に、以降20営業日の終値の
+うち最も下落した時点のリターン%、Day0自身は対象外・終値ベース)を追加で計算し、
+events_by_tickerの各イベントに"max_dd20"フィールドとして追加する。既存の
+date/ret20フィールドの値・個数は一切変更しない(実装前に、danger_features.json
+由来の5,848件全件がday0_events_full.jsonに完全一致で存在し、fwd_closesが
+全件21点揃っており、fwd_closesから再計算したret20が既存ret20と全件(5,848件、
+最大誤差0.0)完全一致することを確認済み)。
+
 実行方法: python build_q5_prior_mean_reference.py
 """
 import json
@@ -27,6 +37,11 @@ from collections import defaultdict
 SOURCE_PATH = (
     r"C:\Users\chune\AppData\Local\Temp\claude\C--Users-chune-stock-buy-app"
     r"\1ee90faf-d5af-43c3-b921-44f69a7aa5fe\scratchpad\q5_aiadj_ratio\danger_features.json"
+)
+# 2026-10-25追加: max_dd20計算用の日次終値パス(fwd_closes)の出典。
+DRAWDOWN_SOURCE_PATH = (
+    r"C:\Users\chune\AppData\Local\Temp\claude\C--Users-chune-stock-buy-app"
+    r"\1ee90faf-d5af-43c3-b921-44f69a7aa5fe\scratchpad\q5_aiadj_ratio\day0_events_full.json"
 )
 OUTPUT_PATH = "q5_prior_mean_reference.json"
 
@@ -37,13 +52,34 @@ OUTPUT_PATH = "q5_prior_mean_reference.json"
 MIN_PRIOR_N = 10
 
 
+def _max_dd20(fwd_closes):
+    """Day0終値(fwd_closes[0])を基準に、以降20営業日の終値(fwd_closes[1:21])の
+    うち最も下落した時点のリターン(%)。Day0自身はmax drawdownの判定対象に
+    含めない(ユーザー確定定義、2026-10-25)。終値ベースであり日中安値は使わない。"""
+    day0_close = fwd_closes[0]
+    return min((c / day0_close - 1) * 100 for c in fwd_closes[1:21])
+
+
 def main():
     with open(SOURCE_PATH, encoding="utf-8") as f:
         all_events = json.load(f)
 
+    with open(DRAWDOWN_SOURCE_PATH, encoding="utf-8") as f:
+        full_events = json.load(f)
+    full_by_key = {(e["ticker"], e["date"]): e for e in full_events}
+
     events_by_ticker = defaultdict(list)
     for e in all_events:
-        events_by_ticker[e["ticker"]].append({"date": e["date"], "ret20": e["ret20"]})
+        key = (e["ticker"], e["date"])
+        full_e = full_by_key[key]
+        assert len(full_e["fwd_closes"]) == 21, f"fwd_closes not 21 points: {key}"
+        recomputed_ret20 = (full_e["fwd_closes"][-1] / full_e["fwd_closes"][0] - 1) * 100
+        assert abs(recomputed_ret20 - e["ret20"]) < 0.01, f"ret20 mismatch: {key}"
+        events_by_ticker[e["ticker"]].append({
+            "date": e["date"],
+            "ret20": e["ret20"],
+            "max_dd20": round(_max_dd20(full_e["fwd_closes"]), 4),
+        })
     for ticker in events_by_ticker:
         events_by_ticker[ticker].sort(key=lambda e: e["date"])
 
@@ -57,9 +93,15 @@ def main():
             "prior_meanの定義と完全に同一。Q1〜Q5判定・Q5 Day0判定・BUY判定とは"
             "無関係の表示専用の過去実績統計である。"
         ),
+        "max_dd20_definition": (
+            "同じQ5 Day0イベントについて、Day0終値を基準に、以降20営業日の"
+            "終値のうち最も下落した時点のリターン(%)。Day0自身は対象外、"
+            "終値ベース(日中安値は使わない)。"
+        ),
         "min_prior_n": MIN_PRIOR_N,
         "source": SOURCE_PATH,
-        "generated_at": "2026-10-23",
+        "drawdown_source": DRAWDOWN_SOURCE_PATH,
+        "generated_at": "2026-10-25",
         "coverage": {
             "start_date": dates[0], "end_date": dates[-1],
             "n_events": len(all_events), "n_tickers": len(events_by_ticker),

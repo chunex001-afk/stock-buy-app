@@ -63,3 +63,61 @@ def get_prior_mean(ticker, day0_date, data=None):
     if n < min_n:
         return {"status": "insufficient", "n": n, "mean": None}
     return {"status": "ok", "n": n, "mean": round(statistics.mean(prior), 1)}
+
+
+def get_prior_stats(ticker, day0_date, data=None):
+    """get_prior_mean(上記、無変更)と完全に同じ母集団(そのday0_dateより厳密に
+    過去の同一銘柄Q5 Day0イベント)から、中央値・勝率・平均最大DD・中央値最大DD
+    を追加で計算する(design 2026-10-25、表示・研究専用の追加統計)。
+
+    【絶対に守ること】
+    - get_prior_mean()自体は一切変更しない(このファイルの上の関数は無変更)。
+      このget_prior_statsは完全に独立した新規関数であり、get_prior_meanの
+      フィルタ条件(date < day0_date)を重複実装している(既存関数を壊すリスクを
+      ゼロにするため、意図的に共有ヘルパー化していない)。
+    - 既存のQ1〜Q5判定・Q5 Day0判定・BUY判定・ranking・20営業日保有ルール・
+      Risk-off・switch_recommendation_logic.py・AI_UNIVERSEのいずれにも
+      一切使用しない、表示・研究専用の参考情報。
+
+    max_dd20(イベントごとの最大下落幅)の定義(ユーザー確定、2026-10-25):
+      Day0終値を基準に、以降20営業日の終値のうち最も下落した時点のリターン(%)。
+      Day0自身はmax drawdownの判定対象に含めない。終値ベース(日中安値は
+      使わない)。build_q5_prior_mean_reference.pyが生成時に計算済みの値を
+      そのまま使う(ここでは再計算しない)。
+
+    戻り値:
+      {"status": "ok", "n": int,
+       "mean": float, "median": float, "win_rate": float,
+       "max_dd_mean": float, "max_dd_median": float}
+      または(nがmin_prior_n未満、または参照データにticker自体が存在しない場合)
+      {"status": "insufficient", "n": int,
+       "mean": None, "median": None, "win_rate": None,
+       "max_dd_mean": None, "max_dd_median": None}
+
+    win_rate: prior中、ret20 > 0 となるイベントの割合(%、小数1桁)。
+    mean/median/max_dd_mean/max_dd_meanは全て同じprior(day0_dateより厳密に
+    過去のイベント)から算出する(mean/median/win_rate/max_dd_mean/
+    max_dd_medianは全て同一母集団)。"""
+    if data is None:
+        data = load_reference_data()
+    events = data.get("events_by_ticker", {}).get(ticker, [])
+    min_n = data.get("min_prior_n", MIN_PRIOR_N)
+    prior = [e for e in events if e["date"] < day0_date]
+    n = len(prior)
+    if n < min_n:
+        return {
+            "status": "insufficient", "n": n,
+            "mean": None, "median": None, "win_rate": None,
+            "max_dd_mean": None, "max_dd_median": None,
+        }
+    rets = [e["ret20"] for e in prior]
+    dds = [e["max_dd20"] for e in prior]
+    win_rate = 100.0 * sum(1 for r in rets if r > 0) / n
+    return {
+        "status": "ok", "n": n,
+        "mean": round(statistics.mean(rets), 1),
+        "median": round(statistics.median(rets), 1),
+        "win_rate": round(win_rate, 1),
+        "max_dd_mean": round(statistics.mean(dds), 1),
+        "max_dd_median": round(statistics.median(dds), 1),
+    }

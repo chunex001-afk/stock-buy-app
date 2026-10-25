@@ -107,6 +107,56 @@ class BuildWatchlistPriorMeansTests(unittest.TestCase):
             app._build_watchlist_prior_means(["AAA"], "2026-10-20")
         resolve_mock.assert_not_called()
 
+    # 9. watchlist表示にprior_statsが追加されること(design 2026-10-25)
+    def test_prior_stats_field_added_alongside_prior_mean(self):
+        fake_stats = {"status": "ok", "n": 31, "mean": 2.4, "median": 2.0,
+                      "win_rate": 60.0, "max_dd_mean": -8.0, "max_dd_median": -7.0}
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(2.4, 31)), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_stats", return_value=fake_stats) as stats_mock:
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        self.assertEqual(result[0]["prior_stats"], fake_stats)
+        # prior_meanと同じticker/anchor_dateで呼ばれること(同一母集団の証跡)
+        stats_mock.assert_called_once_with("AAA", "2026-10-20", data=mock.ANY)
+
+    def test_prior_stats_insufficient_matches_prior_mean_insufficient(self):
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_insufficient_pm(n=3)):
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        # get_prior_statsはmockしていない(本物のロジックが走る)。AAAは参照
+        # データに存在しない(events=[])ため、自然にinsufficientになること。
+        self.assertEqual(result[0]["prior_stats"]["status"], "insufficient")
+        self.assertIsNone(result[0]["prior_stats"]["median"])
+
+    def test_multiple_tickers_each_get_own_prior_stats(self):
+        stats = {
+            "AAA": {"status": "ok", "n": 20, "mean": 1.0, "median": 0.5, "win_rate": 55.0,
+                    "max_dd_mean": -5.0, "max_dd_median": -4.0},
+            "BBB": {"status": "ok", "n": 30, "mean": 2.0, "median": 1.5, "win_rate": 65.0,
+                    "max_dd_mean": -6.0, "max_dd_median": -5.0},
+        }
+
+        def fake_stats(ticker, cutoff, data=None):
+            return stats[ticker]
+
+        with self._mock_reference_data({"AAA": [], "BBB": []}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(1.0)), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_stats", side_effect=fake_stats):
+            result = app._build_watchlist_prior_means(["AAA", "BBB"], "2026-10-20")
+        by_ticker = {r["ticker"]: r for r in result}
+        self.assertEqual(by_ticker["AAA"]["prior_stats"]["median"], 0.5)
+        self.assertEqual(by_ticker["BBB"]["prior_stats"]["median"], 1.5)
+
+    def test_existing_prior_mean_and_in_reference_universe_fields_unchanged(self):
+        # 11. prior_stats追加後も既存のprior_mean/in_reference_universeの
+        # 値・挙動が変わらないこと
+        with self._mock_reference_data({"AAA": [{"date": "2020-01-01", "ret20": 1.0}]}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(2.4, 31)):
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        self.assertEqual(result[0]["prior_mean"], _ok_pm(2.4, 31))
+        self.assertTrue(result[0]["in_reference_universe"])
+        self.assertIn("prior_stats", result[0])
+
 
 if __name__ == "__main__":
     unittest.main()
