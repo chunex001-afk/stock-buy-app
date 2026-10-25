@@ -121,3 +121,41 @@ def get_prior_stats(ticker, day0_date, data=None):
         "max_dd_mean": round(statistics.mean(dds), 1),
         "max_dd_median": round(statistics.median(dds), 1),
     }
+
+
+def label_prior_mean(prior_mean):
+    """prior_mean(get_prior_meanの戻り値、無変更)を、Q5信頼度β(design 2026-10-25、
+    ユーザー確定の帯分け)の定性ラベルに変換するだけの純粋関数。
+
+    【絶対に守ること】
+    - get_prior_mean()・get_prior_stats()は一切変更しない。新しい母集団・
+      新しいスコア計算式は作らない(prior_mean以外の指標をここで合成しない、
+      median/win_rate/max_dd_meanはラベル判定に一切使わない)。
+    - ここで返すのは表示用ラベル文字列のみ。Q1〜Q5判定・Q5 Day0判定・BUY判定・
+      ranking・20営業日保有ルール・Risk-off・switch_recommendation_logicの
+      いずれにも使用しない。
+
+    しきい値(ユーザー確定、2026-10-25、prior_mean[%]に対して):
+      mean <  0           : "弱い・購入禁止"
+      0  <= mean <  3      : "標準"
+      3  <= mean <  4.5    : "🔥 最強"
+      4.5 <= mean <  7      : "⚠️ 高めだが要注意"
+      7  <= mean < 10      : "⚠️ 暴落リスクに注意"
+      mean >= 10           : "⚠️ 暴落リスクに特に注意"
+
+    戻り値: ラベル文字列、またはNone(status != "ok"、既存の「データ不足」表示を
+    そのまま使うためここでは重複ラベルを作らない)。"""
+    if not prior_mean or prior_mean.get("status") != "ok":
+        return None
+    mean = prior_mean["mean"]
+    if mean < 0:
+        return "弱い・購入禁止"
+    if mean < 3:
+        return "標準"
+    if mean < 4.5:
+        return "🔥 最強"
+    if mean < 7:
+        return "⚠️ 高めだが要注意"
+    if mean < 10:
+        return "⚠️ 暴落リスクに注意"
+    return "⚠️ 暴落リスクに特に注意"

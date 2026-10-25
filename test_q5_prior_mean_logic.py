@@ -279,5 +279,50 @@ class GetPriorStatsTests(unittest.TestCase):
         self.assertEqual(mean_result["n"], result["n"])
 
 
+# ---------------------------------------------------------------------------
+# q5_prior_mean_logic.label_prior_mean のテスト(design 2026-10-25、「Q5信頼度β」)。
+# prior_mean(平均)のみから決まる定性ラベル。median/win_rate/max_dd_meanは
+# 一切使わない(新しい合成スコアは作らない、ユーザー確定仕様)ことを重視する。
+# ---------------------------------------------------------------------------
+
+class LabelPriorMeanTests(unittest.TestCase):
+    def test_insufficient_status_returns_none(self):
+        self.assertIsNone(pm.label_prior_mean({"status": "insufficient", "n": 3, "mean": None}))
+
+    def test_none_input_returns_none(self):
+        self.assertIsNone(pm.label_prior_mean(None))
+
+    def test_negative_mean_is_weak_forbidden(self):
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": -0.1}), "弱い・購入禁止")
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": -10.0}), "弱い・購入禁止")
+
+    def test_zero_to_just_under_3_is_standard(self):
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 0.0}), "標準")
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 2.9}), "標準")
+
+    def test_3_to_just_under_4_5_is_strongest(self):
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 3.0}), "🔥 最強")
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 4.4}), "🔥 最強")
+
+    def test_4_5_to_just_under_7_is_high_caution(self):
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 4.5}), "⚠️ 高めだが要注意")
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 6.9}), "⚠️ 高めだが要注意")
+
+    def test_7_to_just_under_10_is_crash_risk_caution(self):
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 7.0}), "⚠️ 暴落リスクに注意")
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 9.9}), "⚠️ 暴落リスクに注意")
+
+    def test_10_and_above_is_special_crash_risk_caution(self):
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 10.0}), "⚠️ 暴落リスクに特に注意")
+        self.assertEqual(pm.label_prior_mean({"status": "ok", "n": 20, "mean": 50.0}), "⚠️ 暴落リスクに特に注意")
+
+    def test_label_does_not_depend_on_median_win_rate_or_max_dd(self):
+        # ユーザー確定の最重要制約: ラベルはprior_mean(mean)のみで決まり、
+        # median/win_rate/max_dd_mean等の他フィールドの有無・値に一切影響されない。
+        base = {"status": "ok", "n": 20, "mean": 5.0}
+        with_extra = dict(base, median=-99.0, win_rate=0.0, max_dd_mean=-99.0)
+        self.assertEqual(pm.label_prior_mean(base), pm.label_prior_mean(with_extra))
+
+
 if __name__ == "__main__":
     unittest.main()

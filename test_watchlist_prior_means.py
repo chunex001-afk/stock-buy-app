@@ -157,6 +157,21 @@ class BuildWatchlistPriorMeansTests(unittest.TestCase):
         self.assertTrue(result[0]["in_reference_universe"])
         self.assertIn("prior_stats", result[0])
 
+    # Q5信頼度β(design 2026-10-25): prior_mean_labelがwatchlist表示にも
+    # 追加されること、かつ本物のq5_prior_mean_logic.label_prior_mean
+    # (mockしていない)がそのまま使われること。
+    def test_prior_mean_label_added_and_matches_real_label_logic(self):
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(3.2, 31)):
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        self.assertEqual(result[0]["prior_mean_label"], "🔥 最強")
+
+    def test_prior_mean_label_none_when_insufficient(self):
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_insufficient_pm(n=4)):
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        self.assertIsNone(result[0]["prior_mean_label"])
+
 
 if __name__ == "__main__":
     unittest.main()

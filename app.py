@@ -968,6 +968,7 @@ def _build_current_q5_prior_means(rows, anchor_date):
     レスポンスキーとして追加するだけ)。
 
     戻り値: [{"ticker", "prior_mean": {"status","n","mean"},
+              "prior_mean_label": str または None,
               "prior_stats": {"status","n","mean","median","win_rate",
               "max_dd_mean","max_dd_median"}}, ...]  (rowsの順序のまま、
     現在Q5の銘柄のみ)。
@@ -978,7 +979,12 @@ def _build_current_q5_prior_means(rows, anchor_date):
     新規関数q5_prior_mean_logic.get_prior_statsを呼ぶだけで、prior_meanと
     完全に同じ母集団(同じticker・同じanchor_date)から計算される。Q1〜Q5判定・
     BUY判定・ranking・20営業日保有ルール・Risk-off・switch_recommendation_logic
-    のいずれにも使われない、表示・研究専用の追加情報。"""
+    のいずれにも使われない、表示・研究専用の追加情報。
+
+    prior_mean_label(design 2026-10-25追加、「Q5信頼度β」): prior_mean(平均)
+    のみをユーザー確定のしきい値で定性ラベルに変換した表示専用文字列
+    (q5_prior_mean_logic.label_prior_mean)。median/win_rate/max_dd_meanは
+    ラベル判定に一切使わない(新しい合成スコアは作らない、ユーザー確定仕様)。"""
     result = []
     for row in rows:
         q = row.get("quintile") or {}
@@ -989,9 +995,11 @@ def _build_current_q5_prior_means(rows, anchor_date):
         if current_q != "Q5":
             continue
         ticker = row.get("ticker")
+        pm = q5_prior_mean_logic.get_prior_mean(ticker, anchor_date)
         result.append({
             "ticker": ticker,
-            "prior_mean": q5_prior_mean_logic.get_prior_mean(ticker, anchor_date),
+            "prior_mean": pm,
+            "prior_mean_label": q5_prior_mean_logic.label_prior_mean(pm),
             "prior_stats": q5_prior_mean_logic.get_prior_stats(ticker, anchor_date),
         })
     return result
@@ -1011,6 +1019,7 @@ def _build_watchlist_prior_means(tickers, anchor_date):
     登録順をそのまま維持する)の順序そのまま。
 
     戻り値: [{"ticker", "prior_mean": {"status","n","mean"},
+              "prior_mean_label": str または None,
               "prior_stats": {"status","n","mean","median","win_rate",
               "max_dd_mean","max_dd_median"},
               "in_reference_universe": bool(q5_prior_mean_reference.jsonの
@@ -1019,14 +1028,17 @@ def _build_watchlist_prior_means(tickers, anchor_date):
     prior_stats(design 2026-10-25追加)は_build_current_q5_prior_meansと同様、
     q5_prior_mean_logic.get_prior_stats(新規関数、get_prior_mean無変更)を
     呼ぶだけで、prior_meanと完全に同じ母集団から計算される表示・研究専用の
-    追加情報。"""
+    追加情報。prior_mean_label(「Q5信頼度β」)も同様にprior_meanのみから
+    決まる表示専用ラベル(q5_prior_mean_logic.label_prior_mean)。"""
     data = q5_prior_mean_logic.load_reference_data()
     events_by_ticker = data.get("events_by_ticker", {})
     result = []
     for ticker in tickers:
+        pm = q5_prior_mean_logic.get_prior_mean(ticker, anchor_date, data=data)
         result.append({
             "ticker": ticker,
-            "prior_mean": q5_prior_mean_logic.get_prior_mean(ticker, anchor_date, data=data),
+            "prior_mean": pm,
+            "prior_mean_label": q5_prior_mean_logic.label_prior_mean(pm),
             "prior_stats": q5_prior_mean_logic.get_prior_stats(ticker, anchor_date, data=data),
             "in_reference_universe": ticker in events_by_ticker,
         })
@@ -1299,6 +1311,10 @@ details.logicinfo .small{margin-top:10px}
 .daction-rows b{color:#172033;font-size:13.5px}
 .daction-note{font-size:12px;font-weight:700;color:#9a6a00;margin-bottom:8px}
 .daction-priormean{font-size:11.5px;font-weight:400;color:#8a94a6;margin-bottom:8px;cursor:help}
+/* Q5信頼度β(design 2026-10-25)。prior_meanのみから決まる定性ラベル(新しい
+   合成スコアではない)。prior_mean本体より少し目立つ濃い色・太字にするだけで、
+   しきい値ごとの色分けはしない(絵文字で強弱を表現する設計のため)。 */
+.priormean-label{font-weight:800;color:#172033}
 /* 中央値・勝率・平均最大DD(design 2026-10-25)。daction-priormeanの2行目相当、
    同じ控えめな見た目(グレー系・小さめ)にする。既存のdaction-priormean自体の
    スタイルは変更しない。 */
@@ -1357,6 +1373,10 @@ details.logicinfo .small{margin-top:10px}
 .wlpm-table td.wlpm-ticker{font-weight:900;color:#172033}
 .wlpm-table td.wlpm-mean-neg{color:#b42318;font-weight:800}
 .wlpm-table td.wlpm-mean-pos{color:#172033;font-weight:700}
+/* Q5信頼度β(design 2026-10-25)。親td(wlpm-mean-neg/pos)の色をそのまま
+   継承させる(マイナス=赤、プラス=濃色が自動的に揃う)。ここではfont-sizeのみ
+   調整し、独自の色指定はしない。 */
+.wlpm-label{font-size:11px;font-weight:700}
 .wlpm-table .wlpm-flag-warn{color:#b42318;font-weight:700}
 .wlpm-table .wlpm-flag-none{color:#98a2b3}
 .wlpm-empty{color:#98a2b3;font-size:12.5px}
@@ -1622,14 +1642,21 @@ function dactionProfitCard(p, h){
 // あくまで参考情報であり、Q5判定・BUY判定そのものではないことが分かるように、
 // BUYバッジ・ティッカー名より目立たせない控えめな見た目(.daction-priormean、
 // グレー系)にする。prior_meanが未定義(古いキャッシュ応答等)の場合は何も出さない。
-function dactionPriorMeanHtml(pm){
+// label(第2引数、design 2026-10-25「Q5信頼度β」)は省略可能。省略時(既存の
+// 全呼び出し箇所: BUYカード・保有銘柄パネル等)は従来通りラベル無しで、表示・
+// 挙動は一切変わらない。渡された場合のみ(現在Q5パネル、下記)prior_meanの
+// 直後に付記する。ラベル自体はq5_prior_mean_logic.label_prior_mean(prior_mean
+// のみから決まる、median/win_rate/max_dd_meanは使わない)をそのまま表示する
+// だけで、ここでは新しいしきい値判定を作らない。
+function dactionPriorMeanHtml(pm, label){
   if(!pm || !pm.status) return "";
   const title = "過去のQ5 Day0後20営業日間の平均リターン(参考情報、Q5判定そのものではありません)";
   if(pm.status === "insufficient"){
     return `<div class="daction-priormean" title="${esc(title)}">Q5過去平均：データ不足${pm.n ? `(過去${pm.n}件)` : ""}</div>`;
   }
   const sign = pm.mean >= 0 ? "+" : "";
-  return `<div class="daction-priormean" title="${esc(title)}">Q5過去平均：${sign}${pm.mean}%（n=${pm.n}）</div>`;
+  const labelHtml = label ? ` <span class="priormean-label">${esc(label)}</span>` : "";
+  return `<div class="daction-priormean" title="${esc(title)}">Q5過去平均：${sign}${pm.mean}%（n=${pm.n}）${labelHtml}</div>`;
 }
 
 // 中央値・勝率・平均最大DD(design 2026-10-25、表示・研究専用の追加統計、
@@ -1721,7 +1748,7 @@ function renderCurrentQ5PriorMeans(list){
   if(!list){ el.innerHTML = ""; return; }
   const rows = list.map(item => `<div class="currentq5pm-row">
     <span class="currentq5pm-ticker">${esc(item.ticker)}</span>
-    ${dactionPriorMeanHtml(item.prior_mean)}
+    ${dactionPriorMeanHtml(item.prior_mean, item.prior_mean_label)}
     ${dactionPriorStatsHtml(item.prior_stats)}
   </div>`).join("");
   el.innerHTML = `<div class="currentq5pm">
@@ -1736,11 +1763,15 @@ function renderCurrentQ5PriorMeans(list){
 // サーバーから渡されたlist(=watchlist登録順)のまま、並べ替えは行わない。
 // ◎○✕等の最終判定しきい値はまだ決めていないため、ここではマイナス/データ不足/
 // 48銘柄対象外をそれぞれ目立たせるだけの最小限の表示にする。
-function wlpmMeanCellHtml(pm){
+// label(第2引数、design 2026-10-25「Q5信頼度β」)はq5_prior_mean_logic.
+// label_prior_meanがprior_meanのみから算出した表示専用文字列をそのまま出す
+// だけ(median/win_rate/max_dd_meanはここでも使わない)。
+function wlpmMeanCellHtml(pm, label){
   if(!pm || !pm.status || pm.status === "insufficient") return `<td colspan="2" class="wlpm-flag-warn">データ不足${(pm && pm.n) ? `(過去${pm.n}件)` : ""}</td>`;
   const sign = pm.mean >= 0 ? "+" : "";
   const cls = pm.mean < 0 ? "wlpm-mean-neg" : "wlpm-mean-pos";
-  return `<td class="${cls}">${sign}${esc(pm.mean)}%</td><td>${esc(pm.n)}</td>`;
+  const labelHtml = label ? `<br><span class="wlpm-label">${esc(label)}</span>` : "";
+  return `<td class="${cls}">${sign}${esc(pm.mean)}%${labelHtml}</td><td>${esc(pm.n)}</td>`;
 }
 // 中央値・勝率・平均最大DD(design 2026-10-25)の2行目。prior_statsが
 // insufficientの場合(=prior_meanも常にinsufficient、同一母集団・同一n判定の
@@ -1763,7 +1794,7 @@ function renderWatchlistPriorMeans(list, anchorDate){
       : `<span class="wlpm-flag-warn">対象外</span>`;
     return `<tr>
       <td class="wlpm-ticker">${esc(item.ticker)}</td>
-      ${wlpmMeanCellHtml(item.prior_mean)}
+      ${wlpmMeanCellHtml(item.prior_mean, item.prior_mean_label)}
       <td>${refFlag}</td>
     </tr>${wlpmStatsRowHtml(item.prior_stats)}`;
   }).join("");

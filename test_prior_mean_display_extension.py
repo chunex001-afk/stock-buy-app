@@ -68,7 +68,10 @@ class BuildCurrentQ5PriorMeansTests(unittest.TestCase):
         rows = [_row("AAA", [{"date": CAL[10], "q": "Q5"}])]
         with mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(2.4, 31)) as m:
             result = app._build_current_q5_prior_means(rows, CAL[20])
-        self.assertEqual(result, [{"ticker": "AAA", "prior_mean": _ok_pm(2.4, 31), "prior_stats": _insufficient_stats()}])
+        # prior_mean_label(design 2026-10-25「Q5信頼度β」)は実物のlabel_prior_mean
+        # がそのまま呼ばれる(mockしていない)。mean=2.4は0〜3未満=「標準」。
+        self.assertEqual(result, [{"ticker": "AAA", "prior_mean": _ok_pm(2.4, 31),
+                                    "prior_mean_label": "標準", "prior_stats": _insufficient_stats()}])
         # 「Q5になった日」ではなく、anchor_date(最新取引日)を基準日に使うこと
         m.assert_called_once_with("AAA", CAL[20])
 
@@ -86,6 +89,13 @@ class BuildCurrentQ5PriorMeansTests(unittest.TestCase):
         self.assertEqual(result[0]["prior_stats"]["median"], 2.0)
         mean_mock.assert_called_once_with("AAA", CAL[20])
         stats_mock.assert_called_once_with("AAA", CAL[20])
+
+    def test_prior_mean_label_present_in_current_q5_panel(self):
+        # Q5信頼度β(design 2026-10-25)。mean=8.0は7〜10未満=「⚠️ 暴落リスクに注意」。
+        rows = [_row("AAA", [{"date": CAL[10], "q": "Q5"}])]
+        with mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(8.0, 31)):
+            result = app._build_current_q5_prior_means(rows, CAL[20])
+        self.assertEqual(result[0]["prior_mean_label"], "⚠️ 暴落リスクに注意")
 
     def test_ticker_currently_not_q5_is_excluded(self):
         rows = [_row("AAA", [{"date": CAL[10], "q": "Q4"}])]
