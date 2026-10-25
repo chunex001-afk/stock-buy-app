@@ -983,6 +983,34 @@ def _build_current_q5_prior_means(rows, anchor_date):
     return result
 
 
+def _build_watchlist_prior_means(tickers, anchor_date):
+    """登録段階でprior_meanを確認するための、watchlist全銘柄(Q5状態を問わない)
+    一覧を組み立てる(design 2026-10-25)。
+
+    _build_current_q5_prior_means(現在Q5の銘柄のみに絞る既存関数、無変更)とは
+    別の読み取り専用関数。Q1〜Q5判定・現在Qの解決(_resolve_q_for_date)には
+    一切関与せず、tickersの各要素についてq5_prior_mean_logic.get_prior_mean/
+    load_reference_dataをそのまま呼ぶだけ(新しいprior_mean計算ロジック・
+    新しいQ5判定ロジックは一切作らない)。
+
+    表示順はtickers(=watchlist登録順、ユーザー確定仕様:ランキングではなく
+    登録順をそのまま維持する)の順序そのまま。
+
+    戻り値: [{"ticker", "prior_mean": {"status","n","mean"},
+              "in_reference_universe": bool(q5_prior_mean_reference.jsonの
+              48銘柄に存在するか)}, ...]  (tickersと同じ順序・同じ件数)。"""
+    data = q5_prior_mean_logic.load_reference_data()
+    events_by_ticker = data.get("events_by_ticker", {})
+    result = []
+    for ticker in tickers:
+        result.append({
+            "ticker": ticker,
+            "prior_mean": q5_prior_mean_logic.get_prior_mean(ticker, anchor_date, data=data),
+            "in_reference_universe": ticker in events_by_ticker,
+        })
+    return result
+
+
 def _get_watchlist():
     tickers = store.get_watchlist()
     if not tickers:
@@ -1285,6 +1313,22 @@ details.logicinfo .small{margin-top:10px}
 .currentq5pm-row:first-of-type{border-top:none}
 .currentq5pm-ticker{font-weight:900;font-size:13.5px;color:#172033;min-width:52px}
 .currentq5pm-empty{color:#98a2b3;font-size:12.5px}
+/* watchlist全銘柄のprior_mean一覧(design 2026-10-25)。登録段階での事前確認用、
+   読み取り専用パネル。◎○✕等の最終判定しきい値はまだ無く、マイナス/データ不足/
+   対象外を目立たせるだけの最小限の配色。 */
+#watchlistPriorMeans{margin-bottom:18px}
+.wlpm{background:white;border-radius:16px;padding:14px 16px;box-shadow:0 2px 14px #0000000c}
+.wlpm-head{font-weight:900;font-size:14px;margin-bottom:2px}
+.wlpm-anchor{color:#98a2b3;font-size:11.5px;margin-bottom:8px}
+.wlpm-table{width:100%;border-collapse:collapse;font-size:12.5px}
+.wlpm-table th{text-align:left;color:#98a2b3;font-weight:700;font-size:11px;padding:4px 6px;border-bottom:1px solid #eef1f5}
+.wlpm-table td{padding:6px 6px;border-bottom:1px solid #eef1f5;color:#475467}
+.wlpm-table td.wlpm-ticker{font-weight:900;color:#172033}
+.wlpm-table td.wlpm-mean-neg{color:#b42318;font-weight:800}
+.wlpm-table td.wlpm-mean-pos{color:#172033;font-weight:700}
+.wlpm-table .wlpm-flag-warn{color:#b42318;font-weight:700}
+.wlpm-table .wlpm-flag-none{color:#98a2b3}
+.wlpm-empty{color:#98a2b3;font-size:12.5px}
 /* 取得情報(取得単価・取得日)の訂正フォーム(design 2026-10-20)。 */
 .pfedit-togglebtn{background:#eef1f5;color:#172033;border:0;border-radius:10px;padding:6px 10px;font-weight:700;font-size:11.5px;cursor:pointer}
 .pfedit-form{display:flex;gap:10px;flex-wrap:wrap;align-items:end;padding:10px 0 12px;border-top:1px dashed #dde2e8}
@@ -1341,6 +1385,7 @@ details.cmp-details .cmp-note:first-child{margin-top:6px}
 <div id="comparePanel"></div>
 <div class="title">📊 保有銘柄のQ1〜Q5状態</div>
 <div id="tickerCount" class="tickercount"></div>
+<div id="watchlistPriorMeans"></div>
 <div class="sub">実データ版｜最大20銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
 
 <div id="pushNotifyBar"></div>
@@ -1633,6 +1678,43 @@ function renderCurrentQ5PriorMeans(list){
   el.innerHTML = `<div class="currentq5pm">
     <div class="currentq5pm-head">現在Q5の銘柄</div>
     ${rows || `<div class="currentq5pm-empty">現在Q5の銘柄はありません</div>`}
+  </div>`;
+}
+
+// watchlist全銘柄のprior_mean一覧(design 2026-10-25)。「登録段階でprior_meanを
+// 確認する」ための読み取り専用パネル。renderCurrentQ5PriorMeans(現在Q5の銘柄のみ)
+// とは別物で、Q1〜Q5判定・Q5ランキング・BUY判定には一切接続しない。表示順は
+// サーバーから渡されたlist(=watchlist登録順)のまま、並べ替えは行わない。
+// ◎○✕等の最終判定しきい値はまだ決めていないため、ここではマイナス/データ不足/
+// 48銘柄対象外をそれぞれ目立たせるだけの最小限の表示にする。
+function wlpmMeanCellHtml(pm){
+  if(!pm || !pm.status || pm.status === "insufficient") return `<td colspan="2" class="wlpm-flag-warn">データ不足${(pm && pm.n) ? `(過去${pm.n}件)` : ""}</td>`;
+  const sign = pm.mean >= 0 ? "+" : "";
+  const cls = pm.mean < 0 ? "wlpm-mean-neg" : "wlpm-mean-pos";
+  return `<td class="${cls}">${sign}${esc(pm.mean)}%</td><td>${esc(pm.n)}</td>`;
+}
+function renderWatchlistPriorMeans(list, anchorDate){
+  const el = document.getElementById("watchlistPriorMeans");
+  if(!el) return;
+  if(!list){ el.innerHTML = ""; return; }
+  const rows = list.map(item => {
+    const inRef = item.in_reference_universe;
+    const refFlag = inRef
+      ? `<span class="wlpm-flag-none">対象</span>`
+      : `<span class="wlpm-flag-warn">対象外</span>`;
+    return `<tr>
+      <td class="wlpm-ticker">${esc(item.ticker)}</td>
+      ${wlpmMeanCellHtml(item.prior_mean)}
+      <td>${refFlag}</td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<div class="wlpm">
+    <div class="wlpm-head">監視銘柄のQ5過去平均(登録段階チェック用)</div>
+    <div class="wlpm-anchor">基準日：${esc(fmtDate(anchorDate))}時点で計算（この銘柄が今Q5 Day0になったと仮定した場合の参考値）</div>
+    ${list.length ? `<table class="wlpm-table">
+      <thead><tr><th>銘柄</th><th>Q5過去平均</th><th>n</th><th>参照データ</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>` : `<div class="wlpm-empty">監視銘柄が登録されていません</div>`}
   </div>`;
 }
 
@@ -2003,6 +2085,7 @@ async function updateRanking(extraMsg){
     renderDailyActions(j.daily_actions, j.portfolio);
     renderPortfolioStatus(j.portfolio);
     renderCurrentQ5PriorMeans(j.current_q5_prior_means);
+    renderWatchlistPriorMeans(j.watchlist_prior_means, j.watchlist_prior_means_anchor_date);
     renderQ5Momentum(j.q5_momentum);
     renderOpInfo(j);
     renderTickerCount(j);
@@ -3126,6 +3209,16 @@ def ranking():
             if trading_calendar else None
         )
 
+        # watchlist全銘柄のprior_mean一覧(design 2026-10-25、登録段階での
+        # 事前確認用)。current_q5_prior_means(現在Q5の銘柄のみ)とは別の
+        # 読み取り専用キー。tickersはwatchlist登録順そのまま(_get_watchlist
+        # の戻り値、sort_rowsを通していない)。
+        watchlist_prior_means = (
+            _build_watchlist_prior_means(tickers, trading_calendar[-1])
+            if trading_calendar else None
+        )
+        watchlist_prior_means_anchor_date = trading_calendar[-1] if trading_calendar else None
+
         return jsonify({
             "ok": True,
             "rows": rows,
@@ -3135,6 +3228,8 @@ def ranking():
             "daily_actions": daily_actions,
             "portfolio": _build_portfolio_view(),
             "current_q5_prior_means": current_q5_prior_means,
+            "watchlist_prior_means": watchlist_prior_means,
+            "watchlist_prior_means_anchor_date": watchlist_prior_means_anchor_date,
             "last_refresh": last_refresh_view,
             "budget": {"used": used, "limit": td.DAILY_API_BUDGET, "remaining": budget_left},
             "max_tickers": logic.MAX_TICKERS,
