@@ -505,5 +505,109 @@ class LabelPriorMeanWithWinRateTests(unittest.TestCase):
         self.assertEqual(pm.label_prior_mean(_pm_ok(3.4)), "🔥 最強")
 
 
+# ---------------------------------------------------------------------------
+# q5_prior_mean_logic.get_prior_stats_recent_years のテスト(design
+# 2026-10-26、「全期間×直近5年prior_mean」研究結果を反映した新規関数)。
+# get_prior_stats(全期間、無変更)と同じ母集団定義・未来データ混入防止
+# ルールに、「day0_dateからN年以内」の期間制限を追加しただけであることを
+# 重視する。
+# ---------------------------------------------------------------------------
+
+def _recent_data(events_by_ticker, min_prior_n=10):
+    return {"min_prior_n": min_prior_n, "events_by_ticker": events_by_ticker}
+
+
+class GetPriorStatsRecentYearsTests(unittest.TestCase):
+    def test_sufficient_recent_history_returns_all_fields(self):
+        # day0=2025-01-01の直近5年(2020-01-01以降)に10件、win_rate/median等
+        # が全期間と同じロジックで計算されること。
+        events = [
+            {"date": f"2021-{m:02d}-01", "ret20": v, "max_dd20": -5.0}
+            for m, v in zip(range(1, 11), [10.0] * 10)
+        ]
+        data = _recent_data({"AAA": events})
+        result = pm.get_prior_stats_recent_years("AAA", "2025-01-01", data=data)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["n"], 10)
+        self.assertEqual(result["mean"], 10.0)
+        self.assertEqual(result["win_rate"], 100.0)
+
+    def test_fewer_than_10_in_recent_5_years_is_insufficient(self):
+        # 直近5年以内に9件しかない場合、全期間側がokでもinsufficientになる。
+        events = [
+            {"date": f"2021-{m:02d}-01", "ret20": 10.0, "max_dd20": -5.0}
+            for m in range(1, 10)
+        ]
+        data = _recent_data({"AAA": events})
+        result = pm.get_prior_stats_recent_years("AAA", "2025-01-01", data=data)
+        self.assertEqual(result["status"], "insufficient")
+        self.assertEqual(result["n"], 9)
+        self.assertIsNone(result["mean"])
+
+    def test_events_older_than_5_years_are_excluded(self):
+        # day0=2025-06-01の5年前は2020-06-01。2019年のイベント(5年より前)は
+        # 直近5年側の計算からは除外される一方、全期間側(get_prior_stats)には
+        # 含まれる(=直近5年側だけ件数が減ってinsufficientになり得る)ことを
+        # 確認する。
+        old_events = [
+            {"date": f"2015-{m:02d}-01", "ret20": -50.0, "max_dd20": -60.0}
+            for m in range(1, 6)
+        ]  # 5件、5年window外
+        recent_events = [
+            {"date": f"2022-{m:02d}-01", "ret20": 10.0, "max_dd20": -5.0}
+            for m in range(1, 6)
+        ]  # 5件、5年window内
+        events = old_events + recent_events
+        data = _recent_data({"AAA": events})
+
+        full = pm.get_prior_stats("AAA", "2025-06-01", data=data)
+        recent = pm.get_prior_stats_recent_years("AAA", "2025-06-01", data=data)
+
+        self.assertEqual(full["n"], 10)  # 全期間は10件全て含む
+        self.assertEqual(recent["n"], 5)  # 直近5年は5件だけ(window外を除外)
+        self.assertEqual(recent["status"], "insufficient")  # 5件<MIN_PRIOR_N(10)
+
+    def test_future_leakage_excludes_events_on_or_after_day0_date(self):
+        events = [
+            {"date": f"2024-{m:02d}-01", "ret20": 10.0, "max_dd20": -5.0}
+            for m in range(1, 11)
+        ] + [
+            {"date": "2025-01-05", "ret20": 10.0, "max_dd20": -5.0},  # day0自身
+            {"date": "2025-02-01", "ret20": -999.0, "max_dd20": -999.0},  # 未来
+        ]
+        data = _recent_data({"AAA": events})
+        result = pm.get_prior_stats_recent_years("AAA", "2025-01-05", data=data)
+        self.assertEqual(result["n"], 10)  # day0自身・未来は含まない
+        self.assertEqual(result["mean"], 10.0)
+
+    def test_zero_history_is_insufficient(self):
+        data = _recent_data({"AAA": []})
+        result = pm.get_prior_stats_recent_years("AAA", "2025-01-01", data=data)
+        self.assertEqual(result["status"], "insufficient")
+        self.assertEqual(result["n"], 0)
+
+    def test_does_not_affect_existing_get_prior_stats(self):
+        # 既存のget_prior_stats(全期間)の結果が、新関数の追加によって一切
+        # 変わっていないことの回帰確認。
+        events = [
+            {"date": f"2015-{m:02d}-01", "ret20": 5.0, "max_dd20": -3.0}
+            for m in range(1, 11)
+        ]
+        data = _recent_data({"AAA": events})
+        full = pm.get_prior_stats("AAA", "2025-01-01", data=data)
+        self.assertEqual(full["status"], "ok")
+        self.assertEqual(full["mean"], 5.0)
+
+    def test_real_reference_data_recent_years_computable(self):
+        # 実データ(本番で使うq5_prior_mean_reference.json)でのエンドツーエンド
+        # 確認。MUは長期履歴銘柄のため直近5年でも十分なイベント数があるはず。
+        data = pm.load_reference_data()
+        result = pm.get_prior_stats_recent_years("MU", "2026-10-26", data=data)
+        self.assertIn(result["status"], ("ok", "insufficient"))
+        if result["status"] == "ok":
+            self.assertIsNotNone(result["mean"])
+            self.assertIsNotNone(result["win_rate"])
+
+
 if __name__ == "__main__":
     unittest.main()

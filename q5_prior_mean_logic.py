@@ -18,8 +18,11 @@ Redis/Twelve Dataへは一切アクセスしない純粋関数(quintile_logic.lo
 import json
 import os
 import statistics
+from datetime import date
 
 REFERENCE_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "q5_prior_mean_reference.json")
+
+RECENT_YEARS_DEFAULT = 5  # 直近N年prior_mean(design 2026-10-26)のデフォルト年数
 
 # Phase1〜3研究で確立した、個別銘柄のprior_meanを「参考情報として表示してよい」
 # と判断する最低限の過去Q5 Day0件数。これより少ない銘柄は「データ不足」とする
@@ -205,3 +208,62 @@ def label_prior_mean_with_win_rate(prior_mean, prior_stats):
     if win_rate >= 55:
         return "🟢 優良"
     return "🟡 標準"
+
+
+def _date_minus_years(date_str, years):
+    """"YYYY-MM-DD"からyears年引いた日付文字列を返す(2/29は2/28に補正)。
+    「直近5年prior_mean」研究(2026-10-26)で使った定義と同一の日付演算。"""
+    d = date.fromisoformat(date_str)
+    try:
+        return d.replace(year=d.year - years).isoformat()
+    except ValueError:
+        return d.replace(month=2, day=28, year=d.year - years).isoformat()
+
+
+def get_prior_stats_recent_years(ticker, day0_date, years=RECENT_YEARS_DEFAULT, data=None):
+    """直近N年(デフォルト5年)だけのprior_stats(design 2026-10-26、「全期間
+    prior_mean×直近5年prior_mean」研究で検証済みの定義をそのまま使う)。
+
+    get_prior_stats(全期間、無変更)と完全に同じ母集団定義・未来データ混入
+    防止ルール(date < day0_date)に、「day0_dateからyears年以内」という期間
+    制限を追加しただけの新規・独立関数。
+
+    【絶対に守ること】
+    - get_prior_mean()・get_prior_stats()・label_prior_mean()・
+      label_prior_mean_with_win_rate()は一切変更しない(この関数はそれらを
+      呼ばない、完全に独立した新規計算)。
+    - 既存のQ1〜Q5判定・Q5 Day0判定・BUY判定・ranking・カテゴリーラベル判定・
+      表示順ソートのいずれにも使用しない、表示・研究専用の追加情報。
+    - prior_n(直近N年の件数)がMIN_PRIOR_N未満の場合は0%等で補完せず、
+      status="insufficient"として呼び出し側に委ねる(全期間側がinsufficient
+      でなくても、直近N年側だけinsufficientになることがある)。
+
+    戻り値: get_prior_statsと同じ形
+      {"status": "ok"|"insufficient", "n": int,
+       "mean": float|None, "median": float|None, "win_rate": float|None,
+       "max_dd_mean": float|None, "max_dd_median": float|None}
+    """
+    if data is None:
+        data = load_reference_data()
+    events = data.get("events_by_ticker", {}).get(ticker, [])
+    min_n = data.get("min_prior_n", MIN_PRIOR_N)
+    start = _date_minus_years(day0_date, years)
+    prior = [e for e in events if start <= e["date"] < day0_date]
+    n = len(prior)
+    if n < min_n:
+        return {
+            "status": "insufficient", "n": n,
+            "mean": None, "median": None, "win_rate": None,
+            "max_dd_mean": None, "max_dd_median": None,
+        }
+    rets = [e["ret20"] for e in prior]
+    dds = [e["max_dd20"] for e in prior]
+    win_rate = 100.0 * sum(1 for r in rets if r > 0) / n
+    return {
+        "status": "ok", "n": n,
+        "mean": round(statistics.mean(rets), 1),
+        "median": round(statistics.median(rets), 1),
+        "win_rate": round(win_rate, 1),
+        "max_dd_mean": round(statistics.mean(dds), 1),
+        "max_dd_median": round(statistics.median(dds), 1),
+    }

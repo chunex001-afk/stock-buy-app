@@ -1022,6 +1022,7 @@ def _build_watchlist_prior_means(tickers, anchor_date):
               "prior_mean_label": str または None,
               "prior_stats": {"status","n","mean","median","win_rate",
               "max_dd_mean","max_dd_median"},
+              "prior_stats_recent5y": 同じ形(直近5年だけの集計)、
               "in_reference_universe": bool(q5_prior_mean_reference.jsonの
               48銘柄に存在するか)}, ...]  (tickersと同じ順序・同じ件数)。
 
@@ -1035,7 +1036,13 @@ def _build_watchlist_prior_means(tickers, anchor_date):
     label_prior_mean_with_win_rate(新規関数、prior_mean+prior_statsのwin_rate
     を組み合わせる)を使う。_build_current_q5_prior_means側(現在Q5の銘柄、
     表示自体は既に非表示化済み)は既存のlabel_prior_mean(prior_meanのみ)の
-    まま無変更。"""
+    まま無変更。
+
+    prior_stats_recent5y(design 2026-10-26追加、「全期間×直近5年prior_mean」
+    研究結果を反映): q5_prior_mean_logic.get_prior_stats_recent_years(新規
+    関数)を呼ぶだけの表示・研究専用の追加情報。prior_mean_label(カテゴリー)
+    の判定・表示順ソート(フロントエンドのwlpmSortedList)には一切使わない
+    (直近5年データが変わってもカテゴリー・表示順は変化しない)。"""
     data = q5_prior_mean_logic.load_reference_data()
     events_by_ticker = data.get("events_by_ticker", {})
     result = []
@@ -1047,6 +1054,9 @@ def _build_watchlist_prior_means(tickers, anchor_date):
             "prior_mean": pm,
             "prior_mean_label": q5_prior_mean_logic.label_prior_mean_with_win_rate(pm, prior_stats),
             "prior_stats": prior_stats,
+            "prior_stats_recent5y": q5_prior_mean_logic.get_prior_stats_recent_years(
+                ticker, anchor_date, data=data
+            ),
             "in_reference_universe": ticker in events_by_ticker,
         })
     return result
@@ -1374,22 +1384,26 @@ details.logicinfo .small{margin-top:10px}
 .wlpm{background:white;border-radius:16px;padding:14px 16px;box-shadow:0 2px 14px #0000000c}
 .wlpm-head{font-weight:900;font-size:14px;margin-bottom:2px}
 .wlpm-anchor{color:#98a2b3;font-size:11.5px;margin-bottom:8px}
-.wlpm-table{width:100%;border-collapse:collapse;font-size:12.5px}
-.wlpm-table th{text-align:left;color:#98a2b3;font-weight:700;font-size:11px;padding:4px 6px;border-bottom:1px solid #eef1f5}
-.wlpm-table td{padding:6px 6px;border-bottom:1px solid #eef1f5;color:#475467}
-.wlpm-table td.wlpm-ticker{font-weight:900;color:#172033}
-.wlpm-table td.wlpm-mean-neg{color:#b42318;font-weight:800}
-.wlpm-table td.wlpm-mean-pos{color:#172033;font-weight:700}
-/* Q5信頼度β(design 2026-10-25)。親td(wlpm-mean-neg/pos)の色をそのまま
+/* design 2026-10-26更新: 1ティッカーにつき「カテゴリー+全期間mean/win/n」
+   「直近5年mean/win/n」の2行を基本とする表示(テーブルからdivベースの行に
+   変更、列構成を持たないため表ではなくflexの行リストにした)。中央値・
+   平均最大DDは既存情報を削除せず3行目(小さめ・淡色)として残す。 */
+.wlpm-rows{display:flex;flex-direction:column}
+.wlpm-row{padding:8px 2px;border-bottom:1px solid #eef1f5;font-size:12.5px}
+.wlpm-row:last-child{border-bottom:none}
+.wlpm-row-line1{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;color:#475467}
+.wlpm-ticker{font-weight:900;color:#172033}
+.wlpm-mean-neg{color:#b42318;font-weight:800}
+.wlpm-mean-pos{color:#172033;font-weight:700}
+/* Q5信頼度β(design 2026-10-25)。親(wlpm-mean-neg/pos)の色をそのまま
    継承させる(マイナス=赤、プラス=濃色が自動的に揃う)。ここではfont-sizeのみ
    調整し、独自の色指定はしない。 */
 .wlpm-label{font-size:11px;font-weight:700}
-.wlpm-table .wlpm-flag-warn{color:#b42318;font-weight:700}
-.wlpm-table .wlpm-flag-none{color:#98a2b3}
+.wlpm-row-line2{margin-top:2px;color:#475467;font-size:11.5px}
+.wlpm-row-line3{margin-top:2px;color:#98a2b3;font-size:11px}
+.wlpm-flag-warn{color:#b42318;font-weight:700}
+.wlpm-flag-none{color:#98a2b3}
 .wlpm-empty{color:#98a2b3;font-size:12.5px}
-/* 中央値・勝率・平均最大DD(design 2026-10-25)。1ティッカーにつき1行追加する
-   サブ行(prior_statsがok時のみ描画、insufficient時は行自体が出ない)。 */
-.wlpm-table tr.wlpm-statsrow td{padding-top:0;padding-bottom:8px;color:#98a2b3;font-size:11px}
 /* 取得情報(取得単価・取得日)の訂正フォーム(design 2026-10-20)。 */
 .pfedit-togglebtn{background:#eef1f5;color:#172033;border:0;border-radius:10px;padding:6px 10px;font-weight:700;font-size:11.5px;cursor:pointer}
 .pfedit-form{display:flex;gap:10px;flex-wrap:wrap;align-items:end;padding:10px 0 12px;border-top:1px dashed #dde2e8}
@@ -1774,25 +1788,42 @@ function renderCurrentQ5PriorMeans(list){
 // サーバーから渡されたlist(=watchlist登録順)のまま、並べ替えは行わない。
 // ◎○✕等の最終判定しきい値はまだ決めていないため、ここではマイナス/データ不足/
 // 48銘柄対象外をそれぞれ目立たせるだけの最小限の表示にする。
-// label(第2引数、design 2026-10-25「Q5信頼度β」)はq5_prior_mean_logic.
-// label_prior_meanがprior_meanのみから算出した表示専用文字列をそのまま出す
-// だけ(median/win_rate/max_dd_meanはここでも使わない)。
-function wlpmMeanCellHtml(pm, label){
-  if(!pm || !pm.status || pm.status === "insufficient") return `<td colspan="2" class="wlpm-flag-warn">データ不足${(pm && pm.n) ? `(過去${pm.n}件)` : ""}</td>`;
+// label(第2引数、design 2026-10-25「Q5信頼度β」→2026-10-26更新)は
+// q5_prior_mean_logic.label_prior_mean_with_win_rateが算出した表示専用
+// 文字列をそのまま出すだけ(ここでは一切判定し直さない)。
+//
+// design 2026-10-26ユーザー確定: 1ティッカーにつき基本2行で表示する。
+//   1行目: カテゴリーラベル + 全期間 Q5過去平均/勝率/n
+//   2行目: 直近5年 Q5過去平均/勝率/n(prior_stats_recent5y、新規追加情報。
+//          カテゴリー判定・表示順には一切使わない、表示専用)
+// 既存の中央値・平均最大DD(design 2026-10-25)は削除せず、3行目(小さめ・
+// 淡色)として残す。
+function wlpmLine1Html(pm, label, stats){
+  if(!pm || !pm.status || pm.status === "insufficient"){
+    return `<span class="wlpm-flag-warn">データ不足${(pm && pm.n) ? `(過去${pm.n}件)` : ""}</span>`;
+  }
   const sign = pm.mean >= 0 ? "+" : "";
   const cls = pm.mean < 0 ? "wlpm-mean-neg" : "wlpm-mean-pos";
-  const labelHtml = label ? `<br><span class="wlpm-label">${esc(label)}</span>` : "";
-  return `<td class="${cls}">${sign}${esc(pm.mean)}%${labelHtml}</td><td>${esc(pm.n)}</td>`;
+  const labelHtml = label ? `<span class="wlpm-label">${esc(label)}</span>` : "";
+  const winPart = (stats && stats.status === "ok") ? `勝率${esc(stats.win_rate)}%｜` : "";
+  return `${labelHtml}<span class="${cls}">Q5過去平均 ${sign}${esc(pm.mean)}%｜${winPart}n=${esc(pm.n)}</span>`;
 }
-// 中央値・勝率・平均最大DD(design 2026-10-25)の2行目。prior_statsが
-// insufficientの場合(=prior_meanも常にinsufficient、同一母集団・同一n判定の
-// ため)は何も出さない(1行目のみ、既存表示のまま)。表を崩さないよう、
-// 1ティッカーにつき1行追加する(colspan、既存の4列構成はそのまま)。
-function wlpmStatsRowHtml(stats){
+function wlpmLine2Html(stats5y){
+  if(!stats5y || !stats5y.status || stats5y.status === "insufficient"){
+    const nPart = (stats5y && stats5y.n) ? `(過去${esc(stats5y.n)}件)` : "";
+    return `<div class="wlpm-row-line2">直近5年平均：データ不足${nPart}</div>`;
+  }
+  const sign = stats5y.mean >= 0 ? "+" : "";
+  return `<div class="wlpm-row-line2">直近5年平均 ${sign}${esc(stats5y.mean)}%｜勝率${esc(stats5y.win_rate)}%｜n=${esc(stats5y.n)}</div>`;
+}
+// 中央値・平均最大DD(design 2026-10-25、既存情報を削除せず3行目として残す)。
+// prior_statsがinsufficientの場合(=prior_meanも常にinsufficient)は何も
+// 出さない(既存表示と同じ条件)。
+function wlpmLine3Html(stats){
   if(!stats || !stats.status || stats.status === "insufficient") return "";
   const msign = stats.median >= 0 ? "+" : "";
   const dsign = stats.max_dd_mean >= 0 ? "+" : "";
-  return `<tr class="wlpm-statsrow"><td></td><td colspan="3">中央値 ${msign}${stats.median}%｜勝率 ${stats.win_rate}%｜平均最大DD ${dsign}${stats.max_dd_mean}%</td></tr>`;
+  return `<div class="wlpm-row-line3">中央値 ${msign}${stats.median}%｜平均最大DD ${dsign}${stats.max_dd_mean}%</div>`;
 }
 // 表示順(design 2026-10-26ユーザー確定): 「監視銘柄のQ5過去平均」パネルだけ、
 // カテゴリー優先順位(🔥最強→🔥高期待・高リスク→🟢優良→🟡標準→🔴弱い・
@@ -1826,22 +1857,24 @@ function renderWatchlistPriorMeans(list, anchorDate){
   if(!list){ el.innerHTML = ""; return; }
   const rows = wlpmSortedList(list).map(item => {
     const inRef = item.in_reference_universe;
-    const refFlag = inRef
-      ? `<span class="wlpm-flag-none">対象</span>`
-      : `<span class="wlpm-flag-warn">対象外</span>`;
-    return `<tr>
-      <td class="wlpm-ticker">${esc(item.ticker)}</td>
-      ${wlpmMeanCellHtml(item.prior_mean, item.prior_mean_label)}
-      <td>${refFlag}</td>
-    </tr>${wlpmStatsRowHtml(item.prior_stats)}`;
+    const refFlag = inRef ? "" : `<span class="wlpm-flag-warn">対象外</span>`;
+    const hasFullData = item.prior_mean && item.prior_mean.status === "ok";
+    const line2 = hasFullData ? wlpmLine2Html(item.prior_stats_recent5y) : "";
+    const line3 = hasFullData ? wlpmLine3Html(item.prior_stats) : "";
+    return `<div class="wlpm-row">
+      <div class="wlpm-row-line1">
+        <span class="wlpm-ticker">${esc(item.ticker)}</span>
+        ${wlpmLine1Html(item.prior_mean, item.prior_mean_label, item.prior_stats)}
+        ${refFlag}
+      </div>
+      ${line2}
+      ${line3}
+    </div>`;
   }).join("");
   el.innerHTML = `<div class="wlpm">
     <div class="wlpm-head">監視銘柄のQ5過去平均(登録段階チェック用)</div>
     <div class="wlpm-anchor">基準日：${esc(fmtDate(anchorDate))}時点で計算（この銘柄が今Q5 Day0になったと仮定した場合の参考値）</div>
-    ${list.length ? `<table class="wlpm-table">
-      <thead><tr><th>銘柄</th><th>Q5過去平均</th><th>n</th><th>参照データ</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>` : `<div class="wlpm-empty">監視銘柄が登録されていません</div>`}
+    ${list.length ? `<div class="wlpm-rows">${rows}</div>` : `<div class="wlpm-empty">監視銘柄が登録されていません</div>`}
   </div>`;
 }
 

@@ -189,6 +189,55 @@ class BuildWatchlistPriorMeansTests(unittest.TestCase):
             result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
         self.assertIsNone(result[0]["prior_mean_label"])
 
+    # design 2026-10-26: 「全期間×直近5年prior_mean」研究結果を反映した
+    # prior_stats_recent5yフィールドの追加。
+    def test_prior_stats_recent5y_field_added(self):
+        fake_recent5y = {"status": "ok", "n": 35, "mean": 4.8, "median": 3.0,
+                          "win_rate": 61.0, "max_dd_mean": -7.0, "max_dd_median": -6.0}
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(3.4, 421)), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_stats_recent_years",
+                                return_value=fake_recent5y) as recent_mock:
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        self.assertEqual(result[0]["prior_stats_recent5y"], fake_recent5y)
+        # prior_meanと同じticker/anchor_dateで呼ばれること(同一ticker・同一
+        # 基準日、ただし直近5年だけに絞った別母集団)。
+        recent_mock.assert_called_once_with("AAA", "2026-10-20", data=mock.ANY)
+
+    def test_prior_stats_recent5y_insufficient_does_not_affect_label_or_full_stats(self):
+        # 直近5年側がinsufficientでも、全期間側のprior_mean/prior_mean_label/
+        # prior_statsには一切影響しないこと(design 2026-10-26の絶対条件)。
+        fake_full_stats = {"status": "ok", "n": 421, "mean": 3.4, "median": -0.9,
+                            "win_rate": 44.7, "max_dd_mean": -11.1, "max_dd_median": -9.0}
+        fake_recent5y_insufficient = {"status": "insufficient", "n": 3, "mean": None,
+                                       "median": None, "win_rate": None,
+                                       "max_dd_mean": None, "max_dd_median": None}
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(3.4, 421)), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_stats", return_value=fake_full_stats), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_stats_recent_years",
+                                return_value=fake_recent5y_insufficient):
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        self.assertEqual(result[0]["prior_stats_recent5y"]["status"], "insufficient")
+        # カテゴリー判定はmean=3.4・win_rate=44.7(全期間)のまま → 🔴(弱い)
+        self.assertEqual(result[0]["prior_mean_label"], "🔴 弱い・購入優先度低")
+        self.assertEqual(result[0]["prior_stats"], fake_full_stats)
+
+    def test_registration_order_preserved_with_recent5y_field_too(self):
+        # design 2026-10-26: 直近5年データを追加しても、_build_watchlist_
+        # prior_means自体の返す順序(登録順)は変わらないこと(表示順の並べ替え
+        # はフロントエンドのwlpmSortedListだけが行う、既存仕様通り)。
+        means = {"AAA": _ok_pm(-5.0), "BBB": _ok_pm(10.0), "CCC": _ok_pm(2.0)}
+
+        def fake_pm(ticker, cutoff, data=None):
+            return means[ticker]
+
+        with self._mock_reference_data({"AAA": [], "BBB": [], "CCC": []}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", side_effect=fake_pm):
+            result = app._build_watchlist_prior_means(["AAA", "BBB", "CCC"], "2026-10-20")
+        self.assertEqual([r["ticker"] for r in result], ["AAA", "BBB", "CCC"])
+        self.assertIn("prior_stats_recent5y", result[0])
+
 
 if __name__ == "__main__":
     unittest.main()
