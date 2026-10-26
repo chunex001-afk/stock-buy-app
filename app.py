@@ -2178,7 +2178,12 @@ async function updateRanking(extraMsg){
     renderAiMarketDecline(j.ai_market_decline, j.risk_off);
     renderDailyActions(j.daily_actions, j.portfolio);
     renderPortfolioStatus(j.portfolio);
-    renderCurrentQ5PriorMeans(j.current_q5_prior_means);
+    // design 2026-10-26ユーザー確定: 「現在Q5の銘柄」セクション(見出し・
+    // ticker一覧)自体を非表示にする(下の「監視銘柄のQ5過去平均」と重複
+    // するため)。renderCurrentQ5PriorMeans関数・current_q5_prior_means
+    // データ・算出ロジックは一切変更せず残してある(呼び出しを止めるだけの
+    // 表示専用の変更)。
+    // renderCurrentQ5PriorMeans(j.current_q5_prior_means);
     renderWatchlistPriorMeans(j.watchlist_prior_means, j.watchlist_prior_means_anchor_date);
     renderQ5Momentum(j.q5_momentum);
     renderOpInfo(j);
