@@ -324,5 +324,186 @@ class LabelPriorMeanTests(unittest.TestCase):
         self.assertEqual(pm.label_prior_mean(base), pm.label_prior_mean(with_extra))
 
 
+# ---------------------------------------------------------------------------
+# q5_prior_mean_logic.label_prior_mean_with_win_rate のテスト(design
+# 2026-10-26、「監視銘柄のQ5過去平均」パネル専用の新ラベル、勝率研究結果を
+# 反映)。既存のlabel_prior_meanとは完全に独立した新規関数であり、上の
+# LabelPriorMeanTestsには一切影響しない。
+# ---------------------------------------------------------------------------
+
+def _pm_ok(mean, n=100):
+    return {"status": "ok", "n": n, "mean": mean}
+
+
+def _stats_ok(win_rate, n=100):
+    return {"status": "ok", "n": n, "mean": None, "median": None,
+            "win_rate": win_rate, "max_dd_mean": None, "max_dd_median": None}
+
+
+class LabelPriorMeanWithWinRateTests(unittest.TestCase):
+    # --- 実例(本文記載の実測値に基づく) ---
+    def test_aehr_like_positive_mean_but_low_win_rate_is_weak(self):
+        # AEHR: +3.4%だが勝率44.7% → meanだけなら「🔥最強」だが、勝率が
+        # 50%未満なので「🔴 弱い・購入優先度低」(今回の変更の主目的)。
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(3.4), _stats_ok(44.7)),
+            "🔴 弱い・購入優先度低",
+        )
+
+    def test_mxl_like_is_strongest(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(3.6), _stats_ok(57.4)),
+            "🔥 最強",
+        )
+
+    def test_anet_like_is_excellent(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(2.9), _stats_ok(66.7)),
+            "🟢 優良",
+        )
+
+    def test_panw_like_is_excellent(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(2.7), _stats_ok(62.1)),
+            "🟢 優良",
+        )
+
+    def test_pltr_like_is_high_expectation_high_risk(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(6.2), _stats_ok(60.0)),
+            "🔥 高期待・高リスク",
+        )
+
+    def test_crdo_like_is_high_expectation_high_risk(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(12.8), _stats_ok(66.7)),
+            "🔥 高期待・高リスク",
+        )
+
+    def test_sndk_like_is_high_expectation_high_risk(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(19.5), _stats_ok(80.0)),
+            "🔥 高期待・高リスク",
+        )
+
+    def test_nbis_like_is_high_expectation_high_risk(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(12.5), _stats_ok(59.1)),
+            "🔥 高期待・高リスク",
+        )
+
+    def test_peng_like_negative_mean_is_weak(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(-0.6), _stats_ok(42.6)),
+            "🔴 弱い・購入優先度低",
+        )
+
+    def test_mrvl_like_negative_mean_is_weak_even_if_win_rate_ok(self):
+        # mean<0が最優先(優先順位1)なので、win_rate>=50でも弱いまま。
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(-0.1), _stats_ok(50.3)),
+            "🔴 弱い・購入優先度低",
+        )
+
+    # --- 境界値 ---
+    def test_boundary_mean_0_with_high_win_rate_is_excellent(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(0.0), _stats_ok(55.0)),
+            "🟢 優良",
+        )
+
+    def test_boundary_mean_3_with_high_win_rate_is_strongest(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(3.0), _stats_ok(55.0)),
+            "🔥 最強",
+        )
+
+    def test_boundary_mean_just_under_3_with_high_win_rate_is_excellent(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(2.999), _stats_ok(55.0)),
+            "🟢 優良",
+        )
+
+    def test_boundary_mean_5_with_high_win_rate_is_high_expectation(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(5.0), _stats_ok(55.0)),
+            "🔥 高期待・高リスク",
+        )
+
+    def test_boundary_mean_just_under_5_with_high_win_rate_is_strongest(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(4.999), _stats_ok(55.0)),
+            "🔥 最強",
+        )
+
+    def test_boundary_mean_5_with_low_win_rate_is_special_crash_risk(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(5.0), _stats_ok(54.999)),
+            "⚠️ 暴落リスクに特に注意",
+        )
+
+    def test_boundary_win_rate_50_is_not_weak(self):
+        # win_rate丁度50%は「<50」ではないので弱いラベルにはならない
+        # (mean0-5%なら、win>=55でなければ標準になる)。
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(2.0), _stats_ok(50.0)),
+            "🟡 標準",
+        )
+
+    def test_boundary_win_rate_just_under_50_is_weak(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(2.0), _stats_ok(49.999)),
+            "🔴 弱い・購入優先度低",
+        )
+
+    def test_boundary_win_rate_55_is_excellent_not_standard(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(2.0), _stats_ok(55.0)),
+            "🟢 優良",
+        )
+
+    def test_boundary_win_rate_just_under_55_is_standard(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(2.0), _stats_ok(54.999)),
+            "🟡 標準",
+        )
+
+    def test_mean_0_to_5_with_win_50_to_55_is_standard(self):
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(4.0), _stats_ok(52.0)),
+            "🟡 標準",
+        )
+
+    # --- データ不足(prior_n<10相当)は既存のinsufficient扱いを維持 ---
+    def test_prior_mean_insufficient_returns_none(self):
+        insufficient_pm = {"status": "insufficient", "n": 9, "mean": None}
+        self.assertIsNone(pm.label_prior_mean_with_win_rate(insufficient_pm, _stats_ok(60.0)))
+
+    def test_prior_stats_insufficient_returns_none(self):
+        insufficient_stats = {"status": "insufficient", "n": 9, "mean": None,
+                               "median": None, "win_rate": None,
+                               "max_dd_mean": None, "max_dd_median": None}
+        self.assertIsNone(pm.label_prior_mean_with_win_rate(_pm_ok(3.4), insufficient_stats))
+
+    def test_n_exactly_10_with_ok_status_is_evaluable(self):
+        # prior_n=10(MIN_PRIOR_Nの境界)はstatus="ok"になる前提(get_prior_mean/
+        # get_prior_statsの既存仕様どおり)なので、ラベルが正常に算出される。
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(3.4, n=10), _stats_ok(57.0, n=10)),
+            "🔥 最強",
+        )
+
+    def test_none_prior_mean_returns_none(self):
+        self.assertIsNone(pm.label_prior_mean_with_win_rate(None, _stats_ok(60.0)))
+
+    def test_none_prior_stats_returns_none(self):
+        self.assertIsNone(pm.label_prior_mean_with_win_rate(_pm_ok(3.4), None))
+
+    def test_does_not_affect_existing_label_prior_mean(self):
+        # 既存のlabel_prior_mean(prior_meanのみ)の挙動が、新関数の追加によって
+        # 一切変わっていないことの回帰確認。
+        self.assertEqual(pm.label_prior_mean(_pm_ok(3.4)), "🔥 最強")
+
+
 if __name__ == "__main__":
     unittest.main()

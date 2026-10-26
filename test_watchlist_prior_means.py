@@ -157,14 +157,31 @@ class BuildWatchlistPriorMeansTests(unittest.TestCase):
         self.assertTrue(result[0]["in_reference_universe"])
         self.assertIn("prior_stats", result[0])
 
-    # Q5信頼度β(design 2026-10-25): prior_mean_labelがwatchlist表示にも
-    # 追加されること、かつ本物のq5_prior_mean_logic.label_prior_mean
-    # (mockしていない)がそのまま使われること。
+    # Q5信頼度β(design 2026-10-25→2026-10-26更新): prior_mean_labelが
+    # watchlist表示にも追加されること、かつ本物のq5_prior_mean_logic.
+    # label_prior_mean_with_win_rate(mockしていない、design 2026-10-26で
+    # label_prior_meanから切り替えた新関数)がそのまま使われること。
+    # get_prior_statsもmockし、prior_meanと同じ母集団のwin_rateを渡す
+    # (実際の呼び出し経路どおり、両方がokなら新ラベルが算出される)。
     def test_prior_mean_label_added_and_matches_real_label_logic(self):
+        fake_stats = {"status": "ok", "n": 31, "mean": 3.2, "median": 2.0,
+                      "win_rate": 60.0, "max_dd_mean": -8.0, "max_dd_median": -7.0}
         with self._mock_reference_data({"AAA": []}), \
-             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(3.2, 31)):
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(3.2, 31)), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_stats", return_value=fake_stats):
             result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
         self.assertEqual(result[0]["prior_mean_label"], "🔥 最強")
+
+    def test_prior_mean_label_is_weak_when_win_rate_is_low_even_if_mean_is_high(self):
+        # design 2026-10-26: mean単独では「🔥最強」帯でも、win_rateが50%未満
+        # なら「🔴 弱い・購入優先度低」になること(AEHR問題への対応)。
+        fake_stats = {"status": "ok", "n": 31, "mean": 3.2, "median": -1.0,
+                      "win_rate": 44.7, "max_dd_mean": -9.0, "max_dd_median": -8.0}
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_mean", return_value=_ok_pm(3.2, 31)), \
+             mock.patch.object(app.q5_prior_mean_logic, "get_prior_stats", return_value=fake_stats):
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        self.assertEqual(result[0]["prior_mean_label"], "🔴 弱い・購入優先度低")
 
     def test_prior_mean_label_none_when_insufficient(self):
         with self._mock_reference_data({"AAA": []}), \

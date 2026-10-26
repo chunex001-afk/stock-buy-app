@@ -1028,18 +1028,25 @@ def _build_watchlist_prior_means(tickers, anchor_date):
     prior_stats(design 2026-10-25追加)は_build_current_q5_prior_meansと同様、
     q5_prior_mean_logic.get_prior_stats(新規関数、get_prior_mean無変更)を
     呼ぶだけで、prior_meanと完全に同じ母集団から計算される表示・研究専用の
-    追加情報。prior_mean_label(「Q5信頼度β」)も同様にprior_meanのみから
-    決まる表示専用ラベル(q5_prior_mean_logic.label_prior_mean)。"""
+    追加情報。
+
+    prior_mean_label(design 2026-10-26更新): このパネルだけ、prior_meanの
+    勝率研究(walk-forward OOS検証済み)結果を反映し、q5_prior_mean_logic.
+    label_prior_mean_with_win_rate(新規関数、prior_mean+prior_statsのwin_rate
+    を組み合わせる)を使う。_build_current_q5_prior_means側(現在Q5の銘柄、
+    表示自体は既に非表示化済み)は既存のlabel_prior_mean(prior_meanのみ)の
+    まま無変更。"""
     data = q5_prior_mean_logic.load_reference_data()
     events_by_ticker = data.get("events_by_ticker", {})
     result = []
     for ticker in tickers:
         pm = q5_prior_mean_logic.get_prior_mean(ticker, anchor_date, data=data)
+        prior_stats = q5_prior_mean_logic.get_prior_stats(ticker, anchor_date, data=data)
         result.append({
             "ticker": ticker,
             "prior_mean": pm,
-            "prior_mean_label": q5_prior_mean_logic.label_prior_mean(pm),
-            "prior_stats": q5_prior_mean_logic.get_prior_stats(ticker, anchor_date, data=data),
+            "prior_mean_label": q5_prior_mean_logic.label_prior_mean_with_win_rate(pm, prior_stats),
+            "prior_stats": prior_stats,
             "in_reference_universe": ticker in events_by_ticker,
         })
     return result

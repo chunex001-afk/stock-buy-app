@@ -159,3 +159,49 @@ def label_prior_mean(prior_mean):
     if mean < 10:
         return "⚠️ 暴落リスクに注意"
     return "⚠️ 暴落リスクに特に注意"
+
+
+def label_prior_mean_with_win_rate(prior_mean, prior_stats):
+    """prior_mean(get_prior_meanの戻り値、無変更)とprior_stats(get_prior_stats
+    の戻り値、無変更)のwin_rateを組み合わせた新しい表示ラベル(design 2026-10-26、
+    ユーザー確定: 「監視銘柄のQ5過去平均」パネル専用。prior_meanだけでは
+    AEHR(+3.4%だが勝率44.7%)を「🔥最強」と誤って表示してしまう問題への対応)。
+
+    【絶対に守ること】
+    - get_prior_mean()・get_prior_stats()・label_prior_mean()は一切変更しない
+      (この関数は完全に新規・独立。既存のlabel_prior_meanの呼び出し箇所・
+      挙動には一切影響しない)。
+    - ここで返すのは表示用ラベル文字列のみ。Q1〜Q5判定・Q5 Day0判定・BUY判定・
+      ranking・20営業日保有ルール・Risk-off・switch_recommendation_logicの
+      いずれにも使用しない。
+    - prior_meanとprior_statsが同一ティッカー・同一anchor_dateから計算された
+      組であることを呼び出し側が保証する(両者は同じ母集団なので、片方が
+      "ok"ならもう片方も通常"ok"になるが、念のため両方のstatusを確認する)。
+
+    判定優先順位(ユーザー確定、2026-10-26、prior_mean[%]・prior_win_rate[%]
+    に対して、上から順に最初に当たった条件を採用):
+      1. mean < 0 または win_rate < 50        : "🔴 弱い・購入優先度低"
+      2. mean >= 5 かつ win_rate >= 55         : "🔥 高期待・高リスク"
+      3. mean >= 5 かつ win_rate < 55          : "⚠️ 暴落リスクに特に注意"
+      4. 3 <= mean < 5 かつ win_rate >= 55      : "🔥 最強"
+      5. 0 <= mean < 3 かつ win_rate >= 55      : "🟢 優良"
+      6. それ以外(0<=mean<5 かつ 50<=win_rate<55) : "🟡 標準"
+
+    戻り値: ラベル文字列、またはNone(prior_mean・prior_statsいずれかの
+    status != "ok"、既存の「データ不足」表示をそのまま使うためここでは
+    重複ラベルを作らない)。"""
+    if not prior_mean or prior_mean.get("status") != "ok":
+        return None
+    if not prior_stats or prior_stats.get("status") != "ok":
+        return None
+    mean = prior_mean["mean"]
+    win_rate = prior_stats["win_rate"]
+    if mean < 0 or win_rate < 50:
+        return "🔴 弱い・購入優先度低"
+    if mean >= 5:
+        return "🔥 高期待・高リスク" if win_rate >= 55 else "⚠️ 暴落リスクに特に注意"
+    if mean >= 3:
+        return "🔥 最強" if win_rate >= 55 else "🟡 標準"
+    if win_rate >= 55:
+        return "🟢 優良"
+    return "🟡 標準"
