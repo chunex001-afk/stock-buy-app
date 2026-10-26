@@ -1794,11 +1794,37 @@ function wlpmStatsRowHtml(stats){
   const dsign = stats.max_dd_mean >= 0 ? "+" : "";
   return `<tr class="wlpm-statsrow"><td></td><td colspan="3">中央値 ${msign}${stats.median}%｜勝率 ${stats.win_rate}%｜平均最大DD ${dsign}${stats.max_dd_mean}%</td></tr>`;
 }
+// 表示順(design 2026-10-26ユーザー確定): 「監視銘柄のQ5過去平均」パネルだけ、
+// カテゴリー優先順位(🔥最強→🔥高期待・高リスク→🟢優良→🟡標準→🔴弱い・
+// 購入優先度低)を第1キー、同カテゴリー内はprior_win_rate降順を第2キーで
+// 並べる。_build_watchlist_prior_means側(登録順を維持する既存仕様・既存
+// テストtest_registration_order_preserved_not_sorted_by_mean、無変更)は
+// 変更せず、ここ(JS描画直前)でだけソートする表示専用の変更。ラベル判定
+// ロジック(label_prior_mean_with_win_rate)・prior_mean/prior_win_rate/
+// prior_nの計算方法には一切触れない。ラベルが無い(データ不足)銘柄は
+// 既知の5カテゴリーより後ろに回す。
+const WLPM_CATEGORY_PRIORITY = {
+  "🔥 最強": 1,
+  "🔥 高期待・高リスク": 2,
+  "🟢 優良": 3,
+  "🟡 標準": 4,
+  "🔴 弱い・購入優先度低": 5,
+};
+function wlpmSortedList(list){
+  return list.slice().sort((a, b) => {
+    const pa = WLPM_CATEGORY_PRIORITY[a.prior_mean_label] || 99;
+    const pb = WLPM_CATEGORY_PRIORITY[b.prior_mean_label] || 99;
+    if(pa !== pb) return pa - pb;
+    const wa = (a.prior_stats && a.prior_stats.status === "ok") ? a.prior_stats.win_rate : -Infinity;
+    const wb = (b.prior_stats && b.prior_stats.status === "ok") ? b.prior_stats.win_rate : -Infinity;
+    return wb - wa;
+  });
+}
 function renderWatchlistPriorMeans(list, anchorDate){
   const el = document.getElementById("watchlistPriorMeans");
   if(!el) return;
   if(!list){ el.innerHTML = ""; return; }
-  const rows = list.map(item => {
+  const rows = wlpmSortedList(list).map(item => {
     const inRef = item.in_reference_universe;
     const refFlag = inRef
       ? `<span class="wlpm-flag-none">対象</span>`
