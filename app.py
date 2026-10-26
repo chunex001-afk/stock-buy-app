@@ -1746,10 +1746,14 @@ function renderCurrentQ5PriorMeans(list){
   const el = document.getElementById("currentQ5PriorMeans");
   if(!el) return;
   if(!list){ el.innerHTML = ""; return; }
+  // design 2026-10-26ユーザー確定: 下の「監視銘柄のQ5過去平均(登録段階
+  // チェック用)」パネルと情報が重複するため、ここではprior_mean/prior_stats
+  // (Q5過去平均・prior_n・中央値・勝率・平均最大DD等)の表示を削除し、
+  // 「現在Q5の銘柄」自体(ticker名の一覧)だけを残す。dactionPriorMeanHtml/
+  // dactionPriorStatsHtml関数・prior_mean計算ロジック・データは他の呼び出し
+  // 箇所(BUYカード等)でそのまま使われているため無変更。
   const rows = list.map(item => `<div class="currentq5pm-row">
     <span class="currentq5pm-ticker">${esc(item.ticker)}</span>
-    ${dactionPriorMeanHtml(item.prior_mean, item.prior_mean_label)}
-    ${dactionPriorStatsHtml(item.prior_stats)}
   </div>`).join("");
   el.innerHTML = `<div class="currentq5pm">
     <div class="currentq5pm-head">現在Q5の銘柄</div>
@@ -2326,6 +2330,9 @@ function qBadgeHtml(q){
 // 揃わずbeta===nullの場合は推測値を出さず「β —」「ベータ算出不可」と表示する。
 // 超高ベータ(β>=2.5)の場合のみ「Q1〜Q5の段階差は小さめ」を追加表示する
 // (「差なし」とは表示しない、Q1〜Q5判定の無効化・Q5除外は行わない)。
+// design 2026-10-26ユーザー確定: 今後のQ5判断材料としてベータを使わない方針
+// のため、render()のカードからこの関数の呼び出しを削除した(関数自体・
+// beta_logic.py・算出データは無変更、呼び出されなくなっただけ)。
 function betaHtml(q){
   q = q || {};
   const hasBeta = q.beta !== null && q.beta !== undefined;
@@ -2398,6 +2405,9 @@ function q5ProgressHtml(q){
 // 発生から最大40営業日保持される(発生・保持・失効の判定はrefresh.py側で
 // 完結済み、ここは表示専用)。購入不可等の判定には一切関与しない。
 // 将来の下落を断定する表現(「〜になる確率」等)は使わない。
+// design 2026-10-26ユーザー確定: 現在のQ5判断材料として使わない方針のため、
+// render()のカードからこの関数の呼び出しを削除した(関数自体・発生/失効の
+// 判定ロジック・refresh.py側データは無変更、呼び出されなくなっただけ)。
 function q5WarningHtml(q){
   if(!q || q.status !== "ready" || !q.q5_warning) return "";
   return `<div class="q5warn">
@@ -2412,6 +2422,10 @@ function q5WarningHtml(q){
 // SMA20以上を3取引日連続維持)の判定はrefresh.py側で完結済み、ここでは値の
 // 解釈・判定は一切行わない。購入不可・売却・除外の判定ではなく、保有継続・
 // 買い増しを再検討する材料としての補助表示(一覧・ランキングからは除外しない)。
+// design 2026-10-26ユーザー確定: 現在のQ5判断で中線割れによる購入中断を
+// 使わない方針のため、render()のカードからこの関数の呼び出しを削除した
+// (関数自体・発生/解除の判定ロジック・refresh.py側データは無変更、
+// 呼び出されなくなっただけ)。
 function q5MidlineHaltHtml(q){
   if(!q || q.status !== "ready" || !q.q5_midline_halt) return "";
   const h = q.q5_midline_halt;
@@ -2522,11 +2536,8 @@ function render(rows){
         <span class="tickerbig">${esc(x.ticker)}</span>
         ${qBadgeHtml(x.quintile)}
       </div>
-      ${betaHtml(x.quintile)}
       ${q5SignalHtml(x.quintile)}
       ${q5ProgressHtml(x.quintile)}
-      ${q5WarningHtml(x.quintile)}
-      ${q5MidlineHaltHtml(x.quintile)}
       ${qDailyBreakdownHtml(x.quintile)}
 
       <div class="pricebar">
@@ -2549,7 +2560,12 @@ function render(rows){
 }
 
 updateRanking();
-loadComparison();
+// 「📈 実績比較：私 vs Q5」(① Q5直近勢い・② 実績比較)は表示を停止する
+// (design 2026-10-26ユーザー確定: サンプル数が少なく比較・判断する段階では
+// ないため)。renderComparison/loadComparison関数・/api/compare/q5universe・
+// comparison_logic.py側のロジック・データは一切変更せず残してある
+// (呼び出しを止めるだけの表示専用の変更)。
+// loadComparison();
 
 // PWA化(design 2026-09-17): ホーム画面追加・スタンドアロン起動のためのSW登録のみ。
 // /sw.js側でAPI(/api/*)は明示的にキャッシュ対象外にしており、株価・Q1〜Q5・
