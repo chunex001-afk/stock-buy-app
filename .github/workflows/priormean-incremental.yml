@@ -1,0 +1,44 @@
+name: prior_mean incremental update (daily)
+
+# prior_mean差分更新の設計(2026-10-27研究・design確認済み)Phase 2。
+# 既存の daily-refresh.yml / q5-universe-refresh.yml とは完全に分離した
+# 専用ワークフロー。既存のQ1〜Q5判定・Q5 Day0判定・BUY/SELL判定・
+# prior_mean計算・ラベル判定・Q5ランキング・Risk-off・switch
+# recommendation・watchlist・q5_prior_mean_reference.jsonには一切関与しない。
+#
+# cron時刻だけで「本体のdaily-refreshが今日の分を処理済みか」を保証しない。
+# refresh_priormean_incremental.py側がquintile:pool_historyの最終日を確認し、
+# 本体がまだ今日の分を処理していなければTwelve Dataを一切呼ばずに終了する
+# (API credits消費ゼロでスキップできる安全策、q5-universe-refresh.ymlと
+# 同じ設計方針)。
+
+on:
+  schedule:
+    # UTC 23:40 = JST 8:40(daily-refresh・q5-universe-refreshの後を目安)。
+    - cron: "40 23 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: priormean-incremental
+  cancel-in-progress: false
+
+jobs:
+  priormean-incremental:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run prior_mean incremental update
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python refresh_priormean_incremental.py

@@ -1,0 +1,49 @@
+name: prior_mean new ticker backfill (1 ticker per run)
+
+# prior_mean差分更新の設計(2026-10-27研究・design確認済み)Phase 2。
+# priormean:pending_backfillキューに新規銘柄が無ければ即座に終了する
+# (API credits消費ゼロ)。1回の実行で処理するのは最大1銘柄のみ(複数の
+# 新規銘柄が溜まっていても既存処理を圧迫しない、ユーザー確定仕様)。
+#
+# 既存の daily-refresh.yml / q5-universe-refresh.yml / priormean-
+# incremental.yml とは完全に分離した専用ワークフロー。既存のQ1〜Q5判定・
+# BUY判定・prior_mean計算・ラベル判定・Risk-off・watchlist・
+# q5_prior_mean_reference.jsonには一切関与しない。
+#
+# 【既知の制約】現時点(2026-10-27)では、本当に未知の新規銘柄(ローカル
+# 価格キャッシュが存在しない銘柄)の数十年分の価格データ取得方法が
+# 未実装・未検証です(Twelve Dataの既存fetch_daily_seriesはoutputsize=300
+# が上限のため)。この制約が解消されるまでは、このワークフローは
+# .q5_price_cache/<ticker>.jsonが別途用意されている銘柄でのみ正しく
+# 動作します。
+
+on:
+  schedule:
+    # UTC 23:50 = JST 8:50(priormean-incrementalの後を目安)。
+    - cron: "50 23 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: priormean-backfill
+  cancel-in-progress: false
+
+jobs:
+  priormean-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill one pending new ticker (if any)
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python run_pending_priormean_backfill.py
