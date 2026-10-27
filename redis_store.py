@@ -270,6 +270,102 @@ def set_portfolio_state(data):
 # 新しい別ジョブ(refresh_q5_universe.py)専用の読み書きのみ。
 # ---------------------------------------------------------------------------
 
+def get_priormean_bounds_history():
+    """prior_mean差分更新の設計(2026-10-27、design調査・Phase 0実装)専用の
+    保存データを取得する。REFERENCE_UNIVERSE(quintile_logic.REFERENCE_UNIVERSE、
+    48銘柄+SPY、無変更)の過去の日次Q1〜Q5 bounds時系列
+    ({"YYYY-MM-DD": [b1,b2,b3,b4], ...}、quintile_logic.pool_percentile_bounds
+    の戻り値をそのまま日付ごとに保存したもの)。
+
+    新規ウォッチリスト銘柄を将来バックフィルする際(Phase 1以降で実装予定)、
+    REFERENCE_UNIVERSE全体のpred_scoreを再計算せずに済むようにするための
+    前提データであり、現時点ではどの判定ロジックからも参照されない独立した
+    データ(build_priormean_bounds_history.pyが書き込むだけ)。
+
+    既存のQ1〜Q5判定・Q5 Day0判定・prior_mean計算・ラベル判定・Q5ランキング・
+    BUY判定・Risk-off・switch_recommendation_logic・AI市場下落判定のいずれにも
+    一切接続しない。TTLは意図的に付けない(長期保持が必要な履歴データのため)。
+    または None(未生成時)。"""
+    return get_json("priormean:bounds_history")
+
+
+def set_priormean_bounds_history(data):
+    return set_json("priormean:bounds_history", data)
+
+
+def get_priormean_events(ticker):
+    """prior_mean差分更新Phase 1(design調査・2026-10-27確認済み)。新規
+    ウォッチリスト銘柄(既存q5_prior_mean_reference.jsonの56銘柄には含まれ
+    ない銘柄)のQ5 Day0履歴を取得する。
+
+    戻り値: [{"date","ret20","max_dd20"}, ...](既存の
+    q5_prior_mean_reference.jsonのevents_by_ticker[ticker]と完全に同一の
+    形式)、または None(未バックフィル時)。
+
+    既存56銘柄のevents_by_ticker(q5_prior_mean_reference.json)とは完全に
+    別のキー空間であり、このキーの内容が既存56銘柄のデータに混ざることは
+    ない(呼び出し側がpriormean_incremental_logic.merge_reference_dataで
+    論理的に結合する時だけ、get_prior_mean/get_prior_statsに渡す一時的な
+    dictの中で合流する。ファイル自体は別々のまま)。TTLは付けない。"""
+    return get_json(f"priormean:events:{ticker.upper()}")
+
+
+def set_priormean_events(ticker, events):
+    return set_json(f"priormean:events:{ticker.upper()}", events)
+
+
+def get_priormean_backfill_status(ticker):
+    """prior_mean差分更新Phase 1専用。新規銘柄のバックフィル進行状況を
+    取得する。戻り値: "pending" | "in_progress" | "done" | "failed" の
+    いずれか、または None(一度もバックフィル処理の対象になっていない=
+    「新規銘柄」として検出されうる状態)。"""
+    return get_json(f"priormean:backfill_status:{ticker.upper()}")
+
+
+def set_priormean_backfill_status(ticker, status):
+    return set_json(f"priormean:backfill_status:{ticker.upper()}", status)
+
+
+def get_priormean_pending_backfill():
+    """prior_mean差分更新Phase 2専用。新規にバックフィルが必要だと検出
+    された銘柄のキュー。戻り値: ["<TICKER>", ...](検出順)、または None
+    (未初期化時)。refresh_priormean_incremental.py(日次検出)が追加し、
+    run_pending_priormean_backfill.py(別ワークフロー、1回1銘柄処理)が
+    1件ずつ取り出して消費する。既存のwatchlist/quintile:state等とは
+    完全に独立したキーで、どの判定ロジックからも参照されない。"""
+    return get_json("priormean:pending_backfill")
+
+
+def set_priormean_pending_backfill(tickers):
+    return set_json("priormean:pending_backfill", list(tickers))
+
+
+def get_priormean_incremental_state():
+    """prior_mean差分更新Phase 2専用。日次差分更新(refresh_priormean_
+    incremental.py)の進行状態。
+
+    戻り値: {"prev_q": {"<TICKER>": "Q4", ...}(バックフィル済み銘柄の
+    前回判定時のQ、Day0検出の起点。quintile:state:{ticker}が既に毎日
+    保持しているcurrent_q/previous_qとは別に、このジョブ自身が「最後に
+    処理した日の時点のQ」として独立に保持する。理由: quintile:stateは
+    本体refresh.pyの都合で上書きされていくため、このジョブが処理に失敗した
+    日があっても、このジョブ自身の最終処理地点を正しく追跡するため),
+    "pending": [{"ticker","day0_date","day0_price"}, ...](Day0検出済みだが
+    まだ20営業日経過していないイベント。(ticker, day0_date)の組ごとに
+    1件。確定したらpriormean:events:{ticker}へ移動しここからは削除する),
+    "last_processed_date": "YYYY-MM-DD"}
+    または None(未初期化時)。
+
+    既存のquintile:state・q5universe:state・watchlist等とは完全に独立した
+    キーであり、どのQ1〜Q5判定・BUY判定・Risk-off・switch recommendation
+    からも参照されない(読み取りも書き込みもこのジョブ専用)。"""
+    return get_json("priormean:incremental_state")
+
+
+def set_priormean_incremental_state(data):
+    return set_json("priormean:incremental_state", data)
+
+
 def get_q5universe_state():
     """48銘柄の将来成績蓄積状態を取得する。
     戻り値: {"prev_q": {"<TICKER>": "Q4", ...}(前回判定時のQ、Day0検出の
