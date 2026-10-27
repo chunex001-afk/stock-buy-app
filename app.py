@@ -13,6 +13,7 @@ import beta_logic
 import comparison_logic
 import market_regime_display
 import push_notify
+import priormean_incremental_logic
 import q5_prior_mean_logic
 import quintile_logic
 import redis_store as store
@@ -1048,7 +1049,9 @@ def _build_watchlist_prior_means(tickers, anchor_date):
               "max_dd_mean","max_dd_median"},
               "prior_stats_recent5y": 同じ形(直近5年だけの集計)、
               "in_reference_universe": bool(q5_prior_mean_reference.jsonの
-              48銘柄に存在するか)}, ...]  (tickersと同じ順序・同じ件数)。
+              既存56銘柄、またはPhase 1/2でRedisにバックフィル済みの新規
+              銘柄として、イベント履歴を1件以上持っているか)}, ...]
+              (tickersと同じ順序・同じ件数)。
 
     prior_stats(design 2026-10-25追加)は_build_current_q5_prior_meansと同様、
     q5_prior_mean_logic.get_prior_stats(新規関数、get_prior_mean無変更)を
@@ -1066,8 +1069,32 @@ def _build_watchlist_prior_means(tickers, anchor_date):
     研究結果を反映): q5_prior_mean_logic.get_prior_stats_recent_years(新規
     関数)を呼ぶだけの表示・研究専用の追加情報。prior_mean_label(カテゴリー)
     の判定・表示順ソート(フロントエンドのwlpmSortedList)には一切使わない
-    (直近5年データが変わってもカテゴリー・表示順は変化しない)。"""
+    (直近5年データが変わってもカテゴリー・表示順は変化しない)。
+
+    design 2026-10-28追加: 静的56銘柄に無い銘柄(新規ウォッチリスト銘柄)は、
+    priormean:events:{ticker}(Phase 1/2、redis_store.get_priormean_events、
+    無変更)にバックフィル済みのイベントがあればpriormean_incremental_logic.
+    merge_reference_data(無変更)で論理的に合流させてから表示する。
+    get_prior_mean/get_prior_stats自体・q5_prior_mean_reference.json・既存
+    56銘柄の値は一切変更しない(static_events_by_tickerに無い銘柄だけが
+    対象、merge_reference_data自体が既存56銘柄を上書きしない防御的実装)。
+    Redis未設定・取得失敗時(get_priormean_eventsは例外を投げずNoneを返す
+    既存方針)はそのticker分だけ静的JSONのみにフォールバックし、他の銘柄の
+    表示には影響しない(_compute_daily_actionsのBUY判定・Q1〜Q5判定・
+    switch_recommendation_logicの判定条件は、この関数とは別に無変更のまま
+    q5_prior_mean_logic.get_prior_mean(ticker, anchor_date)〈data省略〉を
+    呼んでおり、この変更の影響を受けない)。"""
     data = q5_prior_mean_logic.load_reference_data()
+    static_events_by_ticker = data.get("events_by_ticker", {})
+    redis_events_by_ticker = {}
+    for ticker in tickers:
+        if ticker in static_events_by_ticker:
+            continue
+        events = store.get_priormean_events(ticker)
+        if events:
+            redis_events_by_ticker[ticker] = events
+    if redis_events_by_ticker:
+        data = priormean_incremental_logic.merge_reference_data(data, redis_events_by_ticker)
     events_by_ticker = data.get("events_by_ticker", {})
     result = []
     for ticker in tickers:

@@ -239,5 +239,115 @@ class BuildWatchlistPriorMeansTests(unittest.TestCase):
         self.assertIn("prior_stats_recent5y", result[0])
 
 
+# design 2026-10-28追加: 静的56銘柄に無い新規ウォッチリスト銘柄について、
+# Redis(priormean:events:{ticker}、Phase 1/2、無変更)のバックフィル済み
+# イベントをpriormean_incremental_logic.merge_reference_data(無変更)経由で
+# 表示に合流させる配線のテスト。get_prior_mean/get_prior_stats自体・
+# q5_prior_mean_reference.json・既存56銘柄の値は一切変更していないことを
+# 確認するのが主眼(実際のget_prior_mean/get_prior_stats/merge_reference_data
+# はmockせず、本物のロジックをそのまま走らせる)。
+_NEWCO_EVENTS = [
+    {"date": "2020-01-06", "ret20": 5.0, "max_dd20": -2.0},
+    {"date": "2020-02-10", "ret20": -3.0, "max_dd20": -6.0},
+    {"date": "2020-03-16", "ret20": 8.0, "max_dd20": -1.0},
+    {"date": "2020-04-20", "ret20": 2.0, "max_dd20": -3.0},
+    {"date": "2020-05-25", "ret20": 4.0, "max_dd20": -2.5},
+    {"date": "2020-06-29", "ret20": -1.0, "max_dd20": -5.0},
+    {"date": "2020-08-03", "ret20": 6.0, "max_dd20": -1.5},
+    {"date": "2020-09-07", "ret20": 3.0, "max_dd20": -2.0},
+    {"date": "2020-10-12", "ret20": 7.0, "max_dd20": -1.0},
+    {"date": "2020-11-16", "ret20": -2.0, "max_dd20": -4.0},
+    {"date": "2020-12-21", "ret20": 1.0, "max_dd20": -3.0},
+]  # 11件 >= MIN_PRIOR_N(10)、いずれもanchor_date(2026-10-20)より過去
+
+
+class WatchlistPriorMeansRedisFallbackTests(unittest.TestCase):
+    """新規銘柄のRedisバックフィル済みイベントが、既存のget_prior_mean/
+    get_prior_stats/merge_reference_dataをそのまま使って表示に反映される
+    こと、既存56銘柄・Redis障害時の安全なフォールバックには影響しないこと
+    を確認する(いずれも本物のロジックを使用、mockは店store.get_priormean_
+    eventsだけ)。"""
+
+    def _mock_reference_data(self, events_by_ticker):
+        return mock.patch.object(
+            app.q5_prior_mean_logic, "load_reference_data",
+            return_value={"events_by_ticker": events_by_ticker},
+        )
+
+    # 2. FORMなど新規銘柄 → Redis eventsが存在する場合、prior_meanが表示される
+    def test_new_ticker_with_redis_events_shows_real_prior_mean(self):
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.store, "get_priormean_events",
+                                side_effect=lambda t: _NEWCO_EVENTS if t == "FORM" else None) as m:
+            result = app._build_watchlist_prior_means(["AAA", "FORM"], "2026-10-20")
+        form_row = next(r for r in result if r["ticker"] == "FORM")
+        self.assertEqual(form_row["prior_mean"]["status"], "ok")
+        self.assertEqual(form_row["prior_mean"]["n"], 11)
+        self.assertTrue(form_row["in_reference_universe"])
+        # 既存56銘柄(AAA)はそもそもRedisへ問い合わせない(次のテストで確認)。
+        m.assert_called_once_with("FORM")
+
+    # 3. Redis eventsが存在しない新規銘柄 → 従来どおりデータ不足
+    def test_new_ticker_without_redis_events_stays_insufficient(self):
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.store, "get_priormean_events", return_value=None):
+            result = app._build_watchlist_prior_means(["AAA", "ZZZ"], "2026-10-20")
+        zzz_row = next(r for r in result if r["ticker"] == "ZZZ")
+        self.assertEqual(zzz_row["prior_mean"]["status"], "insufficient")
+        self.assertFalse(zzz_row["in_reference_universe"])
+
+    # 1. 既存56銘柄 → prior_mean/prior_n/win_rateが変更前と完全一致
+    #    (静的JSONに既に存在する銘柄はRedisへ問い合わせず、常に静的データの
+    #    値だけで計算される)
+    def test_existing_ticker_never_triggers_redis_lookup(self):
+        static_events = {"AAA": _NEWCO_EVENTS}  # AAAは静的JSON側に"既存56銘柄"として存在する想定
+        with self._mock_reference_data(static_events), \
+             mock.patch.object(app.store, "get_priormean_events") as m:
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        m.assert_not_called()
+        self.assertEqual(result[0]["prior_mean"]["n"], 11)
+        self.assertTrue(result[0]["in_reference_universe"])
+
+    def test_existing_ticker_value_identical_with_or_without_redis_data_for_others(self):
+        # 既存56銘柄(AAA)の値が、他の新規銘柄(FORM)にRedisデータが
+        # 有る/無しに関わらず完全に同一であること(merge_reference_dataの
+        # 防御的実装=既存銘柄を絶対に上書きしないことの、配線経由での確認)。
+        static_events = {"AAA": _NEWCO_EVENTS}
+        with self._mock_reference_data(static_events), \
+             mock.patch.object(app.store, "get_priormean_events", return_value=None):
+            result_without_redis = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        with self._mock_reference_data(static_events), \
+             mock.patch.object(app.store, "get_priormean_events",
+                                side_effect=lambda t: _NEWCO_EVENTS if t == "FORM" else None):
+            result_with_redis = app._build_watchlist_prior_means(["AAA", "FORM"], "2026-10-20")
+        aaa_without = result_without_redis[0]
+        aaa_with = next(r for r in result_with_redis if r["ticker"] == "AAA")
+        self.assertEqual(aaa_without, aaa_with)
+
+    # 4. Redis取得失敗 → 既存56銘柄の表示が壊れない
+    def test_redis_unconfigured_or_failed_does_not_break_existing_tickers(self):
+        # redis_store.get_priormean_eventsは実際には例外を投げずNoneを返す
+        # 既存方針(redis_store.pyのis_configured()チェック・try/except)。
+        # ここではそれをそのまま再現する(mockなし、未設定のままの本物の
+        # redis_store.get_priormean_eventsを使う)。
+        self.assertFalse(app.store.is_configured())  # 前提条件(ローカルにUpstash認証情報は無い)
+        static_events = {"AAA": _NEWCO_EVENTS}
+        with self._mock_reference_data(static_events):
+            result = app._build_watchlist_prior_means(["AAA", "ZZZ"], "2026-10-20")
+        aaa_row = next(r for r in result if r["ticker"] == "AAA")
+        zzz_row = next(r for r in result if r["ticker"] == "ZZZ")
+        self.assertEqual(aaa_row["prior_mean"]["status"], "ok")
+        self.assertEqual(aaa_row["prior_mean"]["n"], 11)
+        self.assertEqual(zzz_row["prior_mean"]["status"], "insufficient")
+
+    def test_in_reference_universe_true_only_when_events_exist_after_merge(self):
+        with self._mock_reference_data({}), \
+             mock.patch.object(app.store, "get_priormean_events",
+                                side_effect=lambda t: _NEWCO_EVENTS if t == "FORM" else None):
+            result = app._build_watchlist_prior_means(["FORM", "ZZZ"], "2026-10-20")
+        flags = {r["ticker"]: r["in_reference_universe"] for r in result}
+        self.assertEqual(flags, {"FORM": True, "ZZZ": False})
+
+
 if __name__ == "__main__":
     unittest.main()
