@@ -11,6 +11,7 @@ from flask import Flask, jsonify, request, render_template_string
 
 import beta_logic
 import comparison_logic
+import market_regime_display
 import push_notify
 import q5_prior_mean_logic
 import quintile_logic
@@ -682,6 +683,29 @@ def _build_riskoff_view():
     }
 
 
+def _build_market_regime_view():
+    """市場環境(SPY過熱度)パネル(design 2026-10-27、Candidate C研究の表示専用
+    実装)の表示専用ビューを組み立てる。既存のstore.get_riskoff_state()が既に
+    保持しているspy_close/sma200をそのまま再利用するだけで、新しい外部API
+    取得は一切行わない。
+
+    研究結果: Candidate C(SPY過熱時にQ5新規購入を止める、という仮の売買ルール)
+    は2026年の完全ホールドアウトOOSで失敗したため、本番の自動判定(Q1〜Q5判定・
+    Q5 Day0判定・BUY判定・Q5ランキング・prior_mean・Risk-off・switch
+    recommendation・ポートフォリオ・資金配分のいずれ)にも一切使用せず、
+    market_regime_display.build_market_regime_view()(表示専用、無変更)が
+    組み立てた値をそのまま返すだけ。他のロジックはこの戻り値を参照しない。
+
+    データ不足(refresh.py未実行直後等)の場合はNone(呼び出し側のJSはパネル
+    自体を表示しない、_build_ai_market_decline_viewと同じ既存の扱い方)。"""
+    state = store.get_riskoff_state()
+    if not state:
+        return None
+    return market_regime_display.build_market_regime_view(
+        state.get("spy_close"), state.get("sma200"),
+    )
+
+
 def _ai_market_decline_bucket(pct_down):
     """pct_down(0〜100)が該当するバックテスト参考区分を返す(design
     2026-10-23、refresh.AI_MARKET_DECLINE_BACKTEST_BUCKETSをそのまま参照する
@@ -1299,6 +1323,20 @@ details.logicinfo .small{margin-top:10px}
 .aimktdecl-disclaimer{font-size:10.5px;color:#98a2b3;margin-top:8px;line-height:1.5}
 .aimktdecl-riskoff-note{font-size:12px;font-weight:700;color:#b42318;margin-top:10px;background:#fdeceb;border-radius:8px;padding:8px 10px;line-height:1.6}
 
+/* 市場環境(SPY過熱度)パネル(design 2026-10-27、Candidate C研究の表示専用
+   実装)。Q1〜Q5判定・BUY判定・ランキング・Risk-offには一切関与しない参考
+   表示。Risk-off(赤)とは明確に区別し、「過熱=危険」に見えすぎないよう
+   アンバー系の中間色を使う(通常=緑、やや高め=アンバー、過熱=オレンジ)。 */
+#marketregime{margin-bottom:18px}
+.mktregime{border-radius:14px;padding:12px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.mktregime-normal{background:#eefcf3;border:1px solid #bbe8cf}
+.mktregime-elevated{background:#fff8e8;border:1px solid #f3dfa0}
+.mktregime-overheated{background:#fff3e6;border:1px solid #f3c98a}
+.mktregime-title{font-weight:800;font-size:14px;color:#172033}
+.mktregime-dev{font-size:15px;font-weight:800;color:#172033}
+.mktregime-note{font-size:11px;color:#8a7a5c;flex-basis:100%;line-height:1.5;margin-top:2px}
+.mktregime-disclaimer{font-size:10.5px;color:#98a2b3;flex-basis:100%}
+
 /* 今日のアクション(design 2026-10-16、IMPLEMENTATION_DESIGN_daily_action_ui.md
    フェーズ4)。daily_actions(SELL→PROFIT→BUYの優先順でサーバー側が計算済み)を
    そのままカードとして描画するだけ。Q1〜Q5判定・Day0判定・Risk-off判定には
@@ -1454,15 +1492,17 @@ details.cmp-details .cmp-note:first-child{margin-top:6px}
 <div class="wrap">
 <div id="riskoff"></div>
 <div id="aimarketdecline"></div>
+<div id="marketregime"></div>
 <div id="dailyActions"></div>
 <div id="portfolioStatus"></div>
 <div id="currentQ5PriorMeans"></div>
 <div id="comparePanel"></div>
-<div class="title">📊 保有銘柄のQ1〜Q5状態</div>
-<div id="tickerCount" class="tickercount"></div>
-<div id="watchlistPriorMeans"></div>
-<div class="sub">実データ版｜最大20銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
 
+<!-- design 2026-10-27: 「🔔更新通知・銘柄追加・運用情報」ブロックを
+     「📊 保有銘柄のQ1〜Q5状態」の上に移動(表示順のみの変更、どの要素も
+     中身は無変更)。Q1〜Q5判定・Day0判定・BUY判定・prior_mean・watchlist・
+     switch recommendation・Risk-off・AI市場下落判定・市場過熱判定・購入
+     判定・API取得処理のいずれにも一切影響しない。 -->
 <div id="pushNotifyBar"></div>
 
 <div class="card">
@@ -1476,6 +1516,11 @@ details.cmp-details .cmp-note:first-child{margin-top:6px}
   <div id="status" class="small">読み込み中…</div>
   <details class="opinfo"><summary>運用情報</summary><div id="opinfo" class="opbody"></div></details>
 </div>
+
+<div class="title">📊 保有銘柄のQ1〜Q5状態</div>
+<div id="tickerCount" class="tickercount"></div>
+<div id="watchlistPriorMeans"></div>
+<div class="sub">実データ版｜最大20銘柄｜毎日サーバー側で自動更新｜各銘柄が現在Q1〜Q5のどの状態かを確認できます</div>
 
 <div id="q5momentum"></div>
 <div id="hero"></div>
@@ -1561,6 +1606,26 @@ function renderAiMarketDecline(d, riskOff){
     ${refBlock}
     ${riskOffNote}
     <div class="aimktdecl-disclaimer">※過去データに基づく参考値であり、今回の20日後のリターンを保証するものではありません。</div>
+  </div>`;
+}
+
+// 市場環境(SPY過熱度)パネル(design 2026-10-27、Candidate C研究の表示専用
+// 実装)。app._build_market_regime_viewが組み立てた値をそのまま描画するだけの
+// 表示専用関数。Q1〜Q5判定・Q5 Day0判定・BUY判定・Q5ランキング・prior_mean・
+// Risk-off判定・switch recommendation・ポートフォリオ・資金配分のいずれにも
+// 一切関与しない(研究結果: このルールは2026年の完全ホールドアウトOOSで失敗
+// したため、自動判定には採用せず参考表示のみとした)。「購入禁止」「買わない
+// 方がいい」等の勧誘的・指示的な表現は使わない。
+function renderMarketRegime(d){
+  const el = document.getElementById("marketregime");
+  if(!el) return;
+  if(!d){ el.innerHTML = ""; return; }
+  const devStr = (d.deviation_pct>=0?"+":"") + d.deviation_pct.toFixed(1) + "%";
+  el.innerHTML = `<div class="mktregime mktregime-${esc(d.level)}">
+    <div class="mktregime-title">${esc(d.emoji)} ${esc(d.label)}</div>
+    <div class="mktregime-dev">SPY SMA200乖離 ${esc(devStr)}</div>
+    <div class="mktregime-note">${esc(d.note)}</div>
+    <div class="mktregime-disclaimer">${esc(d.disclaimer)}</div>
   </div>`;
 }
 
@@ -2242,6 +2307,7 @@ async function updateRanking(extraMsg){
     render(j.rows);
     renderRiskOff(j.risk_off);
     renderAiMarketDecline(j.ai_market_decline, j.risk_off);
+    renderMarketRegime(j.market_regime);
     renderDailyActions(j.daily_actions, j.portfolio);
     renderPortfolioStatus(j.portfolio);
     // design 2026-10-26ユーザー確定: 「現在Q5の銘柄」セクション(見出し・
@@ -3402,6 +3468,7 @@ def ranking():
             "q5_momentum": _compute_q5_momentum_ranking(rows),
             "risk_off": _build_riskoff_view(),
             "ai_market_decline": _build_ai_market_decline_view(),
+            "market_regime": _build_market_regime_view(),
             "daily_actions": daily_actions,
             "portfolio": _build_portfolio_view(),
             "current_q5_prior_means": current_q5_prior_means,
