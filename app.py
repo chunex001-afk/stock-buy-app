@@ -1050,7 +1050,12 @@ def _build_watchlist_prior_means(tickers, anchor_date):
               "prior_stats_recent5y": 同じ形(直近5年だけの集計)、
               "in_reference_universe": bool(q5_prior_mean_reference.jsonの
               既存56銘柄、またはPhase 1/2でRedisにバックフィル済みの新規
-              銘柄として、イベント履歴を1件以上持っているか)}, ...]
+              銘柄として、イベント履歴を1件以上持っているか)、
+              "backfill_status": "pending"|"in_progress"|"failed"|"done"|None
+              (design 2026-10-28b追加。既存56銘柄は常にNone〈Redis問い合わせ
+              自体をしない〉。新規銘柄のみredis_store.get_priormean_backfill_
+              status〈Phase1/2既存関数、無変更〉の値をそのまま表示用に渡す。
+              prior_mean計算には一切使わない、表示文言の分岐専用)}, ...]
               (tickersと同じ順序・同じ件数)。
 
     prior_stats(design 2026-10-25追加)は_build_current_q5_prior_meansと同様、
@@ -1083,16 +1088,25 @@ def _build_watchlist_prior_means(tickers, anchor_date):
     表示には影響しない(_compute_daily_actionsのBUY判定・Q1〜Q5判定・
     switch_recommendation_logicの判定条件は、この関数とは別に無変更のまま
     q5_prior_mean_logic.get_prior_mean(ticker, anchor_date)〈data省略〉を
-    呼んでおり、この変更の影響を受けない)。"""
+    呼んでおり、この変更の影響を受けない)。
+
+    design 2026-10-28b追加: 新規銘柄がまだprior_mean不足の場合に、「待てば
+    解決するのか(バックフィル待ち/再試行待ち)」と「待っても解決しない
+    (バックフィル済みだが件数が少ない、または既存56銘柄)」をJS側で区別
+    表示できるよう、非静的銘柄だけredis_store.get_priormean_backfill_status
+    (Phase1/2既存関数、無変更)も合わせて取得する(既存56銘柄はこれも
+    問い合わせない、無駄なRedis呼び出しを増やさない既存方針を維持)。"""
     data = q5_prior_mean_logic.load_reference_data()
     static_events_by_ticker = data.get("events_by_ticker", {})
     redis_events_by_ticker = {}
+    backfill_status_by_ticker = {}
     for ticker in tickers:
         if ticker in static_events_by_ticker:
             continue
         events = store.get_priormean_events(ticker)
         if events:
             redis_events_by_ticker[ticker] = events
+        backfill_status_by_ticker[ticker] = store.get_priormean_backfill_status(ticker)
     if redis_events_by_ticker:
         data = priormean_incremental_logic.merge_reference_data(data, redis_events_by_ticker)
     events_by_ticker = data.get("events_by_ticker", {})
@@ -1109,6 +1123,7 @@ def _build_watchlist_prior_means(tickers, anchor_date):
                 ticker, anchor_date, data=data
             ),
             "in_reference_universe": ticker in events_by_ticker,
+            "backfill_status": backfill_status_by_ticker.get(ticker),
         })
     return result
 
@@ -1467,6 +1482,10 @@ details.logicinfo .small{margin-top:10px}
 .wlpm-row-line2{margin-top:2px;color:#475467;font-size:11.5px}
 .wlpm-row-line3{margin-top:2px;color:#98a2b3;font-size:11px}
 .wlpm-flag-warn{color:#b42318;font-weight:700}
+/* design 2026-10-28b: 新規銘柄のバックフィル待ち(pending/in_progress)は
+   エラーではなく待機状態のため、既存のwlpm-flag-warn(赤)とは別の、
+   控えめな情報色(既存のtickercount等と同系の青)にする。 */
+.wlpm-flag-pending{color:#175cd3;font-weight:700}
 .wlpm-flag-none{color:#98a2b3}
 .wlpm-empty{color:#98a2b3;font-size:12.5px}
 /* 取得情報(取得単価・取得日)の訂正フォーム(design 2026-10-20)。 */
@@ -1890,8 +1909,27 @@ function renderCurrentQ5PriorMeans(list){
 //          カテゴリー判定・表示順には一切使わない、表示専用)
 // 既存の中央値・平均最大DD(design 2026-10-25)は削除せず、3行目(小さめ・
 // 淡色)として残す。
-function wlpmLine1Html(pm, label, stats){
+// backfillStatus(design 2026-10-28b、第4引数、省略可能): 新規銘柄の
+// redis_store.get_priormean_backfill_status(Phase1/2既存、無変更)の値。
+// 既存56銘柄は常にundefined/nullのため、以下の分岐には入らず従来通り
+// 「データ不足」のまま(表示文言の分岐専用、prior_mean計算には使わない)。
+// pending/in_progress→自動取得待ち、failed→取得失敗、
+// done(取得済みだが件数不足)→「件数不足」、null/undefined(既存56銘柄・
+// 未検出)→従来通り「データ不足」の4パターンに分ける。
+function wlpmLine1Html(pm, label, stats, backfillStatus){
   if(!pm || !pm.status || pm.status === "insufficient"){
+    if(backfillStatus === "pending" || backfillStatus === "in_progress"){
+      return `<span class="wlpm-flag-pending">🕐 データ不足｜23:50以降に自動取得</span>`;
+    }
+    if(backfillStatus === "failed"){
+      return `<span class="wlpm-flag-warn">⚠️ データ取得失敗｜再試行予定</span>`;
+    }
+    if(backfillStatus === "done"){
+      // 取得済み(バックフィル完了)だが件数がMIN_PRIOR_N未満で不足している
+      // 場合は、「データが無い」のではなく「件数が足りない」ことが分かる
+      // 表現にする(待っても解決しないケース、ユーザー確定仕様)。
+      return `<span class="wlpm-flag-warn">件数不足${(pm && pm.n) ? `(過去${pm.n}件)` : ""}</span>`;
+    }
     return `<span class="wlpm-flag-warn">データ不足${(pm && pm.n) ? `(過去${pm.n}件)` : ""}</span>`;
   }
   const sign = pm.mean >= 0 ? "+" : "";
@@ -1956,7 +1994,7 @@ function renderWatchlistPriorMeans(list, anchorDate){
     return `<div class="wlpm-row">
       <div class="wlpm-row-line1">
         <span class="wlpm-ticker">${esc(item.ticker)}</span>
-        ${wlpmLine1Html(item.prior_mean, item.prior_mean_label, item.prior_stats)}
+        ${wlpmLine1Html(item.prior_mean, item.prior_mean_label, item.prior_stats, item.backfill_status)}
         ${refFlag}
       </div>
       ${line2}

@@ -349,5 +349,58 @@ class WatchlistPriorMeansRedisFallbackTests(unittest.TestCase):
         self.assertEqual(flags, {"FORM": True, "ZZZ": False})
 
 
+# design 2026-10-28b追加: 「🕐 データ不足｜23:50以降に自動取得」等の表示
+# 文言分岐に使う"backfill_status"フィールドが、_build_watchlist_prior_means
+# から正しく伝播することの確認(JS側の文言分岐自体はtest_wlpm_line1_html_js
+# で実際にnode.jsを使って確認する。ここではPython側のデータの受け渡しのみ
+# を確認する)。
+class WatchlistPriorMeansBackfillStatusFieldTests(unittest.TestCase):
+    def _mock_reference_data(self, events_by_ticker):
+        return mock.patch.object(
+            app.q5_prior_mean_logic, "load_reference_data",
+            return_value={"events_by_ticker": events_by_ticker},
+        )
+
+    def test_non_static_ticker_backfill_status_is_passed_through(self):
+        for status in ("pending", "in_progress", "failed", "done", None):
+            with self._mock_reference_data({}), \
+                 mock.patch.object(app.store, "get_priormean_events", return_value=None), \
+                 mock.patch.object(app.store, "get_priormean_backfill_status", return_value=status):
+                result = app._build_watchlist_prior_means(["ZZZ"], "2026-10-20")
+            self.assertEqual(result[0]["backfill_status"], status, f"status={status}のとき不一致")
+
+    # 6. 既存56銘柄 → backfill_statusは常にNone、かつRedisへ一切問い合わせない
+    def test_static_ticker_backfill_status_is_always_none_without_redis_call(self):
+        static_events = {"AAA": _NEWCO_EVENTS}
+        with self._mock_reference_data(static_events), \
+             mock.patch.object(app.store, "get_priormean_backfill_status") as m_status, \
+             mock.patch.object(app.store, "get_priormean_events") as m_events:
+            result = app._build_watchlist_prior_means(["AAA"], "2026-10-20")
+        self.assertIsNone(result[0]["backfill_status"])
+        m_status.assert_not_called()
+        m_events.assert_not_called()
+
+    # 7. Q1〜Q5/BUY判定に変更がないこと(この関数とは別経路であることの再確認)
+    def test_backfill_status_field_does_not_touch_buy_or_quintile_logic(self):
+        with self._mock_reference_data({"AAA": []}), \
+             mock.patch.object(app.store, "get_priormean_events", return_value=None), \
+             mock.patch.object(app.store, "get_priormean_backfill_status", return_value="pending"), \
+             mock.patch.object(app, "_resolve_q_for_date") as resolve_mock, \
+             mock.patch.object(app, "switch_recommendation_logic") as switch_mock:
+            app._build_watchlist_prior_means(["AAA", "ZZZ"], "2026-10-20")
+        resolve_mock.assert_not_called()
+        switch_mock.compute_switch_recommendation.assert_not_called()
+
+    def test_mixed_watchlist_each_ticker_gets_independent_backfill_status(self):
+        statuses = {"NEWA": "pending", "NEWB": "failed", "NEWC": "done"}
+        with self._mock_reference_data({"AAA": _NEWCO_EVENTS}), \
+             mock.patch.object(app.store, "get_priormean_events", return_value=None), \
+             mock.patch.object(app.store, "get_priormean_backfill_status",
+                                side_effect=lambda t: statuses.get(t)):
+            result = app._build_watchlist_prior_means(["AAA", "NEWA", "NEWB", "NEWC"], "2026-10-20")
+        by_ticker = {r["ticker"]: r["backfill_status"] for r in result}
+        self.assertEqual(by_ticker, {"AAA": None, "NEWA": "pending", "NEWB": "failed", "NEWC": "done"})
+
+
 if __name__ == "__main__":
     unittest.main()
