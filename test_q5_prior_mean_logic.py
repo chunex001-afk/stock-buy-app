@@ -437,9 +437,41 @@ class LabelPriorMeanWithWinRateTests(unittest.TestCase):
         )
 
     def test_boundary_mean_5_with_low_win_rate_is_special_crash_risk(self):
+        # 2026-10-27ユーザー確定でラベル文言のみ変更("⚠️ 暴落リスクに特に
+        # 注意" → "⚠️ 暴落リスク有"、判定境界(mean>=5かつwin_rate<55)自体は
+        # 無変更)。
         self.assertEqual(
             pm.label_prior_mean_with_win_rate(_pm_ok(5.0), _stats_ok(54.999)),
-            "⚠️ 暴落リスクに特に注意",
+            "⚠️ 暴落リスク有",
+        )
+
+    def test_boundary_mean_5_with_win_rate_just_under_50_is_crash_risk_not_weak(self):
+        # 2026-10-27ユーザー確定の仕様変更本体: 以前はmean>=5でもwin_rate<50
+        # なら(mean<0 or win_rate<50の条件が先に当たり)「🔴 弱い・購入優先度
+        # 低」になっていたが、mean>=5の判定を最優先にしたことで、win_rateが
+        # 50%未満であっても「🔴」にはならず「⚠️ 暴落リスク有」になる。
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(5.0), _stats_ok(49.999)),
+            "⚠️ 暴落リスク有",
+        )
+
+    def test_boundary_mean_5_with_win_rate_60_new_rule_cases(self):
+        # 新ルールの境界値セット(今回のユーザー依頼に記載された4ケース)。
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(5.0), _stats_ok(55.0)),
+            "🔥 高期待・高リスク",
+        )
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(5.0), _stats_ok(54.9)),
+            "⚠️ 暴落リスク有",
+        )
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(6.0), _stats_ok(54.0)),
+            "⚠️ 暴落リスク有",
+        )
+        self.assertEqual(
+            pm.label_prior_mean_with_win_rate(_pm_ok(6.0), _stats_ok(60.0)),
+            "🔥 高期待・高リスク",
         )
 
     def test_boundary_win_rate_50_is_not_weak(self):

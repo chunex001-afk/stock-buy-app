@@ -181,14 +181,23 @@ def label_prior_mean_with_win_rate(prior_mean, prior_stats):
       組であることを呼び出し側が保証する(両者は同じ母集団なので、片方が
       "ok"ならもう片方も通常"ok"になるが、念のため両方のstatusを確認する)。
 
-    判定優先順位(ユーザー確定、2026-10-26、prior_mean[%]・prior_win_rate[%]
-    に対して、上から順に最初に当たった条件を採用):
-      1. mean < 0 または win_rate < 50        : "🔴 弱い・購入優先度低"
-      2. mean >= 5 かつ win_rate >= 55         : "🔥 高期待・高リスク"
-      3. mean >= 5 かつ win_rate < 55          : "⚠️ 暴落リスクに特に注意"
-      4. 3 <= mean < 5 かつ win_rate >= 55      : "🔥 最強"
-      5. 0 <= mean < 3 かつ win_rate >= 55      : "🟢 優良"
+    判定優先順位(2026-10-27更新、ユーザー確定。prior_mean[%]・
+    prior_win_rate[%]に対して、上から順に最初に当たった条件を採用):
+      1. mean >= 5 かつ win_rate >= 55          : "🔥 高期待・高リスク"
+      2. mean >= 5 かつ win_rate < 55           : "⚠️ 暴落リスク有"
+      3. (mean < 5の場合のみ) mean < 0 または win_rate < 50 : "🔴 弱い・購入優先度低"
+      4. 3 <= mean < 5 かつ win_rate >= 55       : "🔥 最強"
+      5. 0 <= mean < 3 かつ win_rate >= 55       : "🟢 優良"
       6. それ以外(0<=mean<5 かつ 50<=win_rate<55) : "🟡 標準"
+
+    2026-10-27のユーザー確定仕様変更: 以前はmean>=5かつwin_rate<50の銘柄が
+    条件1(mean<0 or win_rate<50)に先に当たり「🔴 弱い・購入優先度低」に
+    分類されていた。今回、mean>=5の判定を最優先に上げたことで、mean>=5の
+    銘柄はwin_rateの値(50%未満かどうかを問わず)によらず必ず「🔥 高期待・
+    高リスク」か「⚠️ 暴落リスク有」のどちらかになる(🔴・🔥最強・🟢優良・
+    🟡標準にはならない)。mean<5の銘柄の判定(条件3〜6)は一切変更していない。
+    「⚠️ 暴落リスク有」になっても購入禁止を意味しない(表示ラベルのみ、
+    以下の【絶対に守ること】の通りBUY判定等には一切使用しない)。
 
     戻り値: ラベル文字列、またはNone(prior_mean・prior_statsいずれかの
     status != "ok"、既存の「データ不足」表示をそのまま使うためここでは
@@ -199,10 +208,10 @@ def label_prior_mean_with_win_rate(prior_mean, prior_stats):
         return None
     mean = prior_mean["mean"]
     win_rate = prior_stats["win_rate"]
+    if mean >= 5:
+        return "🔥 高期待・高リスク" if win_rate >= 55 else "⚠️ 暴落リスク有"
     if mean < 0 or win_rate < 50:
         return "🔴 弱い・購入優先度低"
-    if mean >= 5:
-        return "🔥 高期待・高リスク" if win_rate >= 55 else "⚠️ 暴落リスクに特に注意"
     if mean >= 3:
         return "🔥 最強" if win_rate >= 55 else "🟡 標準"
     if win_rate >= 55:
