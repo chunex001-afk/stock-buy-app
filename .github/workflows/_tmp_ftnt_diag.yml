@@ -1,7 +1,9 @@
-name: TEMP diagnostic (read-only) - FTNT priormean state
+name: TEMP diagnostic (read-only) - FORM priormean state
 
-# 一時的な読み取り専用診断workflow(2026-10-28、FTNT復旧調査用)。
-# Redisへの書き込みは一切行わない(store.get_*のみ呼ぶ)。確認が終わったら
+# 一時的な読み取り専用診断workflow(2026-10-28、FORM状態確認用。元はFTNT
+# 調査用だったファイルを同じ目的〈読み取り専用〉で再利用している)。
+# Redisへの書き込みは一切行わない(store.get_*とapp._build_watchlist_
+# prior_means〈既存の表示用関数、無変更〉を呼ぶだけ)。確認が終わったら
 # このworkflowファイル自体を削除する。既存のQ1〜Q5判定・BUY判定・
 # 既存56銘柄・既存4workflowには一切関与しない。
 
@@ -29,16 +31,19 @@ jobs:
         run: |
           python - <<'PY'
           import redis_store as store
+          import app
+
+          TICKER = "FORM"
 
           watchlist = store.get_watchlist() or []
           print("watchlist:", watchlist)
-          print("FTNT in watchlist:", "FTNT" in watchlist)
+          print(f"{TICKER} in watchlist:", TICKER in watchlist)
 
-          status = store.get_priormean_backfill_status("FTNT")
-          print("priormean:backfill_status:FTNT =", status)
+          status = store.get_priormean_backfill_status(TICKER)
+          print(f"priormean:backfill_status:{TICKER} =", status)
 
-          events = store.get_priormean_events("FTNT")
-          print("priormean:events:FTNT count =", len(events) if events else 0)
+          events = store.get_priormean_events(TICKER)
+          print(f"priormean:events:{TICKER} count =", len(events) if events else 0)
           if events:
               print("  first:", events[0])
               print("  last :", events[-1])
@@ -53,16 +58,15 @@ jobs:
           else:
               print("priormean:bounds_history = None")
 
-          portfolio_state = store.get_portfolio_state() or {}
-          positions = portfolio_state.get("positions") or {}
-          print("portfolio positions tickers =", list(positions.keys()))
-          print("FTNT in portfolio positions:", "FTNT" in positions)
-
-          ticker_record = store.get_ticker_record("FTNT")
-          print("ticker_record(FTNT) exists:", ticker_record is not None)
-          if ticker_record:
-              print("  last_trade_date:", ticker_record.get("last_trade_date"))
-
-          qstate = store.get_quintile_state("FTNT")
-          print("quintile_state(FTNT) exists:", qstate is not None)
+          # 本番と完全に同じ表示用関数(app._build_watchlist_prior_means、無変更)を
+          # そのまま呼ぶ。prior_mean/prior_n/prior_median/win_rate/labelを本番と
+          # 完全に同一の計算で取得する(新しい計算ロジックはここで作らない)。
+          pool_history = store.get_pool_history()
+          if pool_history and pool_history.get("dates"):
+              anchor_date = sorted(pool_history["dates"])[-1]
+              result = app._build_watchlist_prior_means([TICKER], anchor_date)
+              print(f"_build_watchlist_prior_means([{TICKER!r}], {anchor_date!r}) =")
+              print(" ", result[0])
+          else:
+              print("quintile:pool_history が未初期化のため、_build_watchlist_prior_meansは呼べません。")
           PY
