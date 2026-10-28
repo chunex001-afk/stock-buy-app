@@ -1,0 +1,40 @@
+name: TEMP diagnostic (read-only) - AAPL display logic verification
+
+# 一時的な読み取り専用診断workflow(2026-10-28)。AAPLはwatchlistに
+# 追加しない方針のため、画面上では確認できない。代わりに既存の表示用関数
+# app._build_watchlist_prior_means(無変更)をAAPL単体に対して直接呼び、
+# 表示ロジック自体が正しく動作することを確認する。Redisへの書き込みは
+# 一切行わない。確認後にこのworkflowは削除する。
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Verify display logic for AAPL (read-only)
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: |
+          python - <<'PY'
+          import app
+          import redis_store as store
+
+          pool_history = store.get_pool_history()
+          anchor_date = sorted(pool_history["dates"])[-1]
+          result = app._build_watchlist_prior_means(["AAPL"], anchor_date)
+          print(f"_build_watchlist_prior_means(['AAPL'], {anchor_date!r}) =")
+          print(" ", result[0])
+          PY
