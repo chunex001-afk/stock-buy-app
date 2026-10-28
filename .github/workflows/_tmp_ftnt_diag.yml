@@ -1,0 +1,55 @@
+name: TEMP diagnostic (read-only) - FTNT priormean state
+
+# 一時的な読み取り専用診断workflow(2026-10-28、FTNT復旧調査用)。
+# Redisへの書き込みは一切行わない(store.get_*のみ呼ぶ)。確認が終わったら
+# このworkflowファイル自体を削除する。既存のQ1〜Q5判定・BUY判定・
+# 既存56銘柄・既存4workflowには一切関与しない。
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Read-only Redis state dump (no writes)
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: |
+          python - <<'PY'
+          import redis_store as store
+
+          watchlist = store.get_watchlist() or []
+          print("watchlist:", watchlist)
+          print("FTNT in watchlist:", "FTNT" in watchlist)
+
+          status = store.get_priormean_backfill_status("FTNT")
+          print("priormean:backfill_status:FTNT =", status)
+
+          events = store.get_priormean_events("FTNT")
+          print("priormean:events:FTNT count =", len(events) if events else 0)
+          if events:
+              print("  first:", events[0])
+              print("  last :", events[-1])
+
+          pending = store.get_priormean_pending_backfill()
+          print("priormean:pending_backfill =", pending)
+
+          bounds = store.get_priormean_bounds_history()
+          if bounds:
+              dates = sorted(bounds.keys())
+              print("priormean:bounds_history count =", len(dates), "range =", dates[0], "~", dates[-1])
+          else:
+              print("priormean:bounds_history = None")
+          PY
