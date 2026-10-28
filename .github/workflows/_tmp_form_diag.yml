@@ -1,0 +1,71 @@
+name: TEMP diagnostic (read-only) - FORM production backfill investigation
+
+# 一時的な読み取り専用診断workflow(2026-10-28、FORM本番backfillの期待値
+# ズレ〈Day0=328 vs ローカル検証343〉の原因調査用)。Redisへの書き込みは
+# 一切行わない(store.get_*のみ呼ぶ)。Twelve Data呼び出しは1回だけ
+# (FORM、outputsize=5000、既存のtwelvedata_client.fetch_daily_seriesを
+# そのまま呼ぶだけで新しい取得ロジックは作らない、調査専用)。確認が終わったら
+# このworkflowファイル自体を削除する。既存のQ1〜Q5判定・BUY判定・
+# 既存56銘柄・既存workflowには一切関与しない。
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Read-only investigation (no Redis writes)
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import redis_store as store
+          import q5_prior_mean_logic as pml
+          import priormean_incremental_logic as inc
+          import app
+          import twelvedata_client as td
+
+          TICKER = "FORM"
+
+          status = store.get_priormean_backfill_status(TICKER)
+          print(f"priormean:backfill_status:{TICKER} =", status)
+
+          events = store.get_priormean_events(TICKER) or []
+          print(f"priormean:events:{TICKER} count =", len(events))
+          if events:
+              sorted_events = sorted(events, key=lambda e: e["date"])
+              print("  first 5:", sorted_events[:5])
+              print("  last 5 :", sorted_events[-5:])
+
+          pending = store.get_priormean_pending_backfill()
+          print("priormean:pending_backfill =", pending)
+
+          pool_history = store.get_pool_history()
+          if pool_history and pool_history.get("dates"):
+              anchor_date = sorted(pool_history["dates"])[-1]
+              result = app._build_watchlist_prior_means([TICKER], anchor_date)
+              print(f"_build_watchlist_prior_means([{TICKER!r}], {anchor_date!r}) =")
+              print(" ", result[0])
+
+          api_key = os.environ.get("TWELVEDATA_API_KEY", "").strip()
+          if api_key:
+              dates, closes, volumes, lows, attempts = td.fetch_daily_series(TICKER, api_key, outputsize=5000)
+              print(f"Twelve Data fetch_daily_series({TICKER}, outputsize=5000) (調査専用、読み取りのみ):")
+              print("  件数:", len(dates), "範囲:", dates[0], "~", dates[-1])
+          else:
+              print("TWELVEDATA_API_KEY未設定のため、Twelve Data比較はスキップしました。")
+          PY
