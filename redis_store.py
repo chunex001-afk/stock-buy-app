@@ -82,8 +82,16 @@ def set_nx(key, value, ex=None):
     戻り値: 書き込みに成功した(=キーが未設定だった)ならTrue、
     既にキーが存在して書き込まれなかった場合はFalse。
     Upstash/Redisに到達できない場合もFalse(呼び出し元を待たせない・
-    誤って「ロックを取れた」と判定しないためのフェイルセーフ)。"""
-    path = f"set/{key}?NX=true"
+    誤って「ロックを取れた」と判定しないためのフェイルセーフ)。
+
+    2026-10-28修正(バグ修正、design調査で発見): UpstashのREST API仕様
+    (docs.upstash.com)では、NXは値を持たない裸のクエリフラグ
+    (例: "set/foo?NX&EX=100")であり、"NX=true"という記法は存在しない。
+    以前の実装は誤って"?NX=true"を送っており、Upstashが400 Bad Request
+    を返し続けていた(2026-10-22〜、本番で一度も成功していなかった)。
+    このバグはRedisのpath/query構造自体には影響せず、NXフラグの表記だけ
+    の問題だったため、修正もその1点のみに限定する。"""
+    path = f"set/{key}?NX"
     if ex:
         path += f"&EX={ex}"
     res = _request("POST", path, data=value.encode("utf-8"))
