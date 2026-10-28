@@ -122,6 +122,23 @@ def backfill_one_ticker(ticker, price_cache_dir=None, dry_run=False):
         print(f"{ticker}: 既にバックフィル済み(status=done)のためスキップします(冪等)。")
         return {"skipped": True, "reason": "already_done", "ticker": ticker}
 
+    # prior_mean即時dispatchバックフィル専用(design 2026-10-28d)。同一
+    # tickerへの同時dispatch/cron競合を防ぐための原子的ロック(SET NX、
+    # TTL 600秒、明示的な解放はしない)。dry_run時はRedisへの書き込みを
+    # 一切行わない既存方針を維持するため、ロック取得自体もスキップする。
+    if not dry_run:
+        if not store.try_acquire_priormean_backfill_lock(ticker):
+            print(f"{ticker}: 他のプロセス(別dispatch/cron)が処理中のため"
+                  "スキップします(ロック取得失敗)。")
+            return {"skipped": True, "reason": "locked", "ticker": ticker}
+
+        # ロック取得後の二重確認(取得までの間に他プロセスが完了させた可能性)。
+        status = store.get_priormean_backfill_status(ticker)
+        if status == "done":
+            print(f"{ticker}: ロック取得後に既にバックフィル済みと判明したため"
+                  "スキップします(冪等)。")
+            return {"skipped": True, "reason": "already_done_after_lock", "ticker": ticker}
+
     bounds_by_date = store.get_priormean_bounds_history()
     if not bounds_by_date:
         raise RuntimeError(

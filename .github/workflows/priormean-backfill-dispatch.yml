@@ -1,0 +1,56 @@
+name: prior_mean immediate backfill (dispatch, 1 ticker)
+
+# prior_mean差分更新の設計(2026-10-28d、design確認済み)Phase 4。
+# watchlistへ新規銘柄が追加された直後、app.pyからGitHub API経由で
+# workflow_dispatchされ、その1銘柄だけを即時バックフィルする専用workflow。
+#
+# 既存のdaily-refresh.yml / q5-universe-refresh.yml / priormean-
+# incremental.yml / priormean-overnight-detect.yml / priormean-
+# backfill.yml とは完全に分離した専用workflow。既存のQ1〜Q5判定・BUY判定・
+# 既存56銘柄のq5_prior_mean_reference.jsonには一切関与しない。
+#
+# 二重起動防止はbackfill_dispatched_ticker.py→backfill_one_ticker内の
+# Redis原子的ロック(design 2026-10-28d)に委ねる。concurrencyグループも
+# 同一ticker単位で設定し、GitHub Actions側でも同一tickerの同時実行を
+# 直列化する(Redisロックと合わせた二重の安全策)。
+#
+# このworkflow自体が起動に失敗しても(dispatch呼び出し失敗・runner障害等)、
+# 既存のpriormean-overnight-detect.yml / priormean-incremental.yml /
+# priormean-backfill.ymlが既存のstatus="failed"/未検出ロジックにより
+# バックアップとして再試行する(無変更)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "新規ウォッチリスト銘柄のticker symbol"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: priormean-backfill-dispatch-${{ inputs.ticker }}
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill dispatched ticker (writes priormean:events/status/lock for this ticker only)
+        env:
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python backfill_dispatched_ticker.py "${{ inputs.ticker }}"

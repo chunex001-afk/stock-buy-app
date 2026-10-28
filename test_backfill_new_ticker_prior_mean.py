@@ -166,8 +166,12 @@ class NewTickerFallbackFormVerificationTests(unittest.TestCase):
         fake_td_result = (self.window_dates, self.window_closes, self.window_volumes, None, 1)
 
         t0 = time.time()
+        # design 2026-10-28d: backfill_one_ticker冒頭に追加されたRedis原子的
+        # ロック(set_nx)を、このFakeRedisBackend(get_json/set_jsonのみ)の
+        # テストでは常に成功させる(ロック機構自体は別のテストで検証する)。
         with mock.patch.object(store, "get_json", side_effect=fake.get_json), \
              mock.patch.object(store, "set_json", side_effect=fake.set_json), \
+             mock.patch.object(store, "set_nx", return_value=True), \
              mock.patch.object(td, "fetch_daily_series", return_value=fake_td_result) as m_td, \
              mock.patch.dict(os.environ, {"TWELVEDATA_API_KEY": "test-key"}):
             outcome = backfill_script.backfill_one_ticker("FORM", price_cache_dir=self._tmp_dir)

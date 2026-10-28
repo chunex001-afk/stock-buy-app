@@ -363,6 +363,17 @@ def set_priormean_watchlist_added_at(ticker, iso_timestamp):
     return set_json("priormean:watchlist_added_at", current)
 
 
+def try_acquire_priormean_backfill_lock(ticker, ttl_seconds=600):
+    """prior_mean即時dispatchバックフィル専用(design 2026-10-28d)。同一
+    tickerに対する同時dispatch/cronの競合を1プロセスだけに限定するための
+    短命ロック(try_acquire_push_dispatch_lock/try_acquire_push_refresh_
+    notify_lockと完全に同じSET NXパターン)。明示的な解放は行わず、TTL失効
+    に委ねる(既存のpush系ロックと同じ方針、必要以上に複雑にしない)。
+    TTLのデフォルト600秒は、新規銘柄1件のバックフィル実測(KNN計算約3分強
+    +Twelve Data取得+GitHub Actions起動分)に十分な余裕を持たせた値。"""
+    return set_nx(f"priormean:backfill_lock:{ticker.upper()}", "1", ex=ttl_seconds)
+
+
 def get_priormean_incremental_state():
     """prior_mean差分更新Phase 2専用。日次差分更新(refresh_priormean_
     incremental.py)の進行状態。

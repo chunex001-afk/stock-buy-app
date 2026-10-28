@@ -101,8 +101,15 @@ class Phase1FormBackfillTests(unittest.TestCase):
         )
 
     def _run_backfill(self, fake_backend):
+        # design 2026-10-28d: backfill_one_ticker冒頭にRedis原子的ロック
+        # (set_nx)が追加されたため、このFakeRedisBackend(get_json/set_json
+        # のみ差し替え)のテストでは常にロック取得が成功するものとしてモック
+        # する(ロック機構自体のテストはtest_backfill_dispatched_tickerや
+        # redis_store単体テスト側で別途行う、ここではFORM実データでの
+        # 既存のバックフィル計算ロジックを検証することに専念する)。
         with mock.patch.object(store, "get_json", side_effect=fake_backend.get_json), \
              mock.patch.object(store, "set_json", side_effect=fake_backend.set_json), \
+             mock.patch.object(store, "set_nx", return_value=True), \
              mock.patch.object(backfill_script, "compute_ticker_scores", return_value=self.form_scores_by_date):
             return backfill_script.backfill_one_ticker("FORM")
 

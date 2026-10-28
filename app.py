@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 # このcommitがRenderにデプロイされた際、RENDER_GIT_COMMIT変化の検知→
 # Web Push→Windowsデスクトップ通知が実際に届くかを確認するためのもの。
 
+import requests
 from flask import Flask, jsonify, request, render_template_string
 
 import beta_logic
@@ -36,6 +37,18 @@ push_notify.run_deploy_check_async(store)
 # へ直接アクセスすることはなく、常にrefresh.backfill_quintile_history_for_new_ticker
 # 経由で呼び出す(design方針「Twelve Dataをapp.pyから直接呼ばない」を維持)。
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+
+# prior_mean即時dispatchバックフィル専用(design 2026-10-28d)。watchlist
+# 追加直後にGitHub Actions(priormean-backfill-dispatch.yml)をworkflow_
+# dispatchで起動するための設定。GITHUB_DISPATCH_TOKENはRenderの環境変数
+# (Fine-grained PAT、このリポジトリ限定・Actions: Read and write権限のみ)
+# から読む。コードには一切書かない。owner/repo・workflowファイル名は
+# 非機密情報(リポジトリ自体が既に公開されている)のため定数として埋め込む。
+GITHUB_DISPATCH_TOKEN = os.getenv("GITHUB_DISPATCH_TOKEN", "").strip()
+GITHUB_DISPATCH_REPO = "chunex001-afk/stock-buy-app"
+GITHUB_DISPATCH_WORKFLOW_FILE = "priormean-backfill-dispatch.yml"
+GITHUB_DISPATCH_REF = "main"
+GITHUB_DISPATCH_TIMEOUT = 5
 
 TICKER_RE = re.compile(r"[^A-Z0-9.\-]")
 
@@ -137,6 +150,54 @@ def _now_jst_iso():
     redis_store.set_priormean_watchlist_added_atへ渡す値の生成専用で、他の
     判定には使わない。"""
     return datetime.now(_JST).isoformat()
+
+
+def _dispatch_priormean_backfill(ticker):
+    """prior_mean即時dispatchバックフィル専用(design 2026-10-28d)。
+    watchlist追加直後にGitHub Actions(priormean-backfill-dispatch.yml)を
+    workflow_dispatchで起動する。
+
+    【絶対に守ること】
+    - ここでの失敗(トークン未設定・タイムアウト・HTTPエラー・ネットワーク
+      障害等)は、呼び出し元(add_watchlist)のwatchlist追加処理を絶対に
+      失敗扱いにしない。例外を一切外へ投げず、常にbool(成功したか)を返す
+      だけの設計(呼び出し元はログ目的以外で戻り値を使わない)。
+    - 失敗してもQ1〜Q5判定・BUY判定には一切影響しない(この関数が触れるのは
+      GitHub Actionsの起動要求だけで、Redis/既存ロジックには一切触れない)。
+      既存のpriormean-overnight-detect.yml/priormean-incremental.yml/
+      priormean-backfill.yml(いずれも無変更)が、この即時dispatchが届かな
+      かった場合のバックアップとして機能する(既存のstatus="failed"/未検出
+      銘柄の再試行ロジック、無変更)。
+    """
+    if not GITHUB_DISPATCH_TOKEN:
+        print(f"[PRIORMEAN-DISPATCH] {ticker}: GITHUB_DISPATCH_TOKEN未設定のため"
+              "即時dispatchをスキップします(既存cronが後で検出・処理します)。")
+        return False
+
+    url = (
+        f"https://api.github.com/repos/{GITHUB_DISPATCH_REPO}/actions/workflows/"
+        f"{GITHUB_DISPATCH_WORKFLOW_FILE}/dispatches"
+    )
+    headers = {
+        "Authorization": f"Bearer {GITHUB_DISPATCH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = {"ref": GITHUB_DISPATCH_REF, "inputs": {"ticker": ticker}}
+    try:
+        resp = requests.post(url, json=body, headers=headers, timeout=GITHUB_DISPATCH_TIMEOUT)
+    except requests.RequestException as e:
+        print(f"[PRIORMEAN-DISPATCH][WARN] {ticker}: dispatch呼び出しでエラーが発生しました"
+              f"({e})。既存cronが後で検出・処理します。")
+        return False
+
+    if resp.status_code == 204:
+        print(f"[PRIORMEAN-DISPATCH] {ticker}: GitHub Actionsへのdispatchに成功しました。")
+        return True
+
+    print(f"[PRIORMEAN-DISPATCH][WARN] {ticker}: dispatch失敗(status={resp.status_code})。"
+          "既存cronが後で検出・処理します。")
+    return False
 
 
 def _trading_days_calendar():
@@ -3054,6 +3115,21 @@ def add_watchlist():
         # 対象に含める」として安全側に扱う)。
         try:
             store.set_priormean_watchlist_added_at(ticker, _now_jst_iso())
+        except Exception:
+            pass
+
+        # prior_mean即時dispatchバックフィル専用(design 2026-10-28d)。
+        # 既存56銘柄(q5_prior_mean_reference.json)はRedis側のbackfill対象
+        # ではない(prior_meanは静的JSONから計算される)ため、dispatchして
+        # も無駄なTwelve Data呼び出しが発生するだけで表示には使われない。
+        # 不要なAPI callを避けるため、既存56銘柄はdispatch対象から除外する。
+        # ここでの失敗(トークン未設定・タイムアウト等)はwatchlist追加処理
+        # を一切ブロック・失敗させない(_dispatch_priormean_backfill自体が
+        # 例外を外に投げない設計だが、念のためtry/exceptでも保護する)。
+        try:
+            static_tickers = set(q5_prior_mean_logic.load_reference_data().get("events_by_ticker", {}).keys())
+            if ticker not in static_tickers:
+                _dispatch_priormean_backfill(ticker)
         except Exception:
             pass
 
