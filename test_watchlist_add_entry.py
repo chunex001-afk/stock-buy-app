@@ -186,5 +186,31 @@ class ExistingEditEntryApiUntouchedTests(WatchlistAddEntryTestCase):
         self.assertEqual(pos["entry_date"], "2026-10-19")  # entry_priceのみ変更、entry_dateは不変
 
 
+class WatchlistAddedAtRecordingTests(WatchlistAddEntryTestCase):
+    """prior_mean差分更新24:00 JST締切の深夜バックフィル専用(design
+    2026-10-28c)。watchlist追加時にpriormean:watchlist_added_atへ追加時刻
+    (JST)が記録されることの確認。既存のwatchlist追加成否・即時取得
+    (TD_API_KEY=""でスキップ済み)には一切影響しないことも合わせて確認する。"""
+
+    def test_add_watchlist_records_added_at_in_jst(self):
+        with mock.patch.object(app, "_now_jst_iso", return_value="2026-10-27T23:50:00+09:00"), \
+             mock.patch.object(app.store, "set_priormean_watchlist_added_at") as m_set:
+            r, d = self._add_watchlist("COHR")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(d["ok"])
+        m_set.assert_called_once_with("COHR", "2026-10-27T23:50:00+09:00")
+
+    def test_add_watchlist_still_succeeds_even_if_added_at_recording_fails(self):
+        """added_at記録がRedis障害等で例外を投げても、watchlist追加自体は
+        成功として返す(既存の追加処理をブロックしないベストエフォート設計)。"""
+        with mock.patch.object(
+            app.store, "set_priormean_watchlist_added_at", side_effect=RuntimeError("boom"),
+        ):
+            r, d = self._add_watchlist("COHR")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(d["ok"])
+        self.assertIn("COHR", self._watchlist)
+
+
 if __name__ == "__main__":
     unittest.main()

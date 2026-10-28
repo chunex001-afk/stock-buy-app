@@ -340,6 +340,29 @@ def set_priormean_pending_backfill(tickers):
     return set_json("priormean:pending_backfill", list(tickers))
 
 
+def get_priormean_watchlist_added_at():
+    """24:00 JST締切の深夜バックフィル専用(design 2026-10-28c)。
+    watchlistへ銘柄が追加された時刻(JST、ISO8601文字列)を銘柄ごとに記録
+    した辞書。戻り値: {"<TICKER>": "2026-10-27T23:50:00+09:00", ...}、または
+    {}(未初期化時)。app.add_watchlist()が追加時に書き込み、
+    priormean_incremental_logic.detect_new_tickers_for_overnight_backfillが
+    24:00 JST以前に追加されたかどうかの判定だけに使う(この機能導入前から
+    watchlistに存在していた銘柄はこの辞書にキーが無く、その場合は締切の
+    対象外として常に検出対象に含める、既存のwatchlist/quintile:state等の
+    判定ロジックには一切接続しない)。"""
+    return get_json("priormean:watchlist_added_at", default={}) or {}
+
+
+def set_priormean_watchlist_added_at(ticker, iso_timestamp):
+    """1銘柄分の追加時刻だけを読み取り→マージ→書き込みする(他の銘柄の
+    記録を上書きしない)。失敗してもwatchlist本体の追加処理は失敗させない
+    設計(呼び出し元が戻り値を見てbest-effortに扱う)。"""
+    current = get_priormean_watchlist_added_at()
+    current = dict(current)
+    current[ticker.upper()] = iso_timestamp
+    return set_json("priormean:watchlist_added_at", current)
+
+
 def get_priormean_incremental_state():
     """prior_mean差分更新Phase 2専用。日次差分更新(refresh_priormean_
     incremental.py)の進行状態。

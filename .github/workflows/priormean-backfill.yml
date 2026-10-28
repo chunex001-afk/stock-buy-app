@@ -19,7 +19,31 @@ name: prior_mean new ticker backfill (1 ticker per run)
 
 on:
   schedule:
-    # UTC 23:50 = JST 8:50(priormean-incrementalの後を目安)。
+    # design 2026-10-28c: 24:00 JST締切・深夜バックフィル・翌朝7:00 JST
+    # 表示(priormean-overnight-detect.yml、00:10 JST目安で新規銘柄を
+    # 検出・priormean:pending_backfillへ登録)に対応するため、00:20〜
+    # 06:20 JSTの間を30分おきに発火させ、キューを順次1銘柄ずつ処理する
+    # (run_pending_priormean_backfill.py自体は無変更、「1回の実行で1銘柄
+    # まで」というユーザー確定仕様を維持したまま、cronの発火回数だけを
+    # 増やしてキューを捌く)。GitHub Actionsのscheduled cronは実行開始が
+    # 数分〜十数分遅れることがあるため、07:00 JSTの表示目標に対して
+    # 06:20 JST(最終便)で止め、余裕を持たせている。
+    - cron: "20 15 * * *"  # JST 00:20
+    - cron: "50 15 * * *"  # JST 00:50
+    - cron: "20 16 * * *"  # JST 01:20
+    - cron: "50 16 * * *"  # JST 01:50
+    - cron: "20 17 * * *"  # JST 02:20
+    - cron: "50 17 * * *"  # JST 02:50
+    - cron: "20 18 * * *"  # JST 03:20
+    - cron: "50 18 * * *"  # JST 03:50
+    - cron: "20 19 * * *"  # JST 04:20
+    - cron: "50 19 * * *"  # JST 04:50
+    - cron: "20 20 * * *"  # JST 05:20
+    - cron: "50 20 * * *"  # JST 05:50
+    - cron: "20 21 * * *"  # JST 06:20
+    # 既存(無変更): UTC 23:50 = JST 8:50。日中にwatchlistへ追加された
+    # 銘柄(既存のpriormean-incremental.py、08:40 JST実行が検出する分)
+    # 用のキュー処理として引き続き残す。
     - cron: "50 23 * * *"
   workflow_dispatch: {}
 

@@ -72,14 +72,17 @@ class WlpmLine1HtmlBackfillStatusTests(unittest.TestCase):
     (実際のJS関数を実行、文字列照合のみの簡易テストではない)。"""
 
     def test_1_pending_shows_auto_fetch_message(self):
+        # design 2026-10-28c: 24:00 JST締切・深夜バックフィル・翌朝7:00 JST
+        # 表示という新フローに合わせて文言変更(旧「23:50以降に自動取得」は
+        # 実際の処理時刻と無関係な固定文言のミスだったため修正)。
         html = _run_wlpm_line1_html(_INSUFFICIENT_PM, None, None, "pending")
-        self.assertIn("🕐 データ不足｜23:50以降に自動取得", html)
+        self.assertIn("🕐 データ取得中｜翌朝7:00以降に表示", html)
         self.assertIn("wlpm-flag-pending", html)
         self.assertNotIn("wlpm-flag-warn", html)
 
     def test_2_in_progress_shows_same_auto_fetch_message(self):
         html = _run_wlpm_line1_html(_INSUFFICIENT_PM, None, None, "in_progress")
-        self.assertIn("🕐 データ不足｜23:50以降に自動取得", html)
+        self.assertIn("🕐 データ取得中｜翌朝7:00以降に表示", html)
         self.assertIn("wlpm-flag-pending", html)
 
     def test_3_failed_shows_retry_message(self):
@@ -108,7 +111,7 @@ class WlpmLine1HtmlBackfillStatusTests(unittest.TestCase):
     def test_pending_with_zero_n_does_not_show_count_suffix(self):
         pm0 = {"status": "insufficient", "n": 0, "mean": None}
         html = _run_wlpm_line1_html(pm0, None, None, "pending")
-        self.assertIn("🕐 データ不足｜23:50以降に自動取得", html)
+        self.assertIn("🕐 データ取得中｜翌朝7:00以降に表示", html)
         self.assertNotIn("(過去", html)
 
     def test_ok_status_ignores_backfill_status_entirely(self):

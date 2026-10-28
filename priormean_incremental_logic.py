@@ -57,6 +57,40 @@ def detect_new_tickers(watchlist, static_tickers, redis_status_by_ticker):
     return result
 
 
+def detect_new_tickers_for_overnight_backfill(
+    watchlist, static_tickers, redis_status_by_ticker, added_at_by_ticker, cutoff_iso,
+):
+    """24:00 JST締切の深夜バックフィル専用(design 2026-10-28c、Phase 3)。
+
+    既存のdetect_new_tickers(無変更、上の関数)をそのまま呼び、その結果を
+    さらにadded_at_by_ticker(watchlist追加時刻、JST・ISO8601文字列。
+    redis_store.get_priormean_watchlist_added_atの戻り値)でcutoff_iso
+    (今日0:00 JSTのISO8601文字列、=前日24:00 JST)より前に絞り込む。
+
+    - added_at_by_tickerにキーが無い銘柄(この機能導入前からwatchlistに
+      存在していた銘柄、例: FORM)は締切の対象外として扱い、常に含める
+      (記録が無いことを理由に永久に検出されなくなるのを防ぐ安全側の
+      デフォルト)。
+    - added_at >= cutoff_iso(今日0:00 JST以降に追加された銘柄)は今回の
+      深夜バックフィル対象からは除外する(次の日の深夜バックフィル、または
+      既存の日次incremental処理〈無変更〉が後で検出する)。
+
+    ISO8601文字列同士の比較は、同じ固定オフセット(+09:00)で生成されて
+    いれば辞書順比較がそのまま時刻順比較になる(datetime.isoformat()の
+    既存仕様、新しい日時ライブラリは導入しない)。
+
+    既存のdetect_new_tickers自体・呼び出しシグネチャは一切変更しない
+    (既存の08:40 JST処理からの呼び出しに影響を与えない、完全に新規の
+    追加関数)。"""
+    base = detect_new_tickers(watchlist, static_tickers, redis_status_by_ticker)
+    result = []
+    for t in base:
+        added_at = added_at_by_ticker.get(t)
+        if added_at is None or added_at < cutoff_iso:
+            result.append(t)
+    return result
+
+
 def _max_dd20(closes, i0):
     """build_q5_prior_mean_reference.pyの_max_dd20と完全に同一の定義
     (Day0終値基準、以降20営業日の終値のうち最も下落した時点のリターン、

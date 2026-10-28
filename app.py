@@ -131,6 +131,14 @@ def _today_jst_str():
     return datetime.now(_JST).strftime("%Y-%m-%d")
 
 
+def _now_jst_iso():
+    """prior_mean差分更新24:00 JST締切の深夜バックフィル専用(design
+    2026-10-28c)。watchlist追加時刻をJST・ISO8601(オフセット付き)で返す。
+    redis_store.set_priormean_watchlist_added_atへ渡す値の生成専用で、他の
+    判定には使わない。"""
+    return datetime.now(_JST).isoformat()
+
+
 def _trading_days_calendar():
     """quintile:pool_historyに蓄積されている「実際に処理された取引日」の
     一覧(refresh.run_quintile_refreshが実取引日ベース化(2026-09-22)された
@@ -1916,10 +1924,18 @@ function renderCurrentQ5PriorMeans(list){
 // pending/in_progress→自動取得待ち、failed→取得失敗、
 // done(取得済みだが件数不足)→「件数不足」、null/undefined(既存56銘柄・
 // 未検出)→従来通り「データ不足」の4パターンに分ける。
+//
+// design 2026-10-28c更新: 文言を実際の処理フローに合わせて変更した。
+// 旧文言「23:50以降に自動取得」はcron(UTC 23:50=JST 08:50)をJSTの時刻
+// であるかのように表示してしまっていた既存の不整合(実際の処理時刻とは
+// 無関係な固定文言のミス)。24:00 JST締切・深夜バックフィル・翌朝7:00 JST
+// 表示という新しいフロー(design 2026-10-28c)に合わせ、具体的な時刻を
+// 固定文言に埋め込まない表現に変更する(将来cronの時刻を調整しても文言
+// 修正が不要になるようにする、ユーザー確定方針)。
 function wlpmLine1Html(pm, label, stats, backfillStatus){
   if(!pm || !pm.status || pm.status === "insufficient"){
     if(backfillStatus === "pending" || backfillStatus === "in_progress"){
-      return `<span class="wlpm-flag-pending">🕐 データ不足｜23:50以降に自動取得</span>`;
+      return `<span class="wlpm-flag-pending">🕐 データ取得中｜翌朝7:00以降に表示</span>`;
     }
     if(backfillStatus === "failed"){
       return `<span class="wlpm-flag-warn">⚠️ データ取得失敗｜再試行予定</span>`;
@@ -3029,6 +3045,17 @@ def add_watchlist():
         tickers.append(ticker)
         if not store.set_watchlist(tickers):
             return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
+
+        # prior_mean差分更新24:00 JST締切の深夜バックフィル専用(design
+        # 2026-10-28c)。追加時刻(JST)をベストエフォートで記録するだけで、
+        # watchlist本体の追加処理(上のstore.set_watchlist)の成否には一切
+        # 影響しない(失敗してもこの追加リクエスト自体は成功として返す。
+        # 記録が無い銘柄は深夜バックフィルの検出側が「締切の対象外=常に
+        # 対象に含める」として安全側に扱う)。
+        try:
+            store.set_priormean_watchlist_added_at(ticker, _now_jst_iso())
+        except Exception:
+            pass
 
         # 2026-09-17: Alpha Vantage完全撤去・Twelve Data一本化。追加直後にTwelve Data
         # を1回だけ取得し、その同じデータをrefresh.backfill_quintile_history_for_new_ticker

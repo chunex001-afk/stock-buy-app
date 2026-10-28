@@ -1,0 +1,53 @@
+name: prior_mean new ticker overnight detection (24:00 JST cutoff)
+
+# prior_mean差分更新の設計(2026-10-28c、design確認済み)Phase 3。
+# 24:00 JSTまでにwatchlistへ追加された新規銘柄だけを検出し、
+# priormean:pending_backfillへ登録する専用workflow。
+#
+# 既存のdaily-refresh.yml / q5-universe-refresh.yml / priormean-
+# incremental.yml / priormean-backfill.yml とは完全に分離した専用
+# workflow。既存のQ1〜Q5判定・Q5 Day0判定・BUY判定・既存56銘柄の
+# q5_prior_mean_reference.jsonには一切関与しない。
+#
+# priormean-incremental.yml(既存、無変更、08:40 JST実行)が担っている
+# Day0検出・20営業日経過イベント確定にはこのworkflowは一切関与しない
+# (quintile:pool_history/quintile:state/priormean:incremental_stateには
+# アクセスしない)。このworkflowが新規銘柄をstatus="pending"にした後は、
+# priormean-incremental.yml側のdetect_new_tickers(既存、無変更)が
+# それを見て「既に対象」として自然に除外するため、二重登録は発生しない。
+#
+# 24:00 JST以降(=今日0:00 JST以降)に追加された銘柄は、今回の深夜
+# バックフィル対象からは除外され、次の日の深夜(または既存の08:40 JST
+# 日次処理)に委ねられる(detect_new_priormean_tickers_overnight.py側の
+# cutoff判定)。
+
+on:
+  schedule:
+    # UTC 15:10(前日) = JST 00:10(当日)。24:00 JST締切の直後に、
+    # 新規銘柄検出だけを行う(重い処理・API呼び出しは発生しない)。
+    - cron: "10 15 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: priormean-overnight-detect
+  cancel-in-progress: false
+
+jobs:
+  overnight-detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Detect new watchlist tickers added before 24:00 JST
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: python detect_new_priormean_tickers_overnight.py
