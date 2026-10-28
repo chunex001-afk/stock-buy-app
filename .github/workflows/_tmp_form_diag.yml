@@ -68,4 +68,8 @@ jobs:
               print("  件数:", len(dates), "範囲:", dates[0], "~", dates[-1])
           else:
               print("TWELVEDATA_API_KEY未設定のため、Twelve Data比較はスキップしました。")
+
+          from datetime import datetime, timezone
+          today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+          print(f"td_api_budget:{today_utc} =", store.get_td_api_budget(today_utc))
           PY
