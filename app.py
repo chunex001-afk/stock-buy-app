@@ -1980,11 +1980,20 @@ function renderCurrentQ5PriorMeans(list){
 // 淡色)として残す。
 // backfillStatus(design 2026-10-28b、第4引数、省略可能): 新規銘柄の
 // redis_store.get_priormean_backfill_status(Phase1/2既存、無変更)の値。
-// 既存56銘柄は常にundefined/nullのため、以下の分岐には入らず従来通り
-// 「データ不足」のまま(表示文言の分岐専用、prior_mean計算には使わない)。
-// pending/in_progress→自動取得待ち、failed→取得失敗、
-// done(取得済みだが件数不足)→「件数不足」、null/undefined(既存56銘柄・
-// 未検出)→従来通り「データ不足」の4パターンに分ける。
+// inRef(design 2026-10-30、第5引数): item.in_reference_universe(既存
+// フィールド、無変更)。pending→「取得待ち」、in_progress→「取得中」、
+// failed→「取得失敗」、done かつ!inRef(=バックフィル完了済みなのに
+// イベントが1件も無い、待っても解決しない本当の対象外)→何も出さず
+// refFlag側の「対象外」に委ねる、done かつinRef(取得済みだが件数不足)→
+// 「件数不足」、null/undefined かつ!inRef(即時dispatch直後、GitHub
+// Actionsがまだ"in_progress"を書き込む前の数十秒間の新規銘柄)→
+// 「取得中」、null/undefined かつinRef(既存56銘柄等、本当にデータ不足)→
+// 従来通り「データ不足」(表示文言の分岐専用、prior_mean計算には使わない)。
+//
+// design 2026-10-30更新: ウォッチリスト追加直後(backfill_statusがまだ
+// nullの数十秒間)に「データ不足対象外」と誤表示される問題を修正。
+// backfillStatus=nullを「既存銘柄の本当のデータ不足」と「新規銘柄の
+// 取得準備中」の2パターンに分け、新規銘柄側は取得中の文言に変更した。
 //
 // design 2026-10-28c更新: 文言を実際の処理フローに合わせて変更した。
 // 旧文言「23:50以降に自動取得」はcron(UTC 23:50=JST 08:50)をJSTの時刻
@@ -1992,20 +2001,39 @@ function renderCurrentQ5PriorMeans(list){
 // 無関係な固定文言のミス)。24:00 JST締切・深夜バックフィル・翌朝7:00 JST
 // 表示という新しいフロー(design 2026-10-28c)に合わせ、具体的な時刻を
 // 固定文言に埋め込まない表現に変更する(将来cronの時刻を調整しても文言
-// 修正が不要になるようにする、ユーザー確定方針)。
-function wlpmLine1Html(pm, label, stats, backfillStatus){
+// 修正が不要になるようにする、ユーザー確定方針)。2026-10-30、pending/
+// in_progressの文言をさらに分けたため「翌朝7:00以降に表示」の固定文言は
+// 削除した(即時dispatch経由の新規銘柄は数十秒〜数分で解決するため)。
+function wlpmLine1Html(pm, label, stats, backfillStatus, inRef){
   if(!pm || !pm.status || pm.status === "insufficient"){
-    if(backfillStatus === "pending" || backfillStatus === "in_progress"){
-      return `<span class="wlpm-flag-pending">🕐 データ取得中｜翌朝7:00以降に表示</span>`;
-    }
     if(backfillStatus === "failed"){
-      return `<span class="wlpm-flag-warn">⚠️ データ取得失敗｜再試行予定</span>`;
+      return `<span class="wlpm-flag-warn">⚠️ データ取得失敗</span>`;
     }
     if(backfillStatus === "done"){
+      if(!inRef){
+        // バックフィル完了済みなのにイベントが1件も無い=待っても解決しない
+        // 本当の対象外(design 2026-10-30)。重複表示にしないため、ここでは
+        // 何も出さず、呼び出し元のrefFlag(「対象外」)だけに表示を委ねる。
+        return "";
+      }
       // 取得済み(バックフィル完了)だが件数がMIN_PRIOR_N未満で不足している
       // 場合は、「データが無い」のではなく「件数が足りない」ことが分かる
       // 表現にする(待っても解決しないケース、ユーザー確定仕様)。
       return `<span class="wlpm-flag-warn">件数不足${(pm && pm.n) ? `(過去${pm.n}件)` : ""}</span>`;
+    }
+    if(backfillStatus === "pending"){
+      return `<span class="wlpm-flag-pending">🔄 データ取得待ち…</span>`;
+    }
+    if(backfillStatus === "in_progress"){
+      return `<span class="wlpm-flag-pending">🔄 データ取得中｜数分後に表示</span>`;
+    }
+    if(!inRef){
+      // backfillStatusがまだ記録されていない(即時dispatch直後、GitHub
+      // Actionsがbackfill_one_ticker内でset_priormean_backfill_status
+      // ("in_progress")を呼ぶ前の数十秒間)。新規銘柄が取得準備中なだけで
+      // 「データ不足」ではない(design 2026-10-30、ウォッチリスト追加直後に
+      // 「データ不足対象外」と誤表示される問題の修正)。
+      return `<span class="wlpm-flag-pending">🔄 データ取得中｜数分後に表示</span>`;
     }
     return `<span class="wlpm-flag-warn">データ不足${(pm && pm.n) ? `(過去${pm.n}件)` : ""}</span>`;
   }
@@ -2064,14 +2092,21 @@ function renderWatchlistPriorMeans(list, anchorDate){
   if(!list){ el.innerHTML = ""; return; }
   const rows = wlpmSortedList(list).map(item => {
     const inRef = item.in_reference_universe;
-    const refFlag = inRef ? "" : `<span class="wlpm-flag-warn">対象外</span>`;
+    // 「対象外」は、バックフィルが完了済み(done)なのに1件もイベントが無い
+    // =待っても解決しない本当の対象外の時だけ出す(design 2026-10-30)。
+    // backfillStatusがnull/pending/in_progress/failedの間(=新規銘柄がまだ
+    // バックフィル処理の途中)は、wlpmLine1Html側の取得中・取得待ち・失敗の
+    // 表示に任せ、ここでは出さない(「データ不足対象外」のような重複表示の
+    // 防止)。
+    const refFlag = (!inRef && item.backfill_status === "done")
+      ? `<span class="wlpm-flag-warn">対象外</span>` : "";
     const hasFullData = item.prior_mean && item.prior_mean.status === "ok";
     const line2 = hasFullData ? wlpmLine2Html(item.prior_stats_recent5y) : "";
     const line3 = hasFullData ? wlpmLine3Html(item.prior_stats) : "";
     return `<div class="wlpm-row">
       <div class="wlpm-row-line1">
         <span class="wlpm-ticker">${esc(item.ticker)}</span>
-        ${wlpmLine1Html(item.prior_mean, item.prior_mean_label, item.prior_stats, item.backfill_status)}
+        ${wlpmLine1Html(item.prior_mean, item.prior_mean_label, item.prior_stats, item.backfill_status, inRef)}
         ${refFlag}
       </div>
       ${line2}
