@@ -699,7 +699,15 @@ def _compute_backfill_day(ticker, dates, closes, volumes, target_idx, pool_histo
     (過去のQ5エントリー日からq5_price_pathを復元する機能)がこの値を使う。
     既存の呼び出し側(dateとqとscoreだけを読む)には影響しない。
 
-    戻り値: {"date":str,"q":"Q1"〜"Q5","score":float,"price":float}。
+    2026-11-02追加: 戻り値に"bounds"(その日時点の分位境界、[Q1/Q2,Q2/Q3,
+    Q3/Q4,Q4/Q5]の4値)を加えた。ウォッチリスト再登録時のギャップ補完
+    (_backfill_quintile_gap)が、_update_quintile_stateへそのまま渡すために
+    使う(既存のq=assign_quintile(score,bounds)と完全に同じ値になるよう、
+    この関数内で既に計算済みのboundsを再利用するだけ)。既存の呼び出し側
+    (date/q/score/priceだけを読む)には影響しない。
+
+    戻り値: {"date":str,"q":"Q1"〜"Q5","score":float,"price":float,
+    "bounds":[float,float,float,float]}。
     株価データ・pool_history・特徴量/スコア計算のいずれかが不足/失敗した日は
     Noneを返す(この日のQは推測しない)。"""
     n_dates = len(dates)
@@ -746,7 +754,7 @@ def _compute_backfill_day(ticker, dates, closes, volumes, target_idx, pool_histo
         return None
 
     q = quintile_logic.assign_quintile(score, bounds)
-    return {"date": target_date, "q": q, "score": score, "price": closes[target_idx]}
+    return {"date": target_date, "q": q, "score": score, "price": closes[target_idx], "bounds": bounds}
 
 
 def _find_recent_q5_entry_index(computed, entry_before_window):
@@ -769,6 +777,101 @@ def _find_recent_q5_entry_index(computed, entry_before_window):
         if computed[i]["q"] == "Q5" and prev_q != "Q5":
             return i
     return None
+
+
+# ---------------------------------------------------------------------------
+# ウォッチリスト再登録時のQ判定ギャップ補完(design 2026-11-02ユーザー確定仕様)。
+#
+# 背景: ウォッチリストから外れている間、run_quintile_refreshの監視銘柄ループ
+# 対象外になるため、その銘柄のquintile:state(current_q/history/q5_price_path
+# 等)は一切更新されず凍結する(CIENで実際に確認された挙動)。再登録した日に
+# 一度だけ「今日」のQを計算しても、外れていた各取引日のQが未計算のまま
+# 残り、daily_breakdown等の表示が「削除前の古い値がそのまま続いていた」かの
+# ように見えてしまう。
+#
+# この関数は、既存履歴がある銘柄(backfill_quintile_history_for_new_tickerの
+# have_quintile_history=True分岐)について、最後に更新された日(last_updated)
+# の翌取引日から、当日取得できた最新取引日までの各取引日を1日ずつ、
+# _update_quintile_stateに「その日が実際に処理された場合と全く同じ入力」を
+# 渡して呼び出す。これにより:
+# - history・q5_price_path・q5_warning・q5_midline_halt・betaの更新ロジック
+#   自体は一切変更せず、既存のrun_quintile_refreshが毎日呼ぶのと同じ関数を
+#   同じ回数(ギャップの取引日数分)呼ぶだけで「削除していなかった場合」と
+#   同一の最終状態を再現する(Q1〜Q5判定ロジック・Q5シグナル・q5統計・
+#   prior_mean計算には一切触れない)。
+# - 分位境界(pool_history)はウォッチリストと無関係にREFERENCE_UNIVERSEの
+#   ローテーションで毎日更新され続けているため、外れていた期間も「当時の
+#   正しい境界」を使って再計算できる(_compute_backfill_dayが元々行っている
+#   look-ahead bias対策をそのまま使う。未来のプール更新は一切参照しない)。
+# - ある取引日について株価データ・プール履歴のいずれかが不足していれば、
+#   その日は推測せずスキップする(_compute_backfill_dayがNoneを返す場合、
+#   その日のhistoryは更新しない。呼び出し元には「補完できなかった日が
+#   あったか」をbool1つで返し、表示側に「データ不足」を伝えられるようにする)。
+# - ウォッチリストへの登録・削除を何度繰り返しても、2回目以降の再登録では
+#   「前回の再登録以降に外れていた分」だけが新しいギャップになるため
+#   (last_updatedが前回の再登録時点まで進んでいる)、historyに同じ日付の
+#   エントリが重複して追加されることはない。
+# ---------------------------------------------------------------------------
+
+def _backfill_quintile_gap(ticker, last_updated, dates, closes, volumes, pool_history, trading_calendar):
+    """last_updated(前回quintile:stateが更新された取引日)の翌日から、
+    dates[-1](当日取得できた最新取引日)までの間にある取引日を、
+    trading_calendar(quintile:pool_historyの実取引日一覧)から1日ずつ
+    _update_quintile_stateで処理する。
+
+    戻り値: (filled_days: int(実際に補完できた取引日数),
+             had_gap_issue: bool(補完対象の取引日が1日以上あったが、
+             データ不足で推測せずスキップした日が1日でもあったか))。
+
+    last_updatedが無い(=まだ一度もQ1〜5が確定していない)場合、
+    trading_calendarが空の場合、datesが空の場合は何もせず(0, False)を返す
+    (架空の取引日を作らない、既存のhas_min_history_for_quintile等のガードは
+    _compute_backfill_day側にすべて委ねる)。"""
+    if not last_updated or not dates or not trading_calendar:
+        return 0, False
+
+    latest_fetched_date = dates[-1]
+    gap_dates = [d for d in trading_calendar if last_updated < d <= latest_fetched_date]
+    if not gap_dates:
+        return 0, False
+
+    date_to_idx = {d: i for i, d in enumerate(dates)}
+    filled_days = 0
+    had_gap_issue = False
+    for target_date in gap_dates:
+        idx = date_to_idx.get(target_date)
+        if idx is None:
+            had_gap_issue = True
+            continue
+        entry = _compute_backfill_day(ticker, dates, closes, volumes, idx, pool_history)
+        if entry is None:
+            had_gap_issue = True
+            continue
+        # dates/closesはtarget_date(=idx)までにスライスして渡す(_update_quintile_state
+        # 内のlogic.sma(closes,20)がclosesの末尾20件をそのまま使う実装のため、
+        # 日次本番呼び出しと同じ「その日時点で終わる系列」を保証し、未来の終値が
+        # 混入してsma20_today・q5_midline_haltが誤った値になることを防ぐ。
+        # _reconcile_price_pathのdate_to_close参照もこれでtarget_date以降の値を
+        # 一切含まなくなり、look-ahead biasの余地が無くなる)。
+        _update_quintile_state(
+            ticker, entry["score"], entry["bounds"], entry["date"],
+            price=entry["price"], beta=None,
+            trading_calendar=trading_calendar, dates=dates[: idx + 1], closes=closes[: idx + 1],
+        )
+        filled_days += 1
+
+    if filled_days:
+        print(
+            f"[Q1-5][OK] {ticker}: ウォッチリスト再登録に伴い、"
+            f"{last_updated}の翌取引日〜{latest_fetched_date}の{filled_days}取引日分の"
+            "Q判定ギャップを補完しました。"
+        )
+    if had_gap_issue:
+        print(
+            f"[Q1-5][WARN] {ticker}: 再登録時のギャップ補完中、データ不足のため"
+            "推測せずスキップした取引日がありました。"
+        )
+    return filled_days, had_gap_issue
 
 
 def backfill_quintile_history_for_new_ticker(ticker, api_key):
@@ -811,6 +914,15 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
     - 必要な株価データ・プール履歴が不足している日は、その日のQを推測せず
       スキップする(historyに追加しない。表示側は既存のresolveQForDateが
       「データがない日」を「—」として扱う)。
+
+    2026-11-02(5回目の改修、ユーザー確定仕様): have_quintile_history=True
+    (=既にQ1〜5履歴がある銘柄、典型的にはウォッチリストから一時的に削除
+    →再登録したケース)でも、_backfill_quintile_gapで「外れていた間に
+    未処理のまま残っている取引日」だけを look-ahead biasなしで補完する
+    ように拡張した(詳細は_backfill_quintile_gapのdocstring参照)。既存の
+    history/current_q等を書き換えるのではなく、_update_quintile_stateを
+    ギャップの取引日数分だけ追加で呼び出すだけであり、Q1〜Q5判定ロジック・
+    Q5シグナル・Q5統計・prior_mean計算には一切触れない。
 
     2026-09-17(2回目の改修、SKHY/AXT障害調査を受けて): 旧指標・Q1〜5の
     それぞれについて「既に正常なデータがあるか」を個別に見て、壊れている側
@@ -914,12 +1026,31 @@ def backfill_quintile_history_for_new_ticker(ticker, api_key):
         print(f"[WARN] {ticker}: 旧指標の計算・保存に失敗しました: {e}", file=sys.stderr)
 
     if have_quintile_history:
-        # Q1〜5側は既に正常なため、既存historyには一切手を加えない(design
-        # 2026-09-18、上のdocstring参照)。旧指標側の結果だけを反映して終える。
+        # 2026-11-02改修(design: ウォッチリスト再登録時のQ判定ギャップ補完、
+        # ユーザー確定仕様): 既存historyの値そのものは一切書き換えない方針は
+        # 変えないが、「ウォッチリストから外れていた間に未処理のまま残っている
+        # 取引日」があれば、_backfill_quintile_gapで1日ずつ補完する。
+        # 外れていなかった銘柄(=last_updatedが最新取引日と一致、または翌日に
+        # 通常の日次更新が引き継ぐ)はgap_datesが空になり、従来通り何もせず
+        # 終了する(既存の「正常な銘柄には触れない」動作を変えない)。
+        gap_message = None
+        existing_last_updated = (existing_state or {}).get("last_updated")
+        pool_history = store.get_pool_history()
+        if pool_history and pool_history.get("scores_by_date") and existing_last_updated:
+            trading_calendar_dates = sorted(pool_history.get("dates", []))
+            _filled, had_gap_issue = _backfill_quintile_gap(
+                ticker, existing_last_updated, dates, closes, volumes,
+                pool_history, trading_calendar_dates,
+            )
+            if had_gap_issue:
+                gap_message = (
+                    "ウォッチリストから外れていた期間の一部は、株価データ不足のため"
+                    "Q判定を補完できませんでした（推測はしていません）。"
+                )
         # okはTrue固定(Q1〜5は表示可能な状態にあるため。旧指標の修復が
         # 今回失敗していても、それはis_stale/last_errorとして別途記録済みで、
         # このbackfill呼び出し全体を「失敗」とは呼ばない)。
-        return {"ok": True, "error_type": None, "message": None}
+        return {"ok": True, "error_type": None, "message": gap_message}
 
     pool_history = store.get_pool_history()
     if not pool_history or not pool_history.get("scores_by_date"):
