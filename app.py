@@ -1557,6 +1557,10 @@ details.logicinfo .small{margin-top:10px}
 .wlpm-flag-pending{color:#175cd3;font-weight:700}
 .wlpm-flag-none{color:#98a2b3}
 .wlpm-empty{color:#98a2b3;font-size:12.5px}
+/* 「監視銘柄のQ5過去平均」パネル専用の手動更新ボタン(design 2026-11-02)。
+   このパネルの行内に収まる小さめサイズにするだけで、button.secondary
+   (既存、無変更)の配色をそのまま使う。 */
+.wlpm-refresh-btn{padding:3px 10px;font-size:11px;border-radius:8px;margin-left:2px}
 /* 取得情報(取得単価・取得日)の訂正フォーム(design 2026-10-20)。 */
 .pfedit-togglebtn{background:#eef1f5;color:#172033;border:0;border-radius:10px;padding:6px 10px;font-weight:700;font-size:11.5px;cursor:pointer}
 .pfedit-form{display:flex;gap:10px;flex-wrap:wrap;align-items:end;padding:10px 0 12px;border-top:1px dashed #dde2e8}
@@ -2086,6 +2090,83 @@ function wlpmSortedList(list){
     return wb - wa;
   });
 }
+// 「監視銘柄のQ5過去平均」パネル専用の手動更新ボタン(design 2026-11-02
+// ユーザー確定仕様)。新規追加銘柄(例:CRWD)のバックフィルが完了する前に
+// 表示される「データ取得中｜数分後に表示」等の行だけに、その銘柄1件だけを
+// 再取得するボタンを出す。通常のウォッチリスト表示・他の更新ボタンには
+// 一切追加しない(このパネルのレンダリング関数内だけの変更)。
+// Q1〜Q5判定・Q5統計・prior_mean/prior_n算出ロジック・BUY/TOP6選定には
+// 一切関与しない表示専用機能(/api/watchlist/<ticker>/refresh_prior_mean・
+// /api/watchlist/<ticker>/prior_mean_statusを呼ぶだけ)。
+//
+// wlpmRefreshInFlightはモジュール内で一度だけ作る集合で、どのticker用の
+// ボタンがクリック済み(サーバー側の処理待ち)かを、updateRanking()による
+// パネル全体の再描画をまたいで保持する(二重実行防止の表示側ガード。
+// 実際の二重実行防止自体はbackfill_one_ticker側のRedis原子的ロック+
+// GitHub Actions concurrencyグループ、既存・無変更に委ねる)。
+const wlpmRefreshInFlight = new Set();
+
+function wlpmRefreshButtonHtml(item){
+  // done(バックフィル完了済み。件数不足・対象外を含む)は再試行しても
+  // 結果が変わらないため、ボタンは出さない(design: 取得完了後は
+  // ボタンを非表示にするユーザー確定仕様)。
+  if(item.backfill_status === "done") return "";
+  const inFlight = wlpmRefreshInFlight.has(item.ticker);
+  return `<button type="button" class="secondary wlpm-refresh-btn" ${inFlight ? "disabled" : ""}
+    onclick="wlpmRefreshOne('${esc(item.ticker)}', event)">${inFlight ? "更新中…" : "更新"}</button>`;
+}
+
+// ポーリング間隔・最大試行回数(design 2026-11-02): GitHub Actions
+// workflow_dispatchのキュー待ち+実処理(既存の新規銘柄追加時dispatchと
+// 全く同じ処理、実測は数秒〜1分程度)を踏まえ、10秒間隔・最大18回(3分)
+// まで確認する。/api/watchlist/<ticker>/prior_mean_statusはRedis読み取り
+// のみで、Twelve Dataへの新規呼び出しはこのポーリングからは発生しない。
+const WLPM_REFRESH_POLL_INTERVAL_MS = 10000;
+const WLPM_REFRESH_POLL_MAX_ATTEMPTS = 18;
+
+async function wlpmRefreshOne(ticker, evt){
+  if(wlpmRefreshInFlight.has(ticker)) return; // 二重実行防止(クリック時点)
+  wlpmRefreshInFlight.add(ticker);
+  const btn = evt && evt.currentTarget;
+  if(btn){ btn.disabled = true; btn.textContent = "更新中…"; }
+
+  try{
+    const r = await fetch(`/api/watchlist/${encodeURIComponent(ticker)}/refresh_prior_mean`, {method: "POST"});
+    const j = await r.json();
+    if(!j.ok){
+      wlpmRefreshInFlight.delete(ticker);
+      if(btn){ btn.disabled = false; btn.textContent = "更新"; }
+      document.getElementById("status").textContent = `${ticker}: ${j.error || "更新に失敗しました"}`;
+      return;
+    }
+  }catch(e){
+    wlpmRefreshInFlight.delete(ticker);
+    if(btn){ btn.disabled = false; btn.textContent = "更新"; }
+    document.getElementById("status").textContent = `${ticker}: 通信に失敗しました(${e.message})`;
+    return;
+  }
+
+  // dispatch成功後、この銘柄だけを軽量エンドポイントでポーリングする
+  // (他の監視銘柄・他のパネルは一切再取得しない)。done/failedになったら
+  // 最後に1回だけ既存のupdateRanking()を呼び、パネル全体を正しい最新状態
+  // に再描画する(個別のDOM更新は行わない、既存の描画パイプラインの再利用)。
+  for(let attempt = 0; attempt < WLPM_REFRESH_POLL_MAX_ATTEMPTS; attempt++){
+    await new Promise(res => setTimeout(res, WLPM_REFRESH_POLL_INTERVAL_MS));
+    try{
+      const r = await fetch(`/api/watchlist/${encodeURIComponent(ticker)}/prior_mean_status`);
+      const j = await r.json();
+      if(j.ok && j.item && (j.item.backfill_status === "done" || j.item.backfill_status === "failed")){
+        break;
+      }
+    }catch(e){
+      // 1回のポーリング失敗だけでは中断しない(一時的な通信エラーの可能性)。
+    }
+  }
+
+  wlpmRefreshInFlight.delete(ticker);
+  await updateRanking();
+}
+
 function renderWatchlistPriorMeans(list, anchorDate){
   const el = document.getElementById("watchlistPriorMeans");
   if(!el) return;
@@ -2108,6 +2189,7 @@ function renderWatchlistPriorMeans(list, anchorDate){
         <span class="wlpm-ticker">${esc(item.ticker)}</span>
         ${wlpmLine1Html(item.prior_mean, item.prior_mean_label, item.prior_stats, item.backfill_status, inRef)}
         ${refFlag}
+        ${wlpmRefreshButtonHtml(item)}
       </div>
       ${line2}
       ${line3}
@@ -3220,6 +3302,69 @@ def delete_watchlist(ticker):
         if not store.set_watchlist(tickers):
             return jsonify({"ok": False, "error": "保存先(Redis)への書き込みに失敗しました"}), 502
         return jsonify({"ok": True, "tickers": tickers})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# 「監視銘柄のQ5過去平均(登録段階チェック用)」パネル専用の手動更新機能
+# (design 2026-11-02ユーザー確定仕様)。新規銘柄追加直後の_dispatch_
+# priormean_backfill(既存、無変更)と同じGitHub Actions workflow
+# (priormean-backfill-dispatch.yml→backfill_dispatched_ticker.py→
+# backfill_new_ticker_prior_mean.backfill_one_ticker、いずれも無変更)を
+# 1銘柄分だけ再利用するだけで、新しいバックフィルロジックは一切作らない。
+# Q1〜Q5判定・Q5統計・prior_mean/prior_n算出方法・BUY/TOP6選定ロジックには
+# 一切関与しない、このパネル専用の読み取り専用確認・再dispatchのみ。
+@app.post("/api/watchlist/<ticker>/refresh_prior_mean")
+def refresh_watchlist_prior_mean(ticker):
+    try:
+        ticker = _sanitize_ticker(ticker)
+        if ticker not in _get_watchlist():
+            return jsonify({"ok": False, "error": "この銘柄はウォッチリストに登録されていません"}), 404
+
+        static_tickers = set(q5_prior_mean_logic.load_reference_data().get("events_by_ticker", {}).keys())
+        if ticker in static_tickers:
+            return jsonify({"ok": False, "error": "この銘柄は既存の固定データを使用するため、更新は不要です"}), 400
+
+        current_status = store.get_priormean_backfill_status(ticker)
+        if current_status == "done":
+            return jsonify({"ok": True, "dispatched": False, "message": "すでにデータ取得済みです"})
+        if current_status == "in_progress":
+            # 二重実行防止(design 2026-11-02): backfill_one_ticker自体の
+            # Redis原子的ロック・GitHub Actions concurrencyグループ(いずれも
+            # 既存、無変更)で安全に防止されているが、ここで事前に弾くことで
+            # 無駄なworkflow_dispatch呼び出し自体を発生させない。
+            return jsonify({"ok": True, "dispatched": False, "message": "すでに取得処理が実行中です。しばらくお待ちください。"})
+
+        if not GITHUB_DISPATCH_TOKEN:
+            return jsonify({"ok": False, "error": "GITHUB_DISPATCH_TOKEN未設定のため、手動更新はできません。"}), 503
+
+        dispatched = _dispatch_priormean_backfill(ticker)
+        if not dispatched:
+            return jsonify({"ok": False, "error": "GitHub Actionsへのdispatchに失敗しました。しばらくしてから再度お試しください。"}), 502
+        return jsonify({"ok": True, "dispatched": True, "message": "データ取得を開始しました。数分後に反映されます。"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/watchlist/<ticker>/prior_mean_status")
+def watchlist_prior_mean_status(ticker):
+    """上記の手動更新ボタンが完了を確認するための軽量な読み取り専用
+    エンドポイント(design 2026-11-02)。/api/rankingを丸ごと呼び直すと
+    他の監視銘柄・他のパネルまで再計算してしまうため、この1銘柄分だけを
+    _build_watchlist_prior_means(既存関数、無変更)に単一要素のリストで
+    渡して結果を1件だけ返す。Twelve Dataへの新規呼び出しは一切発生しない
+    (既存のRedis読み取りのみ)。"""
+    try:
+        ticker = _sanitize_ticker(ticker)
+        if ticker not in _get_watchlist():
+            return jsonify({"ok": False, "error": "この銘柄はウォッチリストに登録されていません"}), 404
+
+        trading_calendar = _trading_days_calendar()
+        if not trading_calendar:
+            return jsonify({"ok": True, "item": None})
+
+        item = _build_watchlist_prior_means([ticker], trading_calendar[-1])[0]
+        return jsonify({"ok": True, "item": item})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

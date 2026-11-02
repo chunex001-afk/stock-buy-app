@@ -186,11 +186,16 @@ def _run_render_watchlist_prior_means(list_items):
     wlpm3_src = _extract_function(app.HTML, "function wlpmLine3Html(")
     priority_src = _extract_const(app.HTML, "const WLPM_CATEGORY_PRIORITY")
     sorted_src = _extract_function(app.HTML, "function wlpmSortedList(")
+    # design 2026-11-02: 手動更新ボタン(renderWatchlistPriorMeansの新しい
+    # 依存)も実際のapp.HTMLから抽出して実行する(文字列照合ではなく実際の
+    # 分岐を動かすこのテストファイルの既存方針を維持する)。
+    refresh_btn_src = _extract_function(app.HTML, "function wlpmRefreshButtonHtml(")
     render_src = _extract_function(app.HTML, "function renderWatchlistPriorMeans(")
     items = json.dumps(list_items, ensure_ascii=False)
     script = f"""
 let __out = null;
 const document = {{ getElementById: () => ({{ set innerHTML(v) {{ __out = v; }} }}) }};
+const wlpmRefreshInFlight = new Set();
 {esc_src}
 {fmt_date_src}
 {wlpm1_src}
@@ -198,6 +203,7 @@ const document = {{ getElementById: () => ({{ set innerHTML(v) {{ __out = v; }} 
 {wlpm3_src}
 {priority_src}
 {sorted_src}
+{refresh_btn_src}
 {render_src}
 renderWatchlistPriorMeans({items}, "2026-10-29");
 process.stdout.write(__out);
