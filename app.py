@@ -2189,7 +2189,6 @@ function renderWatchlistPriorMeans(list, anchorDate){
         <span class="wlpm-ticker">${esc(item.ticker)}</span>
         ${wlpmLine1Html(item.prior_mean, item.prior_mean_label, item.prior_stats, item.backfill_status, inRef)}
         ${refFlag}
-        ${wlpmRefreshButtonHtml(item)}
       </div>
       ${line2}
       ${line3}
